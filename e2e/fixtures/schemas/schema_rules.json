@@ -1,0 +1,165 @@
+{
+  "$schema_version": "1.0.0",
+  "disclaimer": "本建议由 AI 智能导诊结合医学知识库生成，仅供参考，不替代执业医师诊断。",
+  "knowledge_document": {
+    "required": [
+      "doc_id",
+      "source_title",
+      "source_type",
+      "authority_level",
+      "disease_name",
+      "department",
+      "target_population",
+      "section_type",
+      "content",
+      "key_symptoms"
+    ],
+    "optional": [
+      "aliases",
+      "secondary_departments",
+      "differential_points",
+      "red_flag_signs",
+      "seasonal_tags",
+      "suggested_follow_up_slots",
+      "updated_at"
+    ],
+    "enums": {
+      "source_type": ["textbook", "guideline", "hospital_manual", "qa_dataset"],
+      "section_type": ["clinical_manifestation", "differential_diagnosis", "red_flag", "triage_rule"],
+      "target_population": ["adult", "child", "elderly", "pregnant", "female", "male"]
+    },
+    "ranges": {
+      "authority_level": [0.1, 1.0]
+    },
+    "slot_constraints": {
+      "max_question_chars": 30,
+      "min_quick_options": 2,
+      "max_quick_options": 4
+    }
+  },
+  "patient_record": {
+    "required": [
+      "patient_id",
+      "consent_long_term_memory",
+      "l2_profile",
+      "l3_visit_events"
+    ],
+    "l2_profile_required": [
+      "age_group",
+      "gender",
+      "is_pregnant",
+      "chronic_diseases",
+      "allergies",
+      "surgical_history",
+      "long_term_medications"
+    ],
+    "l3_visit_event_required": [
+      "event_id",
+      "occurred_at",
+      "chief_complaint",
+      "extracted_symptoms",
+      "recommended_department",
+      "urgency_level",
+      "summary"
+    ],
+    "ranges": {
+      "urgency_level": [1, 4]
+    }
+  },
+  "epidemic_context": {
+    "required": [
+      "context_id",
+      "region_code",
+      "region_name",
+      "season",
+      "disease_name",
+      "seasonal_tag",
+      "intensity",
+      "boost_symptoms",
+      "priority_question_hint",
+      "active",
+      "valid_from",
+      "valid_to"
+    ],
+    "ranges": {
+      "intensity": [0.0, 1.0]
+    }
+  },
+  "medical_dictionaries": {
+    "synonym_required": ["standard_term", "colloquial_terms"],
+    "red_flag_required": ["rule_id", "level", "trigger_all_of", "trigger_any_of", "alert_message"],
+    "enums": {
+      "red_flag_level": ["None", "Urgent", "Emergency120"]
+    }
+  },
+  "triage_invariants": {
+    "max_question_chars": 30,
+    "min_quick_options": 2,
+    "max_quick_options": 4,
+    "max_turns": 4,
+    "valid_statuses": ["follow_up", "completed", "emergency"],
+    "valid_red_flags": ["None", "Urgent", "Emergency120"],
+    "required_prometheus_metrics": [
+      "medical_server_requests_total",
+      "medical_server_sse_active_connections",
+      "medical_server_triage_duration_seconds",
+      "medical_server_llm_errors_total",
+      "medical_server_rag_duration_seconds",
+      "medical_server_cache_hits_total",
+      "medical_server_pg_pool_active"
+    ],
+    "required_tables": [
+      "l2",
+      "l3",
+      "epidemic_contexts",
+      "symptom_synonyms",
+      "red_flag_rules",
+      "triage_audit_logs",
+      "api_keys",
+      "llm_providers",
+      "ingestion_checkpoints"
+    ],
+    "required_studio_commands": {
+      "module1": [
+        "preview_knowledge_chunks",
+        "start_knowledge_import",
+        "resume_knowledge_import",
+        "get_import_job_status",
+        "export_import_errors"
+      ],
+      "module2": [
+        "preview_patient_import",
+        "apply_masking_and_import_patients"
+      ],
+      "module3": [
+        "list_epidemic_contexts",
+        "upsert_epidemic_context",
+        "notify_server_hot_reload"
+      ],
+      "module4": [
+        "get_medical_dictionaries",
+        "save_symptom_synonym",
+        "delete_symptom_synonym",
+        "save_red_flag_rule",
+        "delete_red_flag_rule",
+        "test_dictionary_sandbox"
+      ],
+      "module5": [
+        "run_ecs_whitebox_triage",
+        "reset_ecs_debug_session",
+        "list_debug_patients"
+      ],
+      "module6": [
+        "list_llm_providers",
+        "upsert_llm_provider",
+        "test_llm_provider_connectivity",
+        "get_router_config",
+        "save_router_config",
+        "list_api_keys",
+        "issue_api_key",
+        "revoke_api_key",
+        "get_gateway_metrics"
+      ]
+    }
+  }
+}

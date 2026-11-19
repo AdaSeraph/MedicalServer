@@ -1,0 +1,35 @@
+{
+  "winter_flu": {
+    "context_id": "epi_2026_winter_flu",
+    "region_code": "CN-110000",
+    "region_name": "北京市",
+    "season": "winter",
+    "disease_name": "甲型流行性感冒",
+    "seasonal_tag": "influenza_season",
+    "intensity": 0.85,
+    "boost_symptoms": ["高热", "全身肌肉酸痛", "乏力", "咽痛", "干咳"],
+    "priority_question_hint": "近期是否有发热人员接触史或未接种流感疫苗",
+    "active": true,
+    "valid_from": "2026-11-01",
+    "valid_to": "2027-03-15"
+  },
+  "mycoplasma_outbreak": {
+    "context_id": "epi_2026_autumn_mycoplasma",
+    "region_code": "CN-110000",
+    "region_name": "北京市",
+    "season": "winter",
+    "disease_name": "支原体肺炎",
+    "seasonal_tag": "mycoplasma_season",
+    "intensity": 0.92,
+    "boost_symptoms": ["持续干咳", "发热", "咽痛"],
+    "priority_question_hint": "学校或托幼机构近期是否有支原体聚集性咳嗽病例",
+    "active": true,
+    "valid_from": "2026-10-15",
+    "valid_to": "2027-02-28"
+  },
+  "reload_request": {
+    "reload_epidemics": true,
+    "reload_dictionaries": true,
+    "reload_router": true
+  }
+}

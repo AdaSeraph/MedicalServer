@@ -1,0 +1,89 @@
+{
+  "tenants": {
+    "hosp_a": {
+      "tenant_id": "hosp_a",
+      "name": "Hospital A HIS",
+      "api_key": "mk_live_hosp_a_e2e_key",
+      "namespace": "hosp_a",
+      "qpm": 120,
+      "tpm": 100000
+    },
+    "hosp_b": {
+      "tenant_id": "hosp_b",
+      "name": "Hospital B Kiosk",
+      "api_key": "mk_live_hosp_b_e2e_key",
+      "namespace": "hosp_b",
+      "qpm": 120,
+      "tpm": 100000
+    },
+    "qpm_test_t1_04": {
+      "tenant_id": "qpm_t1_04",
+      "name": "QPM Throttle T1-04",
+      "api_key": "mk_live_qpm_t1_04_e2e_key",
+      "namespace": "default",
+      "qpm": 3,
+      "tpm": 500
+    },
+    "qpm_test_t1_05": {
+      "tenant_id": "qpm_t1_05",
+      "name": "QPM Throttle T1-05",
+      "api_key": "mk_live_qpm_t1_05_e2e_key",
+      "namespace": "default",
+      "qpm": 3,
+      "tpm": 500
+    },
+    "qpm_test_t2_06": {
+      "tenant_id": "qpm_t2_06",
+      "name": "QPM Throttle T2-06",
+      "api_key": "mk_live_qpm_t2_06_e2e_key",
+      "namespace": "default",
+      "qpm": 3,
+      "tpm": 500
+    },
+    "qpm_test_t4_07": {
+      "tenant_id": "qpm_t4_07",
+      "name": "QPM Throttle T4-07",
+      "api_key": "mk_live_qpm_t4_07_e2e_key",
+      "namespace": "default",
+      "qpm": 3,
+      "tpm": 500
+    },
+    "revoked": {
+      "tenant_id": "revoked",
+      "name": "Revoked Key",
+      "api_key": "mk_live_revoked_e2e_key",
+      "namespace": "revoked",
+      "qpm": 60,
+      "tpm": 10000,
+      "revoked": true
+    }
+  },
+  "seed_knowledge": [
+    {
+      "doc_id": "hosp_a_private_doc_01",
+      "tenant_namespace": "hosp_a",
+      "source_title": "A院区特需呼吸门诊路径",
+      "source_type": "hospital_manual",
+      "authority_level": 0.9,
+      "disease_name": "A院区特需呼吸门诊路径",
+      "department": "呼吸内科",
+      "target_population": ["adult"],
+      "section_type": "triage_rule",
+      "content": "A院区专属呼吸内科高热咳嗽分诊路径。",
+      "key_symptoms": ["高热", "咳嗽", "hosp_a_private"]
+    },
+    {
+      "doc_id": "hosp_b_private_doc_01",
+      "tenant_namespace": "hosp_b",
+      "source_title": "B院区特需发热门诊路径",
+      "source_type": "hospital_manual",
+      "authority_level": 0.9,
+      "disease_name": "B院区特需发热门诊路径",
+      "department": "发热门诊",
+      "target_population": ["adult"],
+      "section_type": "triage_rule",
+      "content": "B院区专属发热门诊高热咳嗽分诊路径。",
+      "key_symptoms": ["高热", "咳嗽", "hosp_b_private"]
+    }
+  ]
+}

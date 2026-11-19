@@ -1,0 +1,45 @@
+{
+  "collections": [
+    {
+      "name": "medical_knowledge",
+      "vectors": {
+        "size": 1024,
+        "distance": "Cosine"
+      },
+      "hnsw_config": {
+        "m": 16,
+        "ef_construct": 128
+      },
+      "payload_indexes": [
+        { "field_name": "tenant_namespace", "field_schema": "keyword", "is_tenant": true },
+        { "field_name": "doc_id", "field_schema": "keyword" },
+        { "field_name": "target_population", "field_schema": "keyword" },
+        { "field_name": "department", "field_schema": "keyword" },
+        { "field_name": "secondary_departments", "field_schema": "keyword" },
+        { "field_name": "authority_level", "field_schema": "float" },
+        { "field_name": "seasonal_tags", "field_schema": "keyword" },
+        { "field_name": "section_type", "field_schema": "keyword" },
+        { "field_name": "disease_name", "field_schema": "keyword" }
+      ]
+    },
+    {
+      "name": "patient_l3_events",
+      "vectors": {
+        "size": 1024,
+        "distance": "Cosine"
+      },
+      "hnsw_config": {
+        "m": 16,
+        "ef_construct": 128
+      },
+      "payload_indexes": [
+        { "field_name": "tenant_id", "field_schema": "keyword", "is_tenant": true },
+        { "field_name": "patient_id", "field_schema": "keyword" },
+        { "field_name": "event_id", "field_schema": "keyword" },
+        { "field_name": "recommended_department", "field_schema": "keyword" },
+        { "field_name": "urgency_level", "field_schema": "integer" },
+        { "field_name": "occurred_at_unix", "field_schema": "integer" }
+      ]
+    }
+  ]
+}

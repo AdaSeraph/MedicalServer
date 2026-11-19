@@ -1,0 +1,102 @@
+{
+  "$schema_version": "1.0.0",
+  "description": "MedicalServer 统一数据采集标准格式模板（适用于 medical-pipeline 与 MedicalStudio GUI 导入）",
+  "knowledge_documents": [
+    {
+      "doc_id": "book_internal_med_9th_ch02_001",
+      "source_title": "内科学（第9版）",
+      "source_type": "textbook",
+      "authority_level": 1.0,
+      "disease_name": "流行性感冒",
+      "aliases": ["甲流", "乙流", "流感", "流行性感冒病毒感染"],
+      "department": "呼吸内科",
+      "secondary_departments": ["发热门诊", "感染科", "急诊科"],
+      "target_population": ["adult", "elderly", "child", "pregnant"],
+      "section_type": "clinical_manifestation",
+      "content": "起病急，主要表现为高热（体温可达39~40℃）、畏寒、寒战、头痛、全身肌肉关节酸痛、极度乏力、食欲减退等全身症状，常有咽喉痛、干咳，可有鼻塞、流涕、胸骨后不适。无并发症者病程呈自限性，多于发病3~4天后体温逐渐消退。",
+      "key_symptoms": ["高热", "全身肌肉酸痛", "乏力", "咽痛", "干咳", "寒战"],
+      "differential_points": [
+        "普通感冒以鼻塞流涕等局部卡他症状为主，全身酸痛和持续高热相对较轻",
+        "若持续高热超3天伴呼吸急促、胸闷或血氧下降，需警惕病毒性肺炎"
+      ],
+      "red_flag_signs": ["呼吸困难", "持续高热超过3天不退", "意识模糊", "口唇发绀", "剧烈胸痛"],
+      "seasonal_tags": ["winter", "spring", "influenza_season"],
+      "suggested_follow_up_slots": [
+        {
+          "slot_key": "onset_duration",
+          "short_question": "发烧大概持续多久了？",
+          "quick_options": ["今天刚开始", "2~3天", "超过3天"]
+        },
+        {
+          "slot_key": "contact_history",
+          "short_question": "身边近期有人发烧或感冒吗？",
+          "quick_options": ["有家人/同事发烧", "没有明确接触", "不太清楚"]
+        }
+      ],
+      "updated_at": "2026-11-18T00:00:00Z"
+    }
+  ],
+  "patient_records": [
+    {
+      "patient_id": "pat_sha256_a1b2c3d4e5f6",
+      "consent_long_term_memory": true,
+      "l2_profile": {
+        "age_group": "30-39",
+        "gender": "female",
+        "is_pregnant": false,
+        "chronic_diseases": ["过敏性鼻炎", "轻度哮喘"],
+        "allergies": ["青霉素", "海鲜"],
+        "surgical_history": ["阑尾切除术(2021)"],
+        "long_term_medications": ["布地奈德吸入剂(按需)"]
+      },
+      "l3_visit_events": [
+        {
+          "event_id": "evt_20260915_001",
+          "occurred_at": "2026-09-15T09:30:00Z",
+          "chief_complaint": "换季夜间干咳伴轻微胸闷",
+          "extracted_symptoms": ["干咳", "胸闷", "夜间加重"],
+          "recommended_department": "呼吸内科",
+          "urgency_level": 2,
+          "summary": "秋季过敏诱发气道高反应，建议呼吸内科评估肺功能，避免接触过敏原。"
+        }
+      ]
+    }
+  ],
+  "epidemic_contexts": [
+    {
+      "context_id": "epi_2026_winter_flu",
+      "region_code": "CN-110000",
+      "region_name": "北京市",
+      "season": "winter",
+      "disease_name": "甲型流行性感冒",
+      "seasonal_tag": "influenza_season",
+      "intensity": 0.85,
+      "boost_symptoms": ["高热", "全身肌肉酸痛", "乏力", "咽痛", "干咳"],
+      "priority_question_hint": "近期是否有发热人员接触史或未接种流感疫苗",
+      "active": true,
+      "valid_from": "2026-11-01",
+      "valid_to": "2027-03-15"
+    }
+  ],
+  "medical_dictionaries": {
+    "symptom_synonyms": [
+      {
+        "standard_term": "上腹痛",
+        "colloquial_terms": ["心口窝疼", "胃口疼", "上肚子痛", "剑突下疼"]
+      },
+      {
+        "standard_term": "呼吸困难",
+        "colloquial_terms": ["喘不上气", "气短", "憋气", "吸不进气"]
+      }
+    ],
+    "red_flag_rules": [
+      {
+        "rule_id": "rf_acute_chest_pain",
+        "level": "Emergency120",
+        "trigger_all_of": ["胸痛"],
+        "trigger_any_of": ["大汗", "左臂放射痛", "呼吸困难", "濒死感", "撕裂样"],
+        "alert_message": "您描述的症状提示可能存在急性心血管或胸部危重症风险，请立即停止等待，尽快拨打 120 或前往最近医院急诊科就诊！"
+      }
+    ]
+  }
+}

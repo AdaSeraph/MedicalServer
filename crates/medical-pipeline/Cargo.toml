@@ -1,0 +1,34 @@
+[package]
+name = "medical-pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+local-fastembed = ["dep:fastembed"]
+
+[dependencies]
+medical-core = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+regex = { workspace = true }
+tracing = { workspace = true }
+
+rayon = { workspace = true }
+sonic-rs = { workspace = true }
+tantivy = { workspace = true }
+tantivy-jieba = { workspace = true }
+pulldown-cmark = { workspace = true }
+docx-rs = { workspace = true }
+pdf-extract = { workspace = true }
+lopdf = { workspace = true }
+calamine = { workspace = true }
+csv = { workspace = true }
+qdrant-client = { workspace = true }
+fastembed = { workspace = true, optional = true }

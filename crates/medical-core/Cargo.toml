@@ -1,0 +1,39 @@
+[package]
+name = "medical-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+regex = { workspace = true }
+arc-swap = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+
+bevy_ecs = { workspace = true }
+aho-corasick = { workspace = true }
+jieba-rs = { workspace = true }
+
+aes-gcm = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+
+sqlx = { workspace = true }
+redis = { workspace = true }
+qdrant-client = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }

@@ -1,0 +1,65 @@
+{
+  "winter_flu_peak": {
+    "region_code": "CN-110000",
+    "target_population": ["adult"],
+    "turns": [
+      "浑身酸痛，发烧39度，嗓子疼",
+      "2~3天",
+      "有家人/同事发烧"
+    ]
+  },
+  "emergency_chest_pain_colloquial": {
+    "utterance": "老爷子突然心口窝撕裂样疼，直冒冷汗还喘不上气",
+    "target_population": ["elderly"]
+  },
+  "emergency_chest_pain_standard": {
+    "utterance": "突然胸痛，伴随大汗和左臂放射痛",
+    "target_population": ["adult"]
+  },
+  "partial_chest_pain_non_emergency": {
+    "utterance": "左边胸口轻微隐痛两天，没有出汗也不憋气",
+    "target_population": ["adult"]
+  },
+  "pregnant_allergy_repeat": {
+    "patient_profile": {
+      "consent_long_term_memory": true,
+      "l2_profile": {
+        "age_group": "30-39",
+        "gender": "female",
+        "is_pregnant": true,
+        "chronic_diseases": ["轻度哮喘"],
+        "allergies": ["青霉素", "头孢类"],
+        "surgical_history": [],
+        "long_term_medications": []
+      },
+      "l3_visit_events": [
+        {
+          "event_id": "evt_preg_001",
+          "occurred_at": "2026-09-15T09:30:00Z",
+          "chief_complaint": "换季夜间干咳伴轻微胸闷",
+          "extracted_symptoms": ["干咳", "胸闷"],
+          "recommended_department": "呼吸内科",
+          "urgency_level": 2,
+          "summary": "秋季过敏诱发气道高反应，建议呼吸内科评估"
+        }
+      ]
+    },
+    "utterance": "今天又开始胸闷气短，还有点低烧",
+    "target_population": ["pregnant"]
+  },
+  "pediatric_mycoplasma_fever": {
+    "region_code": "CN-110000",
+    "target_population": ["child"],
+    "utterance": "孩子持续高烧39.5度伴剧烈干咳4天",
+    "expected_departments": ["儿科", "小儿呼吸科", "发热门诊", "呼吸内科"]
+  },
+  "pii_mixed_utterance": {
+    "utterance": "我叫王小红，身份证号110105199203084321，手机号13711112222，家住海淀区中关村大街1号，最近反酸烧心三天",
+    "forbidden_echo": ["王小红", "110105199203084321", "13711112222", "中关村大街1号"]
+  },
+  "vitals_with_phone_utterance": {
+    "utterance": "体温39.5℃，血压140/90mmHg，心率110次/分，血糖7.8mmol/L，电话+86 138-0013-8000，发烧3天",
+    "preserved_vitals": ["39.5", "140/90", "110", "7.8"],
+    "forbidden_pii": ["138-0013-8000", "13800138000"]
+  }
+}

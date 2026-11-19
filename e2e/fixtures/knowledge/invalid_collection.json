@@ -1,0 +1,261 @@
+{
+  "negative_cases": [
+    {
+      "case_id": "bad_authority_low",
+      "entity_type": "knowledge_document",
+      "expected_error_field": "authority_level",
+      "payload": {
+        "doc_id": "neg_doc_01",
+        "source_title": "测试教材",
+        "source_type": "textbook",
+        "authority_level": 0.09,
+        "disease_name": "感冒",
+        "department": "呼吸内科",
+        "target_population": ["adult"],
+        "section_type": "clinical_manifestation",
+        "content": "低权威边界测试内容。",
+        "key_symptoms": ["鼻塞"]
+      }
+    },
+    {
+      "case_id": "bad_authority_high",
+      "entity_type": "knowledge_document",
+      "expected_error_field": "authority_level",
+      "payload": {
+        "doc_id": "neg_doc_02",
+        "source_title": "测试教材",
+        "source_type": "textbook",
+        "authority_level": 1.01,
+        "disease_name": "感冒",
+        "department": "呼吸内科",
+        "target_population": ["adult"],
+        "section_type": "clinical_manifestation",
+        "content": "高权威边界测试内容。",
+        "key_symptoms": ["鼻塞"]
+      }
+    },
+    {
+      "case_id": "bad_source_type",
+      "entity_type": "knowledge_document",
+      "expected_error_field": "source_type",
+      "payload": {
+        "doc_id": "neg_doc_03",
+        "source_title": "个人博客",
+        "source_type": "medical_blog",
+        "authority_level": 0.5,
+        "disease_name": "感冒",
+        "department": "呼吸内科",
+        "target_population": ["adult"],
+        "section_type": "clinical_manifestation",
+        "content": "非法来源枚举测试。",
+        "key_symptoms": ["咳嗽"]
+      }
+    },
+    {
+      "case_id": "bad_target_population_empty",
+      "entity_type": "knowledge_document",
+      "expected_error_field": "target_population",
+      "payload": {
+        "doc_id": "neg_doc_04",
+        "source_title": "测试教材",
+        "source_type": "textbook",
+        "authority_level": 0.8,
+        "disease_name": "感冒",
+        "department": "呼吸内科",
+        "target_population": [],
+        "section_type": "clinical_manifestation",
+        "content": "空适用人群边界测试。",
+        "key_symptoms": ["咳嗽"]
+      }
+    },
+    {
+      "case_id": "bad_slot_31chars",
+      "entity_type": "knowledge_document",
+      "expected_error_field": "short_question",
+      "payload": {
+        "doc_id": "neg_doc_05",
+        "source_title": "测试教材",
+        "source_type": "textbook",
+        "authority_level": 0.9,
+        "disease_name": "感冒",
+        "department": "呼吸内科",
+        "target_population": ["adult"],
+        "section_type": "triage_rule",
+        "content": "追问超长边界测试。",
+        "key_symptoms": ["咳嗽"],
+        "suggested_follow_up_slots": [
+          {
+            "slot_key": "too_long",
+            "short_question": "请问您这种反复发作的咳嗽症状到底是从什么时候开始持续到现在的？",
+            "quick_options": ["今天", "三天"]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "bad_slot_1opt",
+      "entity_type": "knowledge_document",
+      "expected_error_field": "quick_options",
+      "payload": {
+        "doc_id": "neg_doc_06",
+        "source_title": "测试教材",
+        "source_type": "textbook",
+        "authority_level": 0.9,
+        "disease_name": "感冒",
+        "department": "呼吸内科",
+        "target_population": ["adult"],
+        "section_type": "triage_rule",
+        "content": "选项少于2个边界测试。",
+        "key_symptoms": ["发热"],
+        "suggested_follow_up_slots": [
+          {
+            "slot_key": "one_opt",
+            "short_question": "是否发烧？",
+            "quick_options": ["是"]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "bad_slot_5opt",
+      "entity_type": "knowledge_document",
+      "expected_error_field": "quick_options",
+      "payload": {
+        "doc_id": "neg_doc_07",
+        "source_title": "测试教材",
+        "source_type": "textbook",
+        "authority_level": 0.9,
+        "disease_name": "感冒",
+        "department": "呼吸内科",
+        "target_population": ["adult"],
+        "section_type": "triage_rule",
+        "content": "选项多于4个边界测试。",
+        "key_symptoms": ["发热"],
+        "suggested_follow_up_slots": [
+          {
+            "slot_key": "five_opt",
+            "short_question": "持续几天了？",
+            "quick_options": ["1天", "2天", "3天", "4天", "5天"]
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "bad_patient_id_18",
+      "entity_type": "patient_record",
+      "expected_error_field": "patient_id",
+      "payload": {
+        "patient_id": "11010119900101123X",
+        "consent_long_term_memory": true,
+        "l2_profile": {
+          "age_group": "30-39",
+          "gender": "male",
+          "is_pregnant": false,
+          "chronic_diseases": [],
+          "allergies": [],
+          "surgical_history": [],
+          "long_term_medications": []
+        },
+        "l3_visit_events": []
+      }
+    },
+    {
+      "case_id": "bad_patient_phone",
+      "entity_type": "patient_record",
+      "expected_error_field": "patient_id",
+      "payload": {
+        "patient_id": "13800138000",
+        "consent_long_term_memory": true,
+        "l2_profile": {
+          "age_group": "30-39",
+          "gender": "male",
+          "is_pregnant": false,
+          "chronic_diseases": [],
+          "allergies": [],
+          "surgical_history": [],
+          "long_term_medications": []
+        },
+        "l3_visit_events": []
+      }
+    },
+    {
+      "case_id": "bad_urgency_5",
+      "entity_type": "patient_record",
+      "expected_error_field": "urgency_level",
+      "payload": {
+        "patient_id": "pat_sha256_valid_001",
+        "consent_long_term_memory": true,
+        "l2_profile": {
+          "age_group": "30-39",
+          "gender": "female",
+          "is_pregnant": false,
+          "chronic_diseases": [],
+          "allergies": [],
+          "surgical_history": [],
+          "long_term_medications": []
+        },
+        "l3_visit_events": [
+          {
+            "event_id": "evt_bad_01",
+            "occurred_at": "2026-10-01T00:00:00Z",
+            "chief_complaint": "发热",
+            "extracted_symptoms": ["发热"],
+            "recommended_department": "发热门诊",
+            "urgency_level": 5,
+            "summary": "非法紧急等级测试"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "bad_epidemic_intensity",
+      "entity_type": "epidemic_context",
+      "expected_error_field": "intensity",
+      "payload": {
+        "context_id": "epi_bad_01",
+        "region_code": "CN-110000",
+        "region_name": "北京市",
+        "season": "winter",
+        "disease_name": "甲流",
+        "seasonal_tag": "influenza_season",
+        "intensity": 1.05,
+        "boost_symptoms": ["高热"],
+        "priority_question_hint": "接触史",
+        "active": true,
+        "valid_from": "2026-11-01",
+        "valid_to": "2027-03-15"
+      }
+    },
+    {
+      "case_id": "bad_epidemic_dates",
+      "entity_type": "epidemic_context",
+      "expected_error_field": "valid_from",
+      "payload": {
+        "context_id": "epi_bad_02",
+        "region_code": "CN-110000",
+        "region_name": "北京市",
+        "season": "winter",
+        "disease_name": "甲流",
+        "seasonal_tag": "influenza_season",
+        "intensity": 0.8,
+        "boost_symptoms": ["高热"],
+        "priority_question_hint": "接触史",
+        "active": true,
+        "valid_from": "2027-03-15",
+        "valid_to": "2026-11-01"
+      }
+    },
+    {
+      "case_id": "bad_red_flag_empty",
+      "entity_type": "red_flag_rule",
+      "expected_error_field": "trigger",
+      "payload": {
+        "rule_id": "rf_bad_empty",
+        "level": "Emergency120",
+        "trigger_all_of": [],
+        "trigger_any_of": [],
+        "alert_message": "空触发器测试"
+      }
+    }
+  ]
+}

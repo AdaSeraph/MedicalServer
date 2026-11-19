@@ -1,0 +1,4 @@
+patient_id,consent_long_term_memory,age_group,gender,is_pregnant,chronic_diseases,allergies,surgical_history,long_term_medications,occurred_at,chief_complaint,extracted_symptoms,recommended_department,urgency_level,summary
+pat_sha256_valid_001,true,30-39,female,false,过敏性鼻炎;轻度哮喘,青霉素,阑尾切除术(2021),布地奈德吸入剂,2026-09-15T09:30:00Z,换季夜间干咳伴轻微胸闷,干咳;胸闷,呼吸内科,2,秋季过敏诱发气道高反应建议呼吸内科评估
+pat_sha256_valid_002,true,60-69,male,false,高血压;2型糖尿病,无,无,氨氯地平;二甲双胍,2026-10-01T10:00:00Z,头晕伴血压偏高,头晕;血压升高,心血管内科,2,既往高血压控制不佳建议心血管内科评估
+pat_sha256_valid_003,false,20-29,female,true,无,头孢类,无,无,2026-10-12T11:20:00Z,孕期咽痛低热一天,咽痛;低热,产科,2,未开启长期记忆留存仅作当次分诊参考

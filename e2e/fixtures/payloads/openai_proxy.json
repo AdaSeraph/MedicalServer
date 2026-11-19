@@ -1,0 +1,30 @@
+{
+  "standard_completion": {
+    "model": "medical-triage",
+    "stream": false,
+    "messages": [
+      {"role": "user", "content": "高热伴咳嗽咽痛两天，应该挂哪个科室？"}
+    ]
+  },
+  "streaming_completion": {
+    "model": "medical-triage",
+    "stream": true,
+    "messages": [
+      {"role": "user", "content": "反复反酸烧心三天，需要注意什么？"}
+    ]
+  },
+  "pii_scrub_completion": {
+    "model": "medical-triage",
+    "stream": false,
+    "messages": [
+      {"role": "user", "content": "患者张三，手机13911112222，身份证310101198505054321，头痛两天"}
+    ]
+  },
+  "emergency_completion": {
+    "model": "medical-triage",
+    "stream": false,
+    "messages": [
+      {"role": "user", "content": "突然胸痛伴大汗和左臂放射痛，还有濒死感"}
+    ]
+  }
+}

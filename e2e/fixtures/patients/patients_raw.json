@@ -1,0 +1,48 @@
+[
+  {
+    "name": "张伟",
+    "id_card": "110101199001011234",
+    "phone": "13800138000",
+    "address": "北京市朝阳区幸福路10号3单元",
+    "age": 34,
+    "gender": "male",
+    "is_pregnant": false,
+    "consent_long_term_memory": true,
+    "chronic_diseases": ["高血压"],
+    "allergies": ["青霉素"],
+    "surgical_history": [],
+    "long_term_medications": ["氨氯地平"],
+    "visit_event": {
+      "event_id": "evt_raw_001",
+      "occurred_at": "2026-10-01T10:00:00Z",
+      "chief_complaint": "患者张伟(13800138000)头晕伴血压升高",
+      "extracted_symptoms": ["头晕", "血压升高"],
+      "recommended_department": "心血管内科",
+      "urgency_level": 2,
+      "summary": "既往高血压控制不佳建议心血管内科评估"
+    }
+  },
+  {
+    "name": "李敏",
+    "id_card": "11010119850505122X",
+    "phone": "13912345678",
+    "address": "上海市浦东新区张江路88号",
+    "age": 41,
+    "gender": "female",
+    "is_pregnant": false,
+    "consent_long_term_memory": true,
+    "chronic_diseases": ["过敏性鼻炎", "轻度哮喘"],
+    "allergies": ["海鲜"],
+    "surgical_history": ["阑尾切除术(2020)"],
+    "long_term_medications": ["布地奈德吸入剂"],
+    "visit_event": {
+      "event_id": "evt_raw_002",
+      "occurred_at": "2026-10-02T14:20:00Z",
+      "chief_complaint": "夜间干咳胸闷",
+      "extracted_symptoms": ["干咳", "胸闷"],
+      "recommended_department": "呼吸内科",
+      "urgency_level": 2,
+      "summary": "换季诱发轻度哮喘急性发作风险建议呼吸内科评估"
+    }
+  }
+]

@@ -1,0 +1,34 @@
+[package]
+name = "medical-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+medical-core = { workspace = true }
+medical-pipeline = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+arc-swap = { workspace = true }
+dashmap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+jsonwebtoken = { workspace = true }
+prometheus = { workspace = true }
+redis = { workspace = true }
+sqlx = { workspace = true }
+qdrant-client = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
