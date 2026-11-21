@@ -3955,9 +3955,11 @@ dependencies = [
 name = "medical-studio"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "chrono",
  "medical-core",
  "medical-pipeline",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tauri",

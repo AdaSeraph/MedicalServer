@@ -2,7 +2,7 @@
 
 - **存档时间**: 2026-11-21
 - **工作区**: `e:\RustP\MedicalServer`
-- **当前构建与测试状态**: `cargo test --workspace` 全量通过（exit code 0，48/48 测试通过：`medical-core` 37 项 + `medical-pipeline` 7 项 + `medical-server` 4 项）
+- **当前构建与测试状态**: `cargo test --workspace` 全量通过（exit code 0，50/50 测试通过：`medical-core` 37 项 + `medical-pipeline` 7 项 + `medical-server` 4 项 + `medical-studio` 2 项）；`medical-studio` 前端 `vite build` 通过
 
 ---
 
@@ -39,14 +39,15 @@
 - [x] 端到端集成测试（`tests/server_integration_tests.rs`，4/4 通过，离线 Mock 适配器独立运行）
 - [x] 部署与压测配置：`deploy/Dockerfile`（多阶段生产构建）、`k6/triage_load_test.js`、`deploy/prometheus/{prometheus,alerts}.yml`、`deploy/grafana/provisioning/*` & `deploy/grafana/dashboards/medical-server.json`
 
-### 里程碑 M4：`crates/medical-studio`（Phase 2 & 3 Tauri 2.0 桌面工具箱）
-- [ ] 前端（Vue 3 + Tailwind）与 Tauri Rust Commands 绑定，交付六大模块：
-  1. 医学知识库导入工坊（切片预览与断点续传）
-  2. 病人数据导入与脱敏中心
-  3. 季节与流行病上下文控制台（热更新通知）
-  4. 关键词与急危重症词典管理器（测试沙盒）
-  5. ECS 分诊白盒调试台（左右分栏透视各 `Component` 状态）
-  6. AI 大模型与开放 API 网关配置中心
+### 里程碑 M4：`crates/medical-studio`（Phase 2 & 3 Tauri 2.0 桌面工具箱，已完成并通过 2 项全模块集成测试与前端构建）
+- [x] Tauri 2.0 Rust 后端（`src/state.rs`, `src/commands.rs`, `src/lib.rs`）：注册全部 28 个 `#[tauri::command]` 并通过 `tests/studio_commands_tests.rs`（2/2 通过）
+- [x] Vue 3 + Vite + Tailwind CSS 前端（`frontend/src/components/`）与生产构建产出（`frontend/dist/`），交付全部六大模块：
+  1. 医学知识库导入工坊（`KnowledgeImportPanel.vue`，切片预览、双写与断点续传、错误日志导出）
+  2. 病人数据导入与脱敏中心（`PatientMaskingPanel.vue`，PII 列检测高亮、脱敏预检与入库）
+  3. 季节与流行病上下文控制台（`EpidemicConsolePanel.vue`，强度滑块与 `medical-server` 热更新推送）
+  4. 关键词与急危重症词典管理器（`DictionaryManagerPanel.vue`，双词典维护与实时测试沙盒）
+  5. ECS 分诊白盒调试台（`EcsDebuggerPanel.vue`，左右分栏模拟聊天 + 实时 ECS Component Inspector）
+  6. AI 大模型与开放 API 网关配置中心（`LlmGatewayPanel.vue`，多模型连通性测速、路由策略、API Key 签发吊销与指标统计）
 
 ### 里程碑 M5：`miniapp/`（Phase 4 原生微信小程序）
 - [ ] 隐私知情同意与 AI 导诊免责声明弹窗
@@ -62,4 +63,4 @@
 ---
 
 ## 三、恢复开发指引
-下次恢复时，直接说明：**“读取 `PROGRESS.md`，从里程碑 M4（`medical-studio`）继续开发”** 即可无缝衔接。
+下次恢复时，直接说明：**“读取 `PROGRESS.md`，从里程碑 M5（`miniapp/`）继续开发”** 即可无缝衔接。
