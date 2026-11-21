@@ -1,0 +1,41 @@
+<view class="memory-page">
+  <view class="card section">
+    <view class="section-title">隐私授权状态</view>
+    <view class="consent-row">
+      <text>允许长期健康档案记忆（L2/L3 加密存储）</text>
+      <switch checked="{{consentLongTermMemory}}" bindchange="onToggleConsent" color="#0f766e" />
+    </view>
+    <view class="pid-label">匿名档案号：{{patientId}}</view>
+  </view>
+
+  <view wx:if="{{record}}" class="card section">
+    <view class="section-title">L2 长期健康画像（AES-256-GCM 加密）</view>
+    <view class="field-row"><text class="label">年龄段：</text><text>{{record.l2_profile.age_group || '未设置'}}</text></view>
+    <view class="field-row"><text class="label">慢病史：</text><text>{{chronicText}}</text></view>
+    <view class="field-row"><text class="label">过敏史：</text><text class="allergy-text">{{allergyText}}</text></view>
+    <view class="field-row"><text class="label">长期用药：</text><text>{{medicationText}}</text></view>
+  </view>
+
+  <view wx:if="{{record && record.l3_visit_events.length > 0}}" class="card section">
+    <view class="section-title">L3 历次分诊记录</view>
+    <block wx:for="{{record.l3_visit_events}}" wx:key="event_id">
+      <view class="event-item">
+        <view class="event-head">
+          <text class="event-dept">{{item.recommended_department}}</text>
+          <text class="event-date">{{item.occurred_at}}</text>
+        </view>
+        <view class="event-cc">主诉：{{item.chief_complaint}}</view>
+        <view class="event-summary">{{item.summary}}</view>
+      </view>
+    </block>
+  </view>
+
+  <view wx:if="{{!record && !loading}}" class="card section empty-box">
+    <text>当前暂无长期健康记忆记录。</text>
+  </view>
+
+  <view class="section">
+    <button class="btn-danger" bindtap="onWipeMemory">一键清空并注销全部长期记忆</button>
+    <view class="wipe-hint">点击后将物理清除数据库 L2 画像、L3 历史事件、向量索引及当前会话缓存，不可恢复。</view>
+  </view>
+</view>

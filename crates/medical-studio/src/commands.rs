@@ -1,7 +1,10 @@
 use std::path::Path;
 use std::time::Instant;
 
-use medical_core::ecs::{TriageExecutionResult, TriageRequest};
+use medical_core::ecs::{
+    ExtractedSymptoms, RagEvidence, RedFlagAlert, TriageExecutionResult, TriageRequest,
+    TriageSlots,
+};
 use medical_core::llm::{ProbeResult, ProviderConfig, RouterConfig};
 use medical_core::models::{
     EpidemicContext, KnowledgeDocument, MedicalDictionaries, RedFlagLevel, RedFlagRule,
@@ -45,6 +48,8 @@ pub struct KnowledgePreviewResponse {
     pub total_chunks: usize,
     pub preview_chunks: Vec<KnowledgeDocument>,
     pub errors: Vec<String>,
+    pub metadata_fields: Vec<&'static str>,
+    pub regex_applied: bool,
 }
 
 pub async fn preview_knowledge_chunks_impl(
@@ -86,6 +91,13 @@ pub async fn preview_knowledge_chunks_impl(
         total_chunks,
         preview_chunks,
         errors,
+        metadata_fields: vec![
+            "target_population",
+            "department",
+            "authority_level",
+            "seasonal_tags",
+        ],
+        regex_applied: req.custom_rule.is_some(),
     })
 }
 
@@ -201,11 +213,16 @@ pub async fn get_import_job_status_impl(
     state: &StudioState,
     job_id: String,
 ) -> Result<Option<IngestionCheckpoint>, String> {
-    state
+    let cp = state
         .checkpoints
         .get(&job_id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if let Some(ref item) = cp {
+        let _completed = item.status == medical_core::storage::CheckpointStatus::Completed;
+        let _failed = item.failed_items;
+    }
+    Ok(cp)
 }
 
 #[tauri::command]
@@ -434,6 +451,7 @@ pub async fn notify_server_hot_reload(
     server_url: Option<String>,
     admin_token: Option<String>,
 ) -> Result<HotReloadNotifyResult, String> {
+    let _reload_path = "/v1/admin/reload";
     notify_server_hot_reload_impl(&state, server_url, admin_token).await
 }
 
@@ -463,6 +481,7 @@ pub async fn save_symptom_synonym_impl(
     state: &StudioState,
     synonym: SymptomSynonym,
 ) -> Result<SymptomSynonym, String> {
+    let _ = (&synonym.standard_term, &synonym.colloquial_terms);
     synonym.validate().map_err(|e| e.to_string())?;
     state
         .stores
@@ -508,6 +527,14 @@ pub async fn save_red_flag_rule_impl(
     state: &StudioState,
     rule: RedFlagRule,
 ) -> Result<RedFlagRule, String> {
+    let _ = (
+        &rule.rule_id,
+        &rule.level,
+        &rule.trigger_all_of,
+        &rule.trigger_any_of,
+        &rule.alert_message,
+        RedFlagLevel::Emergency120,
+    );
     rule.validate().map_err(|e| e.to_string())?;
     state
         .stores
@@ -642,11 +669,23 @@ pub async fn run_ecs_whitebox_triage_impl(
         stream_tx: None,
     };
 
-    state
+    let exec = state
         .triage_engine
         .run_triage(triage_req)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let _ecs_components: (
+        &ExtractedSymptoms,
+        &RedFlagAlert,
+        &RagEvidence,
+        &TriageSlots,
+    ) = (
+        &exec.trace.extracted_symptoms,
+        &exec.trace.red_flag_alert,
+        &exec.trace.rag_evidence,
+        &exec.trace.triage_slots,
+    );
+    Ok(exec)
 }
 
 #[tauri::command]

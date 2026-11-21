@@ -79,6 +79,21 @@ onMounted(loadContexts);
           <input v-model="ctx.priority_question_hint" class="w-full px-3 py-1.5 rounded bg-slate-950 border border-slate-700 text-xs" />
         </div>
 
+        <div class="grid grid-cols-2 gap-2 text-xs">
+          <div>
+            <label class="block text-slate-400 mb-1">生效开始 (valid_from)</label>
+            <input v-model="ctx.valid_from" class="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700" />
+          </div>
+          <div>
+            <label class="block text-slate-400 mb-1">生效截止 (valid_to)</label>
+            <input v-model="ctx.valid_to" class="w-full px-2 py-1 rounded bg-slate-950 border border-slate-700" />
+          </div>
+        </div>
+
+        <div class="text-xs text-slate-400">
+          关联高发症状：{{ (ctx.boost_symptoms || []).join('、') }}
+        </div>
+
         <button @click="saveContext(ctx)" class="px-3 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-xs font-medium">保存配置</button>
       </div>
     </div>

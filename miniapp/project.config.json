@@ -1,0 +1,17 @@
+{
+  "description": "MedicalServer 智能医疗分诊与健康档案微信小程序",
+  "packOptions": {
+    "ignore": []
+  },
+  "setting": {
+    "urlCheck": false,
+    "es6": true,
+    "enhance": true,
+    "postcss": true,
+    "minified": true
+  },
+  "compileType": "miniprogram",
+  "libVersion": "3.5.0",
+  "appid": "wx0000000000000000",
+  "projectname": "medical-triage-miniapp"
+}

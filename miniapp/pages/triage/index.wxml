@@ -1,0 +1,96 @@
+<view class="container">
+  <!-- Header bar with Memory link -->
+  <view class="top-bar">
+    <view class="top-title">
+      <text class="title-main">智能分诊导诊助手</text>
+      <text class="title-sub">急诊红线实时守护 · 医学知识库循证</text>
+    </view>
+    <button class="memory-entry-btn" bindtap="goToMemoryPage">健康档案</button>
+  </view>
+
+  <!-- Chat messages scroll area -->
+  <scroll-view class="chat-list" scroll-y="true" scroll-into-view="{{scrollAnchor}}">
+    <block wx:for="{{messages}}" wx:key="id">
+      <view id="msg_{{item.id}}" class="msg-row {{item.role === 'user' ? 'msg-right' : 'msg-left'}}">
+        <view class="bubble {{item.role === 'user' ? 'bubble-user' : 'bubble-bot'}}">
+          <text class="bubble-text">{{item.content}}</text>
+        </view>
+
+        <!-- Structured Department Recommendation Card -->
+        <view wx:if="{{item.triage_result}}" class="triage-card card">
+          <view class="card-header">
+            <text class="dept-name">推荐科室：{{item.triage_result.primary_department}}</text>
+            <text class="urgency-tag">紧急度 {{item.triage_result.urgency_level}} 级</text>
+          </view>
+          <view wx:if="{{item.triage_result.secondary_departments.length > 0}}" class="secondary-depts">
+            <text>备选科室：{{item.triage_result.secondary_departments}}</text>
+          </view>
+          <view class="card-summary">
+            <text>{{item.triage_result.summary}}</text>
+          </view>
+          <view class="disclaimer-box">
+            <text>{{item.triage_result.disclaimer || disclaimerText}}</text>
+          </view>
+          <button class="btn-primary reg-btn" bindtap="onGuideRegistration" data-dept="{{item.triage_result.primary_department}}">
+            前往预约挂号（{{item.triage_result.primary_department}}）
+          </button>
+        </view>
+      </view>
+    </block>
+  </scroll-view>
+
+  <!-- Quick Options Bar (2~4 one-tap reply buttons) -->
+  <view wx:if="{{quickOptions.length > 0}}" class="quick-options-bar">
+    <block wx:for="{{quickOptions}}" wx:key="*this">
+      <button class="quick-opt-btn" bindtap="onTapQuickOption" data-option="{{item}}">
+        {{item}}
+      </button>
+    </block>
+  </view>
+
+  <!-- Bottom Input Bar -->
+  <view class="input-bar">
+    <input
+      class="chat-input"
+      value="{{inputText}}"
+      placeholder="请描述您的不适症状（如发烧、咳嗽）"
+      confirm-type="send"
+      bindinput="onInputChange"
+      bindconfirm="onSendMessage"
+    />
+    <button class="send-btn" disabled="{{loading}}" bindtap="onSendMessage">
+      {{loading ? '思考中' : '发送'}}
+    </button>
+  </view>
+
+  <!-- First-Entry Privacy Consent & AI Disclaimer Modal -->
+  <view wx:if="{{showConsentModal}}" class="modal-mask">
+    <view class="modal-box card">
+      <view class="modal-title">隐私知情同意与 AI 导诊免责声明</view>
+      <view class="modal-body">
+        <text>{{disclaimerText}}</text>
+        <text class="consent-desc">开启“长期健康档案记忆”后，系统将以匿名加密方式留存您的慢病、过敏史与既往分诊摘要，便于复诊时更精准导诊；您可随时在“健康档案”页一键物理清空注销。</text>
+      </view>
+      <view class="consent-check-row" bindtap="toggleConsentChoice">
+        <checkbox checked="{{consentLongTermMemory}}" />
+        <text class="consent-label">我同意授权匿名长期健康记忆（可随时一键清空）</text>
+      </view>
+      <button class="btn-primary modal-confirm-btn" bindtap="onAcceptDisclaimer">我已知晓并开始导诊</button>
+    </view>
+  </view>
+
+  <!-- Emergency120 Red Alert Modal -->
+  <view wx:if="{{showEmergencyModal}}" class="modal-mask">
+    <view class="modal-box emergency-box">
+      <view class="emergency-title">急危重症红色警示（Emergency120）</view>
+      <view class="emergency-body">
+        <text>{{emergencyAlertMessage}}</text>
+      </view>
+      <view class="disclaimer-box">
+        <text>{{disclaimerText}}</text>
+      </view>
+      <button class="btn-danger dial-120-btn" bindtap="onCall120">一键拨打 120 急救电话</button>
+      <button class="close-emergency-btn" bindtap="onCloseEmergencyModal">我已联系急救 / 关闭提示</button>
+    </view>
+  </view>
+</view>

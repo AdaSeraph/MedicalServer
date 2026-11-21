@@ -117,7 +117,7 @@ async function handleExportErrors() {
     </div>
 
     <div v-if="jobProgress" class="p-4 rounded-xl bg-slate-900 border border-slate-800 grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-      <div><span class="text-slate-400">状态：</span><span class="font-semibold text-emerald-400">{{ jobProgress.status }}</span></div>
+      <div><span class="text-slate-400">状态：</span><span class="font-semibold text-emerald-400">{{ jobProgress.completed ? 'completed' : jobProgress.status }}</span></div>
       <div><span class="text-slate-400">已完成：</span>{{ jobProgress.processed_items }} / {{ jobProgress.total_items }}</div>
       <div><span class="text-slate-400">失败：</span>{{ jobProgress.failed_items }}</div>
       <div><span class="text-slate-400">偏移量：</span>{{ jobProgress.byte_offset }} B</div>
@@ -132,6 +132,7 @@ async function handleExportErrors() {
         <div class="flex flex-wrap gap-1.5 text-xs">
           <span class="px-2 py-0.5 rounded bg-slate-800 text-slate-300">{{ chunk.section_type }}</span>
           <span class="px-2 py-0.5 rounded bg-slate-800 text-emerald-300">权威度 {{ chunk.authority_level }}</span>
+          <span class="px-2 py-0.5 rounded bg-slate-800 text-sky-300">适用人群 {{ (chunk.target_population || []).join('/') }}</span>
           <span v-for="tag in chunk.seasonal_tags" :key="tag" class="px-2 py-0.5 rounded bg-amber-900/60 text-amber-200">#{{ tag }}</span>
         </div>
         <p class="text-xs text-slate-300 leading-relaxed">{{ chunk.content }}</p>

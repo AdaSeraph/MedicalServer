@@ -2,7 +2,10 @@
 
 - **存档时间**: 2026-11-21
 - **工作区**: `e:\RustP\MedicalServer`
-- **当前构建与测试状态**: `cargo test --workspace` 全量通过（exit code 0，50/50 测试通过：`medical-core` 37 项 + `medical-pipeline` 7 项 + `medical-server` 4 项 + `medical-studio` 2 项）；`medical-studio` 前端 `vite build` 通过
+- **当前构建与测试状态**: **全部里程碑 M1–M6 已完成并验收通过！**
+  - `cargo build --workspace` / `cargo test --workspace`：exit code 0，**50/50 Rust 测试全绿**（`medical-core` 37 + `medical-pipeline` 7 + `medical-server` 4 + `medical-studio` 2）
+  - `medical-studio` 前端（Vue 3 + Tailwind）：`vite build` 生产构建通过
+  - `python -m e2e.run_e2e --spawn-server --tier 1`：**123/123 全量端到端测试通过（0 失败）**
 
 ---
 
@@ -49,16 +52,17 @@
   5. ECS 分诊白盒调试台（`EcsDebuggerPanel.vue`，左右分栏模拟聊天 + 实时 ECS Component Inspector）
   6. AI 大模型与开放 API 网关配置中心（`LlmGatewayPanel.vue`，多模型连通性测速、路由策略、API Key 签发吊销与指标统计）
 
-### 里程碑 M5：`miniapp/`（Phase 4 原生微信小程序）
-- [ ] 隐私知情同意与 AI 导诊免责声明弹窗
-- [ ] 流式对话与底部快捷选项按钮组
-- [ ] 急危重症红色警示弹窗（一键拨打 120）与推荐科室挂号引导卡
-- [ ] 长期记忆查看与一键清空入口
+### 里程碑 M5：`miniapp/`（Phase 4 原生微信小程序，已完成）
+- [x] 完整原生小程序结构：`app.json`、`app.js`、`app.wxss`、`project.config.json`、`sitemap.json`、`utils/api.js`（含 `wx.login` 与 `enableChunked` SSE 流式分诊支持）
+- [x] 隐私知情同意与 AI 导诊免责声明弹窗（`pages/triage/index.*`）
+- [x] 流式对话与底部 2~4 个快捷选项按钮组
+- [x] 急危重症红色警示弹窗（`Emergency120` + 一键 `wx.makePhoneCall('120')`）与结构化推荐科室挂号引导卡
+- [x] 长期记忆查看（L2 画像 / L3 历次分诊）与一键物理清空注销入口（`pages/memory/index.*`）
 
-### 里程碑 M6：全量集成验收
-- [ ] `cargo check --workspace`、`cargo build --workspace`、`cargo test --workspace` 全绿
-- [ ] `medical-studio` 前端构建通过、`miniapp/` 静态结构校验通过
-- [ ] 运行 `e2e/run_e2e.py` 全量端到端验证
+### 里程碑 M6：全量集成验收（已完成）
+- [x] `cargo check --workspace`、`cargo build --workspace`、`cargo test --workspace` 全绿（50/50 通过，0 warnings）
+- [x] `medical-studio` 前端构建通过（`frontend/dist`）、`miniapp/` 静态结构与 WXML/WXSS/JS 校验通过
+- [x] 运行 `python -m e2e.run_e2e --spawn-server --tier 1` 全量端到端验证：**123/123 全部通过（0 failed）**
 
 ---
 
