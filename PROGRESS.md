@@ -2,7 +2,7 @@
 
 - **存档时间**: 2026-11-21
 - **工作区**: `e:\RustP\MedicalServer`
-- **当前构建与测试状态**: `cargo test --workspace` 全量通过（exit code 0，44/44 测试通过：`medical-core` 37 项 + `medical-pipeline` 7 项）
+- **当前构建与测试状态**: `cargo test --workspace` 全量通过（exit code 0，48/48 测试通过：`medical-core` 37 项 + `medical-pipeline` 7 项 + `medical-server` 4 项）
 
 ---
 
@@ -33,11 +33,11 @@
 - [x] 向量化适配接口（含可选 `local-fastembed`）+ `KnowledgeVectorStore` & `tantivy`（`tantivy-jieba` 中文分词）幂等双写与季节流行病加权混合检索（`src/indexer.rs`）
 - [x] 自动化测试套件（`tests/pipeline_tests.rs`，7/7 通过）
 
-### 里程碑 M3：`crates/medical-server` & 运维压测配置（Phase 4 服务端）
-- [ ] Axum HTTP/SSE 服务：`/v1/auth/wechat`（code2Session + JWT）、`/v1/triage/chat`（非流式 + SSE）、`/v1/knowledge/search`、`/v1/openai/chat/completions`、`/v1/epidemic/current`、`/v1/patients/{patient_id}/memory`（GET/PUT/DELETE 物理清空）
-- [ ] 多租户 API Key 鉴权与 QPM/TPM 令牌桶限流、Redis 语义缓存、Prometheus 指标暴露
-- [ ] 端到端集成测试（离线 Mock 适配器）
-- [ ] 部署与压测配置：多阶段 `Dockerfile`、`k6` 压测脚本、Prometheus + Grafana 监控告警配置
+### 里程碑 M3：`crates/medical-server` & 运维压测配置（Phase 4 服务端，已完成并通过 4 项集成测试）
+- [x] Axum HTTP/SSE 服务：`/health`、`/metrics`、`/v1/auth/wechat`（code2Session + JWT）、`/v1/triage/chat`（非流式 + SSE）、`/v1/knowledge/search`、`/v1/openai/chat/completions`（JSON + SSE 增强代理）、`/v1/epidemic/current`、`/v1/patients/{patient_id}/memory`（GET/PUT/DELETE 物理清空）、`/v1/admin/reload`、`/v1/admin/epidemics`
+- [x] 多租户 API Key 鉴权与 QPM/TPM 令牌桶限流（`src/auth.rs`, `src/rate_limit.rs`）、语义响应缓存、7 项核心 Prometheus 指标暴露（`src/metrics.rs`）
+- [x] 端到端集成测试（`tests/server_integration_tests.rs`，4/4 通过，离线 Mock 适配器独立运行）
+- [x] 部署与压测配置：`deploy/Dockerfile`（多阶段生产构建）、`k6/triage_load_test.js`、`deploy/prometheus/{prometheus,alerts}.yml`、`deploy/grafana/provisioning/*` & `deploy/grafana/dashboards/medical-server.json`
 
 ### 里程碑 M4：`crates/medical-studio`（Phase 2 & 3 Tauri 2.0 桌面工具箱）
 - [ ] 前端（Vue 3 + Tailwind）与 Tauri Rust Commands 绑定，交付六大模块：
@@ -62,4 +62,4 @@
 ---
 
 ## 三、恢复开发指引
-下次恢复时，直接说明：**“读取 `PROGRESS.md`，从里程碑 M3（`medical-server`）继续开发”** 即可无缝衔接。
+下次恢复时，直接说明：**“读取 `PROGRESS.md`，从里程碑 M4（`medical-studio`）继续开发”** 即可无缝衔接。

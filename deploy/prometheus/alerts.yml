@@ -1,0 +1,29 @@
+groups:
+  - name: medical_server_alerts
+    rules:
+      - alert: MedicalServerHighErrorRate
+        expr: sum(rate(medical_server_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(medical_server_requests_total[5m])), 1) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: High HTTP 5xx error rate on medical-server
+          description: More than 5% of medical-server requests returned 5xx over the last 5 minutes.
+
+      - alert: MedicalServerHighTriageLatency
+        expr: histogram_quantile(0.95, sum(rate(medical_server_triage_duration_seconds_bucket[5m])) by (le)) > 3.0
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: Triage P95 latency exceeds 3 seconds
+          description: ECS triage P95 latency has been above 3.0s for 3 minutes.
+
+      - alert: MedicalServerLlmUpstreamErrors
+        expr: increase(medical_server_llm_errors_total[5m]) > 10
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Elevated upstream LLM errors
+          description: Upstream LLM provider failures exceeded 10 in 5 minutes; verify failover chain.

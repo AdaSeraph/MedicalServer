@@ -1,0 +1,62 @@
+{
+  "uid": "medical-server-overview",
+  "title": "MedicalServer Production Overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "tags": ["medical-server", "triage", "rag"],
+  "panels": [
+    {
+      "id": 1,
+      "title": "HTTP Requests Rate (QPS)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(medical_server_requests_total[1m])) by (endpoint, status)",
+          "legendFormat": "{{endpoint}} ({{status}})"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Triage Latency P95 (s)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(medical_server_triage_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "P95 Triage Latency"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Active SSE Connections",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 8, "w": 8, "h": 6 },
+      "targets": [
+        {
+          "expr": "medical_server_sse_active_connections",
+          "legendFormat": "SSE Connections"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Cache Hits & LLM Errors",
+      "type": "timeseries",
+      "gridPos": { "x": 8, "y": 8, "w": 16, "h": 6 },
+      "targets": [
+        {
+          "expr": "rate(medical_server_cache_hits_total[5m])",
+          "legendFormat": "Cache Hits/s"
+        },
+        {
+          "expr": "rate(medical_server_llm_errors_total[5m])",
+          "legendFormat": "LLM Errors/s"
+        }
+      ]
+    }
+  ]
+}
