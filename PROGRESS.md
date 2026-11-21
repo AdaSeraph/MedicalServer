@@ -1,8 +1,8 @@
 # MedicalServer 开发进度存档（Checkpoint）
 
-- **存档时间**: 2026-11-19
+- **存档时间**: 2026-11-21
 - **工作区**: `e:\RustP\MedicalServer`
-- **当前构建与测试状态**: `cargo test --workspace` 全量通过（exit code 0，37/37 测试通过）
+- **当前构建与测试状态**: `cargo test --workspace` 全量通过（exit code 0，44/44 测试通过：`medical-core` 37 项 + `medical-pipeline` 7 项）
 
 ---
 
@@ -26,12 +26,12 @@
 
 ## 二、待开发内容（后续从此处继续）
 
-### 里程碑 M2：`crates/medical-pipeline`（Phase 2 数据采集与双写管线）
-- [ ] `sonic-rs` JSON/JSONL 采集包流式解析与 Schema 校验、断点续传
-- [ ] `pulldown-cmark` / `docx-rs` / `pdf-extract` 医学书籍结构化切块与元数据注入
-- [ ] `calamine` / `csv` 病历读取与隐私脱敏引擎
-- [ ] 向量化适配接口 + `qdrant-client` & `tantivy`（`tantivy-jieba` 中文分词）双写与混合检索验证
-- [ ] 自动化测试套件
+### 里程碑 M2：`crates/medical-pipeline`（Phase 2 数据采集与双写管线，已完成并通过 7 项集成测试）
+- [x] `sonic-rs` JSON/JSONL 采集包流式解析与 Schema 校验、UTF-8 BOM/CRLF 兼容、断点续传（`src/json_stream.rs`, `src/checkpoint.rs`）
+- [x] `pulldown-cmark` / `docx-rs` / `pdf-extract` + `lopdf`（含 OCR 插件接口）医学书籍结构化切块与元数据注入（`src/book_chunker.rs`）
+- [x] `calamine` / `csv` / `sonic-rs` 病历读取与基于 `rayon` 的并行隐私脱敏引擎、跨文件确定性加盐 SHA-256 `patient_id`（`src/patient_import.rs`）
+- [x] 向量化适配接口（含可选 `local-fastembed`）+ `KnowledgeVectorStore` & `tantivy`（`tantivy-jieba` 中文分词）幂等双写与季节流行病加权混合检索（`src/indexer.rs`）
+- [x] 自动化测试套件（`tests/pipeline_tests.rs`，7/7 通过）
 
 ### 里程碑 M3：`crates/medical-server` & 运维压测配置（Phase 4 服务端）
 - [ ] Axum HTTP/SSE 服务：`/v1/auth/wechat`（code2Session + JWT）、`/v1/triage/chat`（非流式 + SSE）、`/v1/knowledge/search`、`/v1/openai/chat/completions`、`/v1/epidemic/current`、`/v1/patients/{patient_id}/memory`（GET/PUT/DELETE 物理清空）
@@ -62,4 +62,4 @@
 ---
 
 ## 三、恢复开发指引
-下次恢复时，直接说明：**“读取 `PROGRESS.md`，从里程碑 M2（`medical-pipeline`）继续开发”** 即可无缝衔接。
+下次恢复时，直接说明：**“读取 `PROGRESS.md`，从里程碑 M3（`medical-server`）继续开发”** 即可无缝衔接。
