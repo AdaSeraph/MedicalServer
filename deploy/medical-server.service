@@ -1,0 +1,20 @@
+[Unit]
+Description=MedicalServer High-Concurrency AI Triage & Knowledge Service
+After=network-online.target postgresql.service redis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=medical
+Group=medical
+WorkingDirectory=/opt/medical-server
+EnvironmentFile=/opt/medical-server/.env
+ExecStart=/opt/medical-server/medical-server
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

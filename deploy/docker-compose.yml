@@ -1,0 +1,97 @@
+services:
+  medical-server:
+    image: ghcr.io/adaseraph/medicalserver/medical-server:latest
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: medical-server
+    restart: unless-stopped
+    ports:
+      - "${MEDICAL_PORT:-8080}:8080"
+    env_file:
+      - .env
+    environment:
+      SERVER_ADDR: 0.0.0.0:8080
+      DATABASE_URL: postgres://medical:${POSTGRES_PASSWORD:-medical_secret}@postgres:5432/medical_server
+      REDIS_URL: redis://redis:6379
+      QDRANT_URL: http://qdrant:6334
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: medical-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: medical
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-medical_secret}
+      POSTGRES_DB: medical_server
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ../migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medical -d medical_server"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: medical-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: medical-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: medical-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: medical-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-medical_admin}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+
+volumes:
+  pg_data:
+  redis_data:
+  qdrant_data:
