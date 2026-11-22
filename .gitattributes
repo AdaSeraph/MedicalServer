@@ -1,0 +1,5 @@
+# Preserve exact UTF-8 BOM + CRLF bytes for cross-platform E2E fixture
+e2e/fixtures/knowledge/bom_crlf.jsonl binary
+
+# Ensure Linux shell scripts always use LF
+*.sh text eol=lf
