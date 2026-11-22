@@ -7,7 +7,7 @@ use medical_core::storage::IssueApiKeyRequest;
 use medical_pipeline::BookMetadataDefaults;
 use medical_studio::commands::{
     KnowledgePreviewRequest, StartKnowledgeImportRequest, WhiteboxTriageRequest,
-    apply_masking_and_import_patients_impl, delete_red_flag_rule_impl,
+    apply_masking_and_import_patients_impl, delete_llm_provider_impl, delete_red_flag_rule_impl,
     delete_symptom_synonym_impl, export_import_errors_impl, get_gateway_metrics_impl,
     get_import_job_status_impl, get_medical_dictionaries_impl, get_router_config_impl,
     issue_api_key_impl, list_api_keys_impl, list_debug_patients_impl, list_epidemic_contexts_impl,
@@ -15,7 +15,8 @@ use medical_studio::commands::{
     preview_patient_import_impl, reset_ecs_debug_session_impl, resume_knowledge_import_impl,
     revoke_api_key_impl, run_ecs_whitebox_triage_impl, save_red_flag_rule_impl,
     save_router_config_impl, save_symptom_synonym_impl, start_knowledge_import_impl,
-    test_dictionary_sandbox_impl, upsert_epidemic_context_impl, upsert_llm_provider_impl,
+    test_dictionary_sandbox_impl, test_llm_provider_connectivity_impl, upsert_epidemic_context_impl,
+    upsert_llm_provider_impl,
 };
 use medical_studio::StudioState;
 
@@ -222,4 +223,155 @@ async fn test_studio_modules_3_4_5_6_end_to_end() {
 
     let metrics = get_gateway_metrics_impl(&state, Some(24)).await.unwrap();
     assert!(metrics.error_rate >= 0.0);
+}
+
+#[tokio::test]
+async fn test_llm_provider_config_and_connectivity_probe() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let state = StudioState::new_offline().await.unwrap();
+
+    // Reject invalid URL
+    let bad = upsert_llm_provider_impl(
+        &state,
+        ProviderConfig {
+            id: "bad_provider".to_string(),
+            name: "Bad".to_string(),
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: "not-a-url".to_string(),
+            api_key: "sk-test".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            tier: ModelTier::Fast,
+            timeout_ms: 3000,
+            is_intranet: false,
+            enabled: true,
+            priority: 1,
+        },
+    )
+    .await;
+    assert!(bad.is_err());
+
+    // Start a tiny local HTTP server simulating OpenAI-compatible /models and /chat/completions
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for _ in 0..4 {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let first_line = req.lines().next().unwrap_or("");
+            let has_valid_key = req.contains("Authorization: Bearer sk-valid-key")
+                || req.contains("authorization: Bearer sk-valid-key");
+
+            let (status, body) = if first_line.starts_with("GET /v1/models ") {
+                if has_valid_key {
+                    ("200 OK", r#"{"data":[]}"#)
+                } else {
+                    ("401 Unauthorized", r#"{"error":"invalid_api_key"}"#)
+                }
+            } else if first_line.starts_with("GET /no-models/models ") {
+                ("404 Not Found", "not found")
+            } else if first_line.starts_with("POST /no-models/chat/completions ") && has_valid_key {
+                ("200 OK", r#"{"choices":[]}"#)
+            } else {
+                ("400 Bad Request", "bad request")
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+
+    // 1. Valid API key against /v1/models
+    upsert_llm_provider_impl(
+        &state,
+        ProviderConfig {
+            id: "custom_ok".to_string(),
+            name: "Custom OK".to_string(),
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: format!("http://{addr}/v1/"),
+            api_key: "sk-valid-key".to_string(),
+            model: "deepseek-chat".to_string(),
+            tier: ModelTier::Fast,
+            timeout_ms: 4000,
+            is_intranet: true,
+            enabled: true,
+            priority: 1,
+        },
+    )
+    .await
+    .unwrap();
+    let probe_ok = test_llm_provider_connectivity_impl(&state, "custom_ok".to_string())
+        .await
+        .unwrap();
+    assert!(probe_ok.ok, "expected ok probe, got: {:?}", probe_ok.error);
+    assert!(probe_ok.ttft_ms.is_some());
+
+    // 2. Wrong API key returns 401 with body details
+    upsert_llm_provider_impl(
+        &state,
+        ProviderConfig {
+            id: "custom_ok".to_string(),
+            name: "Custom Bad Key".to_string(),
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: format!("http://{addr}/v1"),
+            api_key: "sk-wrong-key".to_string(),
+            model: "deepseek-chat".to_string(),
+            tier: ModelTier::Fast,
+            timeout_ms: 4000,
+            is_intranet: true,
+            enabled: true,
+            priority: 1,
+        },
+    )
+    .await
+    .unwrap();
+    let probe_401 = test_llm_provider_connectivity_impl(&state, "custom_ok".to_string())
+        .await
+        .unwrap();
+    assert!(!probe_401.ok);
+    let err_msg = probe_401.error.unwrap_or_default();
+    assert!(err_msg.contains("HTTP 401") && err_msg.contains("invalid_api_key"));
+
+    // 3. Fallback to POST /chat/completions when GET /models returns 404 (and base_url ends with /chat/completions)
+    upsert_llm_provider_impl(
+        &state,
+        ProviderConfig {
+            id: "custom_fallback".to_string(),
+            name: "Fallback Provider".to_string(),
+            kind: ProviderKind::CustomHttp,
+            base_url: format!("http://{addr}/no-models/chat/completions"),
+            api_key: "sk-valid-key".to_string(),
+            model: "qwen-plus".to_string(),
+            tier: ModelTier::Reasoning,
+            timeout_ms: 4000,
+            is_intranet: true,
+            enabled: true,
+            priority: 2,
+        },
+    )
+    .await
+    .unwrap();
+    let probe_fallback = test_llm_provider_connectivity_impl(&state, "custom_fallback".to_string())
+        .await
+        .unwrap();
+    assert!(
+        probe_fallback.ok,
+        "expected fallback probe to succeed, got: {:?}",
+        probe_fallback.error
+    );
+
+    // 4. Delete provider
+    assert!(delete_llm_provider_impl(&state, "custom_fallback".to_string()).await.unwrap());
+    let remaining = list_llm_providers_impl(&state).await.unwrap();
+    assert!(!remaining.iter().any(|p| p.id == "custom_fallback"));
+
+    let _ = server.await;
 }

@@ -44,6 +44,7 @@ pub fn run() {
             // Module 6: AI LLM & Open API Gateway Config Center
             commands::list_llm_providers,
             commands::upsert_llm_provider,
+            commands::delete_llm_provider,
             commands::test_llm_provider_connectivity,
             commands::get_router_config,
             commands::save_router_config,

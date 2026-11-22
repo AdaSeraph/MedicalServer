@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use medical_core::ecs::{
     ExtractedSymptoms, RagEvidence, RedFlagAlert, TriageExecutionResult, TriageRequest,
@@ -752,8 +752,33 @@ pub async fn list_llm_providers(
 
 pub async fn upsert_llm_provider_impl(
     state: &StudioState,
-    config: ProviderConfig,
+    mut config: ProviderConfig,
 ) -> Result<ProviderConfig, String> {
+    config.id = config.id.trim().to_string();
+    config.name = config.name.trim().to_string();
+    config.base_url = config.base_url.trim().trim_end_matches('/').to_string();
+    config.api_key = config.api_key.trim().to_string();
+    config.model = config.model.trim().to_string();
+
+    if config.id.is_empty() {
+        return Err("Provider ID 不能为空".to_string());
+    }
+    if config.base_url.is_empty() {
+        return Err("API Base URL 不能为空".to_string());
+    }
+    if !config.base_url.starts_with("http://") && !config.base_url.starts_with("https://") {
+        return Err("API Base URL 必须以 http:// 或 https:// 开头".to_string());
+    }
+    if config.model.is_empty() {
+        return Err("模型名称 (model) 不能为空".to_string());
+    }
+    if config.name.is_empty() {
+        config.name = config.id.clone();
+    }
+    if config.timeout_ms == 0 {
+        config.timeout_ms = 8000;
+    }
+
     state
         .stores
         .llm_providers
@@ -771,6 +796,50 @@ pub async fn upsert_llm_provider(
     upsert_llm_provider_impl(&state, config).await
 }
 
+pub async fn delete_llm_provider_impl(
+    state: &StudioState,
+    provider_id: String,
+) -> Result<bool, String> {
+    state
+        .stores
+        .llm_providers
+        .delete_provider(&provider_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_llm_provider(
+    state: State<'_, StudioState>,
+    provider_id: String,
+) -> Result<bool, String> {
+    delete_llm_provider_impl(&state, provider_id).await
+}
+
+fn derive_probe_urls(base_url: &str) -> (String, String) {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if let Some(prefix) = trimmed.strip_suffix("/chat/completions") {
+        (format!("{prefix}/models"), trimmed.to_string())
+    } else {
+        (
+            format!("{trimmed}/models"),
+            format!("{trimmed}/chat/completions"),
+        )
+    }
+}
+
+async fn format_http_error(resp: reqwest::Response) -> String {
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    let compact: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let snippet: String = compact.chars().take(180).collect();
+    if snippet.is_empty() {
+        format!("HTTP {status}")
+    } else {
+        format!("HTTP {status}: {snippet}")
+    }
+}
+
 pub async fn test_llm_provider_connectivity_impl(
     state: &StudioState,
     provider_id: String,
@@ -784,26 +853,81 @@ pub async fn test_llm_provider_connectivity_impl(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("provider not found: {provider_id}"))?;
 
-    let url = format!("{}/models", cfg.base_url.trim_end_matches('/'));
-    match state
-        .http_client
-        .get(&url)
-        .bearer_auth(&cfg.api_key)
-        .send()
-        .await
-    {
-        Ok(resp) => {
+    let (models_url, chat_url) = derive_probe_urls(&cfg.base_url);
+    let timeout = Duration::from_millis(cfg.timeout_ms.clamp(2_000, 30_000));
+    let api_key = cfg.api_key.trim();
+
+    let mut models_req = state.http_client.get(&models_url).timeout(timeout);
+    if !api_key.is_empty() {
+        models_req = models_req.bearer_auth(api_key);
+    }
+
+    match models_req.send().await {
+        Ok(resp) if resp.status().is_success() => {
             let ms = started.elapsed().as_millis() as u64;
             Ok(ProbeResult {
                 provider_id,
-                ok: resp.status().is_success(),
+                ok: true,
                 ttft_ms: Some(ms),
                 total_ms: ms,
-                error: if resp.status().is_success() {
-                    None
-                } else {
-                    Some(format!("HTTP {}", resp.status().as_u16()))
-                },
+                error: None,
+            })
+        }
+        Ok(resp) if matches!(resp.status().as_u16(), 404 | 405) => {
+            // Some OpenAI-compatible gateways do not expose GET /models; fallback to minimal chat completion probe.
+            let mut chat_req = state
+                .http_client
+                .post(&chat_url)
+                .timeout(timeout)
+                .json(&serde_json::json!({
+                    "model": cfg.model,
+                    "messages": [{ "role": "user", "content": "ping" }],
+                    "max_tokens": 1,
+                    "stream": false
+                }));
+            if !api_key.is_empty() {
+                chat_req = chat_req.bearer_auth(api_key);
+            }
+            match chat_req.send().await {
+                Ok(chat_resp) => {
+                    let ms = started.elapsed().as_millis() as u64;
+                    if chat_resp.status().is_success() {
+                        Ok(ProbeResult {
+                            provider_id,
+                            ok: true,
+                            ttft_ms: Some(ms),
+                            total_ms: ms,
+                            error: None,
+                        })
+                    } else {
+                        let err = format_http_error(chat_resp).await;
+                        Ok(ProbeResult {
+                            provider_id,
+                            ok: false,
+                            ttft_ms: Some(ms),
+                            total_ms: ms,
+                            error: Some(err),
+                        })
+                    }
+                }
+                Err(e) => Ok(ProbeResult {
+                    provider_id,
+                    ok: false,
+                    ttft_ms: None,
+                    total_ms: started.elapsed().as_millis() as u64,
+                    error: Some(e.to_string()),
+                }),
+            }
+        }
+        Ok(resp) => {
+            let ms = started.elapsed().as_millis() as u64;
+            let err = format_http_error(resp).await;
+            Ok(ProbeResult {
+                provider_id,
+                ok: false,
+                ttft_ms: Some(ms),
+                total_ms: ms,
+                error: Some(err),
             })
         }
         Err(e) => Ok(ProbeResult {
