@@ -1,6 +1,7 @@
 pub mod clinical;
 pub mod dictionary;
 pub mod epidemic;
+pub mod hospital;
 pub mod knowledge;
 pub mod patient;
 pub mod triage;
@@ -14,6 +15,11 @@ pub use clinical::{
 };
 pub use dictionary::{MedicalDictionaries, RedFlagLevel, RedFlagRule, SymptomSynonym};
 pub use epidemic::{EpidemicContext, Season};
+pub use hospital::{
+    HospitalAuthMode, HospitalConnectorConfig, HospitalConnectorKind, HospitalExternalReport,
+    HospitalReportPullRequest, HospitalReportPullResponse, HospitalWebhookPushPayload,
+    ParsedQrReportHint, convert_fhir_bundle_to_clinical_exams, parse_mobile_report_qr_payload,
+};
 pub use knowledge::{
     KnowledgeDocument, SectionType, SourceType, SuggestedFollowUpSlot, TargetPopulation,
 };

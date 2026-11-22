@@ -492,3 +492,106 @@ async fn test_headless_persistence_survives_close_and_restart() {
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+#[tokio::test]
+async fn test_hospital_integration_qr_pull_and_fhir_bundle_import() {
+    let server = build_test_mcp().await;
+    let pid = "pat_sha256_00000000000000000000000000000000000000000000000000000000000000cc";
+
+    // 1. Register a hospital HIS/LIS/PACS connector
+    let reg = call_tool_json(
+        &server,
+        300,
+        "hospital_upsert_connector",
+        json!({
+            "connector_id": "hosp_bj_01",
+            "hospital_code": "BJ001",
+            "hospital_name": "北京协和医院(预留对接)",
+            "kind": "hl7_fhir_r4",
+            "base_url": "mock://hospital-fhir.local",
+            "auth_mode": "bearer",
+            "api_secret": "hosp-secret-token",
+            "enabled": true
+        }),
+    )
+    .await;
+    assert_eq!(reg["saved"], true);
+
+    let list = call_tool_json(&server, 301, "hospital_list_connectors", json!({})).await;
+    assert_eq!(list["total"], 1);
+    assert_eq!(list["connectors"][0]["api_secret"], "***REDACTED***");
+
+    // 2. Pull report from a mobile QR code / cloud-film URL
+    let pulled = call_tool_json(
+        &server,
+        302,
+        "hospital_pull_report",
+        json!({
+            "patient_id": pid,
+            "qr_code_payload": "https://cloudfilm.hosp.cn/view?hosp=BJ001&report_no=MRI2026112201&type=mri",
+            "auto_attach_to_patient": true
+        }),
+    )
+    .await;
+    assert_eq!(pulled["pii_scrubbed"], true);
+    assert!(pulled["attached_event_id"].as_str().unwrap().contains("MRI2026112201"));
+
+    // 3. Import a standard HL7 FHIR R4 Bundle (Blood Pressure + WBC + Brain MRI DiagnosticReport)
+    let fhir_res = call_tool_json(
+        &server,
+        303,
+        "hospital_import_fhir_bundle",
+        json!({
+            "patient_id": pid,
+            "hospital_name": "市第一人民医院LIS/PACS",
+            "report_no": "FHIR20261122",
+            "fhir_bundle": {
+                "resourceType": "Bundle",
+                "type": "collection",
+                "entry": [
+                    {
+                        "resource": {
+                            "resourceType": "Observation",
+                            "code": { "coding": [{ "system": "http://loinc.org", "code": "85354-9", "display": "Blood pressure" }] },
+                            "component": [
+                                { "code": { "coding": [{ "code": "8480-6" }] }, "valueQuantity": { "value": 146, "unit": "mmHg" } },
+                                { "code": { "coding": [{ "code": "8462-4" }] }, "valueQuantity": { "value": 92, "unit": "mmHg" } }
+                            ]
+                        }
+                    },
+                    {
+                        "resource": {
+                            "resourceType": "Observation",
+                            "code": { "coding": [{ "system": "http://loinc.org", "code": "6690-2", "display": "白细胞计数" }] },
+                            "valueQuantity": { "value": 12.6, "unit": "10^9/L" },
+                            "referenceRange": [{ "text": "3.5-9.5" }],
+                            "interpretation": [{ "coding": [{ "code": "H" }] }]
+                        }
+                    },
+                    {
+                        "resource": {
+                            "resourceType": "DiagnosticReport",
+                            "id": "dr-mri-01",
+                            "code": { "text": "颅脑MRI平扫" },
+                            "conclusion": "右侧额叶少许缺血灶，未见急性梗死。"
+                        }
+                    }
+                ]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(fhir_res["imported"], true);
+    assert_eq!(
+        fhir_res["clinical_exams"]["vital_signs"][0]["systolic_bp_mmhg"],
+        146.0
+    );
+    assert_eq!(
+        fhir_res["clinical_exams"]["lab_panels"][0]["items"][0]["loinc_code"],
+        "6690-2"
+    );
+    assert_eq!(
+        fhir_res["clinical_exams"]["imaging_exams"][0]["modality"],
+        "mri"
+    );
+}

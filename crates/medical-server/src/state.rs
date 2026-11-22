@@ -14,7 +14,8 @@ use medical_core::llm::{
     ProviderKind, RerankProvider, RouterConfig,
 };
 use medical_core::models::{
-    EpidemicContext, KnowledgeDocument, Season, SectionType, SourceType, TargetPopulation,
+    EpidemicContext, HospitalConnectorConfig, KnowledgeDocument, Season, SectionType, SourceType,
+    TargetPopulation,
 };
 use medical_core::storage::{
     CoreStores, IssueApiKeyRequest, PgApiKeyStore, PgAuditLogStore, PgCheckpointStore,
@@ -79,6 +80,7 @@ pub struct AppState {
     pub rate_limiter: Arc<TenantRateLimiter>,
     pub metrics: Arc<ServerMetrics>,
     pub http_client: reqwest::Client,
+    pub hospital_connectors: Arc<dashmap::DashMap<String, HospitalConnectorConfig>>,
 }
 
 impl AppState {
@@ -112,6 +114,7 @@ impl AppState {
             rate_limiter: Arc::new(TenantRateLimiter::new()),
             metrics: Arc::new(ServerMetrics::new()),
             http_client,
+            hospital_connectors: Arc::new(dashmap::DashMap::new()),
         })
     }
 
@@ -360,6 +363,7 @@ impl AppState {
             rate_limiter: Arc::new(TenantRateLimiter::new()),
             metrics: Arc::new(ServerMetrics::new()),
             http_client,
+            hospital_connectors: Arc::new(dashmap::DashMap::new()),
         }))
     }
 

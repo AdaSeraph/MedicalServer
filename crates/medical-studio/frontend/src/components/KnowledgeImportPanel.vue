@@ -8,6 +8,7 @@ import {
   type BatchImportItem,
   type QueuedImportFile,
 } from '../utils/batchFiles';
+import ClinicalMediaDropzone, { type LocalClinicalMediaItem } from './ClinicalMediaDropzone.vue';
 
 const toast = useToast();
 
@@ -51,6 +52,7 @@ const isLoadingCategories = ref(false);
 const fileInputRef = ref<HTMLInputElement | null>(null);
 const isDragging = ref(false);
 const queuedFiles = ref<QueuedImportFile[]>([]);
+const kbAttachedMedia = ref<LocalClinicalMediaItem[]>([]);
 const pastedText = ref('');
 const pastedLabel = ref('自由粘贴医学资料.txt');
 
@@ -426,13 +428,20 @@ async function handleCommitNormalizedDocs() {
   isBusy.value = true;
   try {
     const batchJobId = jobId.value.trim() || `job_kb_batch_${Date.now()}`;
+    const strippedMedia = kbAttachedMedia.value.map(({ previewUrl: _p, ...rest }) => rest);
+    const docsToCommit = normalizedDocs.value.map((d) =>
+      strippedMedia.length > 0
+        ? { ...d, media_assets: [...(d.media_assets || []), ...strippedMedia] }
+        : d,
+    );
     jobProgress.value = await invokeStudio<any>('commit_knowledge_documents', {
       req: {
         job_id: batchJobId,
         tenant_namespace: tenantNamespace.value.trim() || 'default',
-        documents: normalizedDocs.value,
+        documents: docsToCommit,
       },
     });
+    kbAttachedMedia.value = [];
     setStatus(
       `批量入库成功：已双写 ${jobProgress.value.processed_items} 条标准知识到向量库与全文索引（任务 ${batchJobId}）`,
       'success',
@@ -705,6 +714,15 @@ async function handleExportErrors() {
         >
           <p class="text-sm text-slate-200">点击此处或将多个医学文档拖拽到这里</p>
           <p class="text-xs text-slate-500 mt-1">支持一次选择多个不同格式的文件，AI 模型会自动统一转换为标准知识库结构</p>
+        </div>
+
+        <!-- Direct Clinical Image Attachment (Drag / Click / Ctrl+V) -->
+        <div class="pt-2 border-t border-slate-800 space-y-2">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-medium text-sky-300">附带医学参考图片（伤口图、核磁/CT图谱、化验单、诱因物质图，入库时自动绑定到知识条目）</span>
+            <span v-if="kbAttachedMedia.length" class="text-[11px] text-emerald-400">已附带 {{ kbAttachedMedia.length }} 张图片</span>
+          </div>
+          <ClinicalMediaDropzone v-model="kbAttachedMedia" compact />
         </div>
 
         <!-- Queued files list -->

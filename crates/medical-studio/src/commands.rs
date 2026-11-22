@@ -11,11 +11,12 @@ use medical_core::ecs::{
 };
 use medical_core::llm::{ProbeResult, ProviderConfig, RouterConfig};
 use medical_core::models::{
-    ClinicalDataCatalog, ClinicalExamBundle, ClinicalMediaAsset, DataCollectionPackage,
-    EpidemicContext, ImagingFeatureRef, KnowledgeDocument, L2Profile, L3VisitEvent,
-    LabBiochemItem, MedicalDictionaries, PatientRecord, RedFlagLevel, RedFlagRule,
-    SymptomSynonym, TargetPopulation, TriageStatus, TriggerSubstanceRecord, VitalSignsRecord,
-    WoundFeatureRef, default_clinical_data_catalog,
+    ClinicalDataCatalog, ClinicalExamBundle, ClinicalMediaAsset, ClinicalMediaCategory,
+    DataCollectionPackage, EpidemicContext, ImagingExamRecord, ImagingFeatureRef, ImagingModality,
+    KnowledgeDocument, L2Profile, L3VisitEvent, LabBiochemItem, MedicalDictionaries, PatientRecord,
+    RedFlagLevel, RedFlagRule, SymptomSynonym, TargetPopulation, TriageStatus,
+    TriggerSubstanceRecord, VitalSignsRecord, WoundFeatureRef, default_clinical_data_catalog,
+    parse_mobile_report_qr_payload,
 };
 use medical_core::privacy::scrub_pii;
 use medical_core::storage::{
@@ -3226,4 +3227,132 @@ pub async fn attach_knowledge_clinical_assets(
     req: StudioAttachKnowledgeClinicalAssetsRequest,
 ) -> Result<KnowledgeDocument, String> {
     attach_knowledge_clinical_assets_impl(&state, req).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StudioPullHospitalReportRequest {
+    pub serial_or_id: String,
+    #[serde(default)]
+    pub salt: Option<String>,
+    #[serde(default)]
+    pub hospital_name: Option<String>,
+    #[serde(default)]
+    pub report_no: Option<String>,
+    #[serde(default)]
+    pub qr_code_payload: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StudioPullHospitalReportResponse {
+    pub report_no: String,
+    pub hospital_name: String,
+    pub cloud_film_url: Option<String>,
+    pub summary: String,
+    pub patient_record: PatientRecord,
+}
+
+#[tauri::command]
+pub async fn pull_hospital_report_for_patient(
+    state: State<'_, StudioState>,
+    req: StudioPullHospitalReportRequest,
+) -> Result<StudioPullHospitalReportResponse, String> {
+    let qr_hint = req
+        .qr_code_payload
+        .as_deref()
+        .map(parse_mobile_report_qr_payload)
+        .unwrap_or_default();
+    let report_no = req
+        .report_no
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or(qr_hint.report_no)
+        .unwrap_or_else(|| format!("RPT{}", uuid::Uuid::new_v4().simple().to_string()[..8].to_uppercase()));
+    let hospital_name = req
+        .hospital_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or(qr_hint.hospital_code)
+        .unwrap_or_else(|| "医院电子报告(预留接口)".to_string());
+
+    let mut bundle = ClinicalExamBundle::default();
+    if let Some(ref url) = qr_hint.cloud_film_url {
+        let modality = match qr_hint
+            .report_type
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "mri" => ImagingModality::Mri,
+            "ct" => ImagingModality::Ct,
+            "us" | "ultrasound" => ImagingModality::Ultrasound,
+            "ecg" => ImagingModality::Ecg,
+            "xray" | "dr" => ImagingModality::Xray,
+            _ => ImagingModality::Other,
+        };
+        let asset = ClinicalMediaAsset {
+            asset_id: format!("hosp_film_{report_no}"),
+            category: if modality == ImagingModality::Mri {
+                ClinicalMediaCategory::MriImage
+            } else {
+                ClinicalMediaCategory::LabReportImage
+            },
+            title: format!("{hospital_name} 电子报告/云胶片 ({report_no})"),
+            mime_type: "text/uri-list".to_string(),
+            uri_or_path: Some(url.clone()),
+            data_base64: None,
+            sha256: None,
+            body_site: None,
+            captured_at: Some(Utc::now()),
+            caption: Some(format!("云胶片/报告链接: {url}")),
+            tags: vec!["医院电子报告".to_string(), "云胶片".to_string()],
+        };
+        bundle.media_assets.push(asset.clone());
+        bundle.imaging_exams.push(ImagingExamRecord {
+            exam_id: format!("exam_hosp_{report_no}"),
+            modality,
+            exam_name: format!("{hospital_name} 电子检查报告 ({report_no})"),
+            body_part: String::new(),
+            examined_at: Some(Utc::now()),
+            findings: format!("已通过医院电子报告接口关联云胶片/报告：{url}"),
+            impression: "已归档至加密病历，配置院内 LIS/PACS 授权后可自动拉取结构化指标".to_string(),
+            contrast_used: None,
+            images: vec![asset],
+        });
+    }
+
+    let summary = if bundle.is_empty() {
+        format!("已关联医院报告单号 {report_no}（{hospital_name}），等待院内 LIS/PACS 连接器同步正文")
+    } else {
+        bundle.to_searchable_text()
+    };
+
+    let rec = attach_patient_clinical_exams_impl(
+        &state,
+        StudioAttachPatientClinicalExamsRequest {
+            serial_or_id: req.serial_or_id,
+            salt: req.salt,
+            event_id: Some(format!("evt_hosp_{report_no}")),
+            chief_complaint: Some(format!("[医院报告·{hospital_name}] 单号 {report_no}")),
+            recommended_department: Some("全科医学科".to_string()),
+            urgency_level: Some(3),
+            summary: Some(summary.clone()),
+            baseline_vitals: None,
+            l2_trigger_substances: Vec::new(),
+            clinical_exams: bundle,
+        },
+    )
+    .await?;
+
+    Ok(StudioPullHospitalReportResponse {
+        report_no,
+        hospital_name,
+        cloud_film_url: qr_hint.cloud_film_url,
+        summary,
+        patient_record: rec,
+    })
 }

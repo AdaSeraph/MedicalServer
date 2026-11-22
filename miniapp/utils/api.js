@@ -235,6 +235,26 @@ function deletePatientMemory(patientId) {
   return request('DELETE', `/v1/patients/${encodeURIComponent(patientId)}/memory`);
 }
 
+function getClinicalDataCatalog() {
+  return request('GET', '/v1/clinical/types');
+}
+
+function attachClinicalExams(patientId, payload) {
+  return request('POST', `/v1/patients/${encodeURIComponent(patientId)}/clinical-exams`, payload);
+}
+
+/**
+ * Pulls a patient's electronic hospital report by report_no or mobile QR code / cloud-film URL.
+ * Works directly with `wx.scanCode` results in WeChat Miniapp.
+ */
+function pullHospitalReport(payload) {
+  return request('POST', '/v1/hospital/reports/pull', payload);
+}
+
+function importFhirBundle(payload) {
+  return request('POST', '/v1/hospital/fhir/import', payload);
+}
+
 module.exports = {
   loginWeChat,
   sendTriageChat,
@@ -244,4 +264,8 @@ module.exports = {
   getPatientMemory,
   updatePatientMemory,
   deletePatientMemory,
+  getClinicalDataCatalog,
+  attachClinicalExams,
+  pullHospitalReport,
+  importFhirBundle,
 };

@@ -278,6 +278,67 @@ pub fn list_tools() -> Vec<McpToolDefinition> {
                 "additionalProperties": false
             }),
         },
+        McpToolDefinition {
+            name: "hospital_list_connectors".to_string(),
+            description: "List configured external hospital HIS/LIS/PACS/Cloud-Film/FHIR connectors.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        },
+        McpToolDefinition {
+            name: "hospital_upsert_connector".to_string(),
+            description: "Register or update an external hospital HIS/LIS/PACS/WeChat-Miniapp/HL7-FHIR connector for pulling or receiving patient electronic reports.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "connector_id": { "type": "string" },
+                    "hospital_code": { "type": "string" },
+                    "hospital_name": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["hl7_fhir_r4", "hospital_lis", "hospital_pacs", "wechat_hospital_miniapp", "national_health_card", "custom_webhook"] },
+                    "base_url": { "type": "string" },
+                    "auth_mode": { "type": "string", "enum": ["bearer", "api_key", "oauth2_client_credentials", "hmac_sha256", "none"] },
+                    "app_id": { "type": "string" },
+                    "api_secret": { "type": "string" },
+                    "enabled": { "type": "boolean", "default": true }
+                },
+                "required": ["connector_id", "hospital_code", "hospital_name", "base_url"]
+            }),
+        },
+        McpToolDefinition {
+            name: "hospital_pull_report".to_string(),
+            description: "Pull a patient's electronic hospital lab/imaging/cloud-film report by report_no, mobile QR code URL/payload, or visit_no, and optionally attach it directly to the patient's encrypted L3 case.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "patient_id": { "type": "string" },
+                    "connector_id": { "type": "string" },
+                    "hospital_code": { "type": "string" },
+                    "report_no": { "type": "string" },
+                    "qr_code_payload": { "type": "string", "description": "Mobile report QR code content or cloud-film URL" },
+                    "visit_no": { "type": "string" },
+                    "report_types": { "type": "array", "items": { "type": "string" } },
+                    "auto_attach_to_patient": { "type": "boolean", "default": true }
+                },
+                "required": ["patient_id"]
+            }),
+        },
+        McpToolDefinition {
+            name: "hospital_import_fhir_bundle".to_string(),
+            description: "Convert and import a standard HL7 FHIR R4 Bundle JSON (Observation, DiagnosticReport, AllergyIntolerance, Media) directly into a patient's encrypted L3 clinical record.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "patient_id": { "type": "string" },
+                    "hospital_name": { "type": "string" },
+                    "report_no": { "type": "string" },
+                    "department": { "type": "string" },
+                    "fhir_bundle": { "type": "object", "description": "HL7 FHIR R4 Bundle JSON object" }
+                },
+                "required": ["patient_id", "fhir_bundle"]
+            }),
+        },
     ]
 }
 
@@ -458,6 +519,26 @@ pub async fn call_tool(backend: &McpBackend, name: &str, args: Value) -> McpTool
                 .request_json(Method::POST, "/v1/admin/save", Some(json!({})), true)
                 .await
         }
+        "hospital_list_connectors" => {
+            backend
+                .request_json(Method::GET, "/v1/hospital/connectors", None, true)
+                .await
+        }
+        "hospital_upsert_connector" => {
+            backend
+                .request_json(Method::POST, "/v1/hospital/connectors", Some(args), true)
+                .await
+        }
+        "hospital_pull_report" => {
+            backend
+                .request_json(Method::POST, "/v1/hospital/reports/pull", Some(args), true)
+                .await
+        }
+        "hospital_import_fhir_bundle" => {
+            backend
+                .request_json(Method::POST, "/v1/hospital/fhir/import", Some(args), true)
+                .await
+        }
         other => Err(format!("unknown MCP tool: '{other}'")),
     };
 
@@ -474,6 +555,8 @@ pub async fn call_tool(backend: &McpBackend, name: &str, args: Value) -> McpTool
                 | "dictionary_upsert_synonym"
                 | "dictionary_upsert_red_flag"
                 | "triage_chat"
+                | "hospital_pull_report"
+                | "hospital_import_fhir_bundle"
         )
     {
         let _ = backend.flush_if_standalone().await;

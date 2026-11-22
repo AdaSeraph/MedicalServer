@@ -2,6 +2,7 @@
 import { computed, nextTick, onActivated, onMounted, ref } from 'vue';
 import { invokeStudio } from '../api/tauri';
 import { useToast } from '../composables/useToast';
+import ClinicalMediaDropzone, { type LocalClinicalMediaItem } from './ClinicalMediaDropzone.vue';
 
 const toast = useToast();
 
@@ -58,6 +59,7 @@ const messages = ref<
   {
     role: 'patient' | 'assistant';
     text: string;
+    images?: Array<{ title: string; previewUrl: string; category: string }>;
     options?: string[];
     card?: any;
     redFlag?: string;
@@ -66,6 +68,89 @@ const messages = ref<
     l3Recalled?: number;
   }[]
 >([]);
+
+// Inline multimodal media + quick vitals + hospital mobile report pull in consultation
+const showMediaDrawer = ref(false);
+const showHospitalPullDrawer = ref(false);
+const consultMedia = ref<LocalClinicalMediaItem[]>([]);
+const quickBpSys = ref<number | null>(null);
+const quickBpDia = ref<number | null>(null);
+const quickTemp = ref<number | null>(null);
+const quickSpo2 = ref<number | null>(null);
+const hospitalNameInput = ref('');
+const hospitalQrOrReportNo = ref('');
+const isPullingHospital = ref(false);
+
+async function handlePullHospitalReport() {
+  if (!activeSerialReady.value) {
+    toast.error('请先输入或生成病人序列号');
+    return;
+  }
+  const raw = hospitalQrOrReportNo.value.trim();
+  if (!raw) {
+    toast.error('请输入医院报告单号或粘贴手机报告二维码/云胶片链接');
+    return;
+  }
+  isPullingHospital.value = true;
+  try {
+    const isUrlOrJson = raw.startsWith('http://') || raw.startsWith('https://') || raw.startsWith('{');
+    const res = await invokeStudio<any>('pull_hospital_report_for_patient', {
+      req: {
+        serial_or_id: serialInput.value.trim(),
+        salt: salt.value,
+        hospital_name: hospitalNameInput.value.trim() || null,
+        report_no: isUrlOrJson ? null : raw,
+        qr_code_payload: isUrlOrJson ? raw : null,
+      },
+    });
+    currentRecord.value = res.patient_record;
+    resolvedPatientId.value = res.patient_record.patient_id;
+    messages.value.push({
+      role: 'patient',
+      text: `[已对接医院电子报告 · ${res.hospital_name}] 单号：${res.report_no}\n${res.summary}`,
+    });
+    hospitalQrOrReportNo.value = '';
+    showHospitalPullDrawer.value = false;
+    await loadPatientList();
+    await scrollChat();
+    toast.success(`已拉取并归档医院报告 ${res.report_no}`);
+  } catch (err) {
+    toast.error(`拉取医院报告失败：${String(err)}`);
+  } finally {
+    isPullingHospital.value = false;
+  }
+}
+
+async function handleChatInputPaste(e: ClipboardEvent) {
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  for (const item of Array.from(items)) {
+    if (item.type.startsWith('image/')) {
+      const file = item.getAsFile();
+      if (!file) continue;
+      e.preventDefault();
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ''));
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+      const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+      consultMedia.value.push({
+        asset_id: `chat_img_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
+        category: 'wound_image',
+        title: `问诊截图_${new Date().toTimeString().slice(0, 8).replace(/:/g, '')}.png`,
+        mime_type: file.type || 'image/png',
+        data_base64: base64,
+        caption: '',
+        tags: ['问诊截图'],
+        previewUrl: dataUrl,
+      });
+      showMediaDrawer.value = true;
+      toast.info('已从剪贴板粘贴图片，发送问诊时将自动归档至病历');
+    }
+  }
+}
 
 function generateNewSerial(): string {
   const now = new Date();
@@ -289,19 +374,86 @@ async function handleSubmitRevisitFeedback() {
 }
 
 async function sendConsultation(text?: string) {
-  const input = (text ?? utterance.value).trim();
-  if (!input || isSending.value) return;
+  const rawInput = (text ?? utterance.value).trim();
+  const hasAttachments =
+    consultMedia.value.length > 0 ||
+    quickBpSys.value !== null ||
+    quickBpDia.value !== null ||
+    quickTemp.value !== null ||
+    quickSpo2.value !== null;
+  if ((!rawInput && !hasAttachments) || isSending.value) return;
   if (!activeSerialReady.value) {
     toast.error('请先输入病人序列号（或点击「新病人初诊建档」自动生成）');
     return;
   }
 
+  const attachedThumbs = consultMedia.value.map((m) => ({
+    title: m.title,
+    previewUrl: m.previewUrl,
+    category: m.category,
+  }));
+  const extraParts: string[] = [];
+  if (quickBpSys.value !== null && quickBpDia.value !== null) {
+    extraParts.push(`血压 ${quickBpSys.value}/${quickBpDia.value} mmHg`);
+  }
+  if (quickTemp.value !== null) extraParts.push(`体温 ${quickTemp.value}℃`);
+  if (quickSpo2.value !== null) extraParts.push(`血氧 ${quickSpo2.value}%`);
+  if (consultMedia.value.length > 0) {
+    const imgDesc = consultMedia.value
+      .map((m) => `${m.title}${m.caption ? `(${m.caption})` : ''}`)
+      .join('、');
+    extraParts.push(`附带医学图片 ${consultMedia.value.length} 张：${imgDesc}`);
+  }
+  const input = [rawInput, ...extraParts].filter(Boolean).join('；');
+
   isSending.value = true;
-  messages.value.push({ role: 'patient', text: input });
+  messages.value.push({
+    role: 'patient',
+    text: input,
+    images: attachedThumbs.length ? attachedThumbs : undefined,
+  });
   utterance.value = '';
+  const pendingMedia = [...consultMedia.value];
+  const pendingVitals =
+    quickBpSys.value !== null ||
+    quickBpDia.value !== null ||
+    quickTemp.value !== null ||
+    quickSpo2.value !== null
+      ? {
+          record_id: `vs_chat_${Date.now()}`,
+          systolic_bp_mmhg: quickBpSys.value,
+          diastolic_bp_mmhg: quickBpDia.value,
+          temperature_c: quickTemp.value,
+          spo2_percent: quickSpo2.value,
+        }
+      : null;
+  consultMedia.value = [];
+  quickBpSys.value = null;
+  quickBpDia.value = null;
+  quickTemp.value = null;
+  quickSpo2.value = null;
+  showMediaDrawer.value = false;
   await scrollChat();
 
   try {
+    if (pendingMedia.length > 0 || pendingVitals) {
+      await invokeStudio<any>('attach_patient_clinical_exams', {
+        req: {
+          serial_or_id: serialInput.value.trim(),
+          salt: salt.value,
+          chief_complaint: rawInput || '问诊附带图片与体征资料',
+          baseline_vitals: pendingVitals,
+          clinical_exams: {
+            vital_signs: pendingVitals ? [pendingVitals] : [],
+            lab_panels: [],
+            imaging_exams: [],
+            wound_assessments: [],
+            trigger_substances: [],
+            media_assets: pendingMedia.map(({ previewUrl: _p, ...rest }) => rest),
+          },
+        },
+      });
+    }
     const shouldPushL2 = syncL2OnSend.value && l2Dirty.value;
     const res = await invokeStudio<any>('run_consultation_triage', {
       req: {
@@ -529,9 +681,18 @@ onActivated(loadPatientList);
                     ? 'inline-block bg-rose-950/90 text-rose-100 border border-rose-700'
                     : 'inline-block bg-slate-800 text-slate-100'
               "
-              class="px-3.5 py-2.5 rounded-2xl text-sm max-w-[88%] text-left leading-relaxed"
+              class="px-3.5 py-2.5 rounded-2xl text-sm max-w-[88%] text-left leading-relaxed whitespace-pre-line"
             >
-              {{ m.text }}
+              <div>{{ m.text }}</div>
+              <div v-if="m.images?.length" class="flex flex-wrap gap-1.5 mt-2">
+                <img
+                  v-for="(img, iIdx) in m.images"
+                  :key="iIdx"
+                  :src="img.previewUrl"
+                  :alt="img.title"
+                  class="h-16 w-16 rounded-lg object-cover border border-white/30"
+                />
+              </div>
             </div>
 
             <div v-if="m.role === 'assistant'" class="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
@@ -582,16 +743,73 @@ onActivated(loadPatientList);
         </div>
 
         <div class="pt-3 border-t border-slate-800 space-y-2">
-          <label class="flex items-center gap-2 text-[11px] text-slate-400 cursor-pointer">
-            <input type="checkbox" v-model="syncL2OnSend" class="accent-sky-500" />
-            <span>问诊发送时自动同步右侧已修改的 L2 画像信息</span>
-            <span v-if="l2Dirty" class="text-amber-300">（右侧 L2 有未保存修改）</span>
-          </label>
+          <div class="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+            <label class="flex items-center gap-2 text-slate-400 cursor-pointer">
+              <input type="checkbox" v-model="syncL2OnSend" class="accent-sky-500" />
+              <span>发送时自动同步 L2 画像</span>
+              <span v-if="l2Dirty" class="text-amber-300">（未保存修改）</span>
+            </label>
+            <div class="flex items-center gap-1.5">
+              <button
+                type="button"
+                @click="showMediaDrawer = !showMediaDrawer"
+                :class="showMediaDrawer || consultMedia.length ? 'bg-sky-700 text-white' : 'bg-slate-800 text-sky-300 hover:bg-slate-700'"
+                class="px-2.5 py-1 rounded-md transition-colors"
+              >
+                📷 图片/体征{{ consultMedia.length ? ` (${consultMedia.length})` : '' }}
+              </button>
+              <button
+                type="button"
+                @click="showHospitalPullDrawer = !showHospitalPullDrawer"
+                :class="showHospitalPullDrawer ? 'bg-emerald-700 text-white' : 'bg-slate-800 text-emerald-300 hover:bg-slate-700'"
+                class="px-2.5 py-1 rounded-md transition-colors"
+              >
+                🏥 扫码/单号拉取医院报告
+              </button>
+            </div>
+          </div>
+
+          <!-- Inline Media & Quick Vitals Drawer -->
+          <div v-if="showMediaDrawer" class="p-2.5 rounded-lg bg-slate-950 border border-slate-800 space-y-2">
+            <div class="grid grid-cols-4 gap-1.5 text-[11px]">
+              <input v-model.number="quickBpSys" type="number" placeholder="收缩压 mmHg" class="px-2 py-1 rounded bg-slate-900 border border-slate-700 text-slate-200" />
+              <input v-model.number="quickBpDia" type="number" placeholder="舒张压 mmHg" class="px-2 py-1 rounded bg-slate-900 border border-slate-700 text-slate-200" />
+              <input v-model.number="quickTemp" type="number" step="0.1" placeholder="体温 ℃" class="px-2 py-1 rounded bg-slate-900 border border-slate-700 text-slate-200" />
+              <input v-model.number="quickSpo2" type="number" placeholder="血氧 %" class="px-2 py-1 rounded bg-slate-900 border border-slate-700 text-slate-200" />
+            </div>
+            <ClinicalMediaDropzone v-model="consultMedia" compact />
+          </div>
+
+          <!-- Inline Hospital Mobile Report Pull Drawer -->
+          <div v-if="showHospitalPullDrawer" class="p-2.5 rounded-lg bg-emerald-950/30 border border-emerald-800/60 space-y-2 text-xs">
+            <div class="text-emerald-300 font-medium">对接医院手机电子报告 / 云胶片（预留 HIS / LIS / PACS / HL7 FHIR 接口）</div>
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-1.5">
+              <input v-model="hospitalNameInput" placeholder="医院名称（可选）" class="px-2 py-1 rounded bg-slate-950 border border-slate-700 text-slate-200" />
+              <input
+                v-model="hospitalQrOrReportNo"
+                @keyup.enter="handlePullHospitalReport"
+                placeholder="输入报告单号，或粘贴手机扫码二维码/云胶片链接"
+                class="sm:col-span-2 px-2 py-1 rounded bg-slate-950 border border-slate-700 text-slate-200"
+              />
+            </div>
+            <div class="flex justify-end">
+              <button
+                type="button"
+                :disabled="isPullingHospital"
+                @click="handlePullHospitalReport"
+                class="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-xs disabled:opacity-50"
+              >
+                {{ isPullingHospital ? '拉取中...' : '一键拉取并归档至病历' }}
+              </button>
+            </div>
+          </div>
+
           <div class="flex gap-2">
             <input
               v-model="utterance"
+              @paste="handleChatInputPaste"
               @keyup.enter="sendConsultation()"
-              :placeholder="mode === 'revisit' ? '输入复诊主诉或疗效反馈，按 Enter 发送...' : '输入新病人主诉，按 Enter 开始无记忆初诊...'"
+              :placeholder="mode === 'revisit' ? '输入复诊主诉（支持直接 Ctrl+V 粘贴伤口/核磁/化验单截图），按 Enter 发送...' : '输入新病人主诉（支持 Ctrl+V 粘贴图片），按 Enter 开始无记忆初诊...'"
               class="flex-1 px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-sm text-slate-100"
             />
             <button

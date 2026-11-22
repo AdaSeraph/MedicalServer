@@ -139,6 +139,7 @@ pub fn run() {
             commands::get_clinical_data_catalog,
             commands::attach_patient_clinical_exams,
             commands::attach_knowledge_clinical_assets,
+            commands::pull_hospital_report_for_patient,
         ])
         .build(tauri::generate_context!())
         .expect("error while building MedicalStudio Tauri application");

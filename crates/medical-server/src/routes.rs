@@ -7,7 +7,7 @@ use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use futures::stream;
@@ -15,9 +15,13 @@ use medical_core::crypto::hash_patient_id;
 use medical_core::ecs::{TriageRequest, TriageStreamEvent};
 use medical_core::llm::{LlmMessage, LlmRequest, LlmStreamChunk, MessageRole, ModelTier};
 use medical_core::models::{
-    ClinicalExamBundle, EpidemicContext, KnowledgeDocument, L2Profile, L3VisitEvent,
-    PatientRecord, RedFlagLevel, RedFlagRule, SymptomSynonym, TargetPopulation,
-    TriggerSubstanceRecord, VitalSignsRecord, default_clinical_data_catalog,
+    ClinicalExamBundle, ClinicalMediaAsset, ClinicalMediaCategory, EpidemicContext,
+    HospitalAuthMode, HospitalConnectorConfig, HospitalExternalReport, HospitalReportPullRequest,
+    HospitalReportPullResponse, HospitalWebhookPushPayload, ImagingExamRecord, ImagingModality,
+    KnowledgeDocument, L2Profile, L3VisitEvent, PatientRecord, RedFlagLevel, RedFlagRule,
+    SymptomSynonym, TargetPopulation, TriggerSubstanceRecord, VitalSignsRecord,
+    convert_fhir_bundle_to_clinical_exams, default_clinical_data_catalog,
+    parse_mobile_report_qr_payload,
 };
 use medical_core::privacy::{MEDICAL_DISCLAIMER, sanitize_medical_output, scrub_pii};
 use medical_core::storage::KnowledgeSearchQuery;
@@ -90,6 +94,21 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/admin/reload", post(admin_reload_handler))
         .route("/v1/admin/save", post(admin_save_snapshot_handler))
         .route("/v1/admin/epidemics", post(admin_upsert_epidemic_handler))
+        // Modern Hospital HIS / LIS / PACS / Mobile Cloud-Film / HL7 FHIR R4 Integration Interfaces
+        .route(
+            "/v1/hospital/connectors",
+            get(list_hospital_connectors_handler).post(upsert_hospital_connector_handler),
+        )
+        .route(
+            "/v1/hospital/connectors/{connector_id}",
+            delete(delete_hospital_connector_handler),
+        )
+        .route("/v1/hospital/reports/pull", post(pull_hospital_report_handler))
+        .route(
+            "/v1/hospital/reports/webhook",
+            post(hospital_report_webhook_handler),
+        )
+        .route("/v1/hospital/fhir/import", post(import_fhir_bundle_handler))
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .layer(ConcurrencyLimitLayer::new(512))
         .layer(cors)
@@ -1916,6 +1935,539 @@ async fn admin_save_snapshot_handler(
             "saved": true,
             "mode": "external_database_or_ephemeral",
             "records_saved": 0,
+        }))
+        .into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Modern Hospital HIS / LIS / PACS / Mobile Cloud-Film / HL7 FHIR R4 Integration
+// ---------------------------------------------------------------------------
+
+async fn list_hospital_connectors_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = authenticate_request(&state, &headers, 5).await {
+        return auth_err_response(e);
+    }
+    let connectors: Vec<HospitalConnectorConfig> = state
+        .hospital_connectors
+        .iter()
+        .map(|entry| {
+            let mut c = entry.value().clone();
+            if c.api_secret.is_some() {
+                c.api_secret = Some("***REDACTED***".to_string());
+            }
+            c
+        })
+        .collect();
+    Json(serde_json::json!({
+        "total": connectors.len(),
+        "connectors": connectors,
+    }))
+    .into_response()
+}
+
+async fn upsert_hospital_connector_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(cfg): Json<HospitalConnectorConfig>,
+) -> Response {
+    let auth = match authenticate_request(&state, &headers, 5).await {
+        Ok(a) => a,
+        Err(e) => return auth_err_response(e),
+    };
+    if !auth.is_admin {
+        return auth_err_response(AuthError::forbidden("admin authorization required"));
+    }
+    if cfg.connector_id.trim().is_empty() || cfg.hospital_name.trim().is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "connector_id and hospital_name must not be empty",
+        );
+    }
+    let cid = cfg.connector_id.clone();
+    state.hospital_connectors.insert(cid.clone(), cfg);
+    Json(serde_json::json!({ "saved": true, "connector_id": cid })).into_response()
+}
+
+async fn delete_hospital_connector_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(connector_id): AxumPath<String>,
+) -> Response {
+    let auth = match authenticate_request(&state, &headers, 5).await {
+        Ok(a) => a,
+        Err(e) => return auth_err_response(e),
+    };
+    if !auth.is_admin {
+        return auth_err_response(AuthError::forbidden("admin authorization required"));
+    }
+    let deleted = state.hospital_connectors.remove(&connector_id).is_some();
+    Json(serde_json::json!({ "deleted": deleted, "connector_id": connector_id })).into_response()
+}
+
+async fn persist_hospital_bundle_to_patient(
+    state: &AppState,
+    patient_id: &str,
+    hospital_name: &str,
+    department: &str,
+    report_no: &str,
+    summary_raw: &str,
+    bundle: ClinicalExamBundle,
+) -> Result<String, String> {
+    let existing_l2 = state
+        .stores
+        .patient_memory
+        .get_l2_profile(patient_id)
+        .await
+        .ok()
+        .flatten();
+    let (consent, mut profile) = match existing_l2 {
+        Some(rec) => (rec.consent_long_term_memory, rec.l2_profile),
+        None => (
+            true,
+            L2Profile {
+                age_group: "unknown".to_string(),
+                ..Default::default()
+            },
+        ),
+    };
+    if profile.baseline_vitals.is_none()
+        && let Some(vs) = bundle.vital_signs.first()
+    {
+        profile.baseline_vitals = Some(vs.clone());
+    }
+    for t in &bundle.trigger_substances {
+        if !profile
+            .trigger_substances
+            .iter()
+            .any(|x| x.trigger_id == t.trigger_id)
+        {
+            profile.trigger_substances.push(t.clone());
+        }
+    }
+    state
+        .stores
+        .patient_memory
+        .upsert_l2_profile(patient_id, consent, &profile)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let event_id = format!("evt_hosp_{report_no}");
+    let exam_text = bundle.to_searchable_text();
+    let scrubbed_summary = scrub_pii(if summary_raw.trim().is_empty() {
+        &exam_text
+    } else {
+        summary_raw
+    })
+    .scrubbed_text;
+    let event = L3VisitEvent {
+        event_id: event_id.clone(),
+        occurred_at: Utc::now(),
+        chief_complaint: format!("[医院报告同步·{hospital_name}] 单号 {report_no}"),
+        extracted_symptoms: Vec::new(),
+        recommended_department: if department.trim().is_empty() {
+            "全科医学科".to_string()
+        } else {
+            department.to_string()
+        },
+        urgency_level: 3,
+        summary: if scrubbed_summary.trim().is_empty() {
+            format!("来自{hospital_name}的电子检查/检验报告（单号 {report_no}）")
+        } else {
+            scrubbed_summary
+        },
+        clinical_exams: bundle,
+    };
+    state
+        .stores
+        .patient_memory
+        .insert_l3_event(patient_id, &event)
+        .await
+        .map_err(|e| e.to_string())?;
+    let embed_text = format!("{} {}", event.chief_complaint, event.summary);
+    if let Ok(vec) = state.embedder.embed_one(&embed_text).await {
+        let _ = state
+            .stores
+            .patient_l3_vectors
+            .upsert_event_vector(patient_id, &event, vec)
+            .await;
+    }
+    Ok(event_id)
+}
+
+async fn pull_hospital_report_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<HospitalReportPullRequest>,
+) -> Response {
+    let auth = match authenticate_request(&state, &headers, 10).await {
+        Ok(a) => a,
+        Err(e) => return auth_err_response(e),
+    };
+    if let Err(e) = check_patient_access(&state, &auth, &req.patient_id) {
+        return auth_err_response(e);
+    }
+    if let Err(verr) = validate_patient_id(&req.patient_id) {
+        return json_error(StatusCode::BAD_REQUEST, verr.message);
+    }
+
+    let qr_hint = req
+        .qr_code_payload
+        .as_deref()
+        .map(parse_mobile_report_qr_payload)
+        .unwrap_or_default();
+
+    let effective_report_no = req
+        .report_no
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or(qr_hint.report_no.clone())
+        .unwrap_or_else(|| format!("RPT{}", Uuid::new_v4().simple().to_string()[..8].to_uppercase()));
+
+    let effective_hosp_code = req
+        .hospital_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or(qr_hint.hospital_code.clone());
+
+    // Look up matching hospital connector if registered
+    let connector = req
+        .connector_id
+        .as_deref()
+        .and_then(|cid| state.hospital_connectors.get(cid).map(|r| r.value().clone()))
+        .or_else(|| {
+            effective_hosp_code.as_deref().and_then(|hc| {
+                state
+                    .hospital_connectors
+                    .iter()
+                    .find(|e| e.value().enabled && e.value().hospital_code == hc)
+                    .map(|e| e.value().clone())
+            })
+        });
+
+    let mut imported_reports = Vec::new();
+    let mut merged_exams = ClinicalExamBundle::default();
+    let mut pull_mode = "qr_sandbox_preview".to_string();
+    let mut source_hospital = connector
+        .as_ref()
+        .map(|c| c.hospital_name.clone())
+        .unwrap_or_else(|| "医院电子报告对接接口(预留适配器)".to_string());
+    let connector_id = connector
+        .as_ref()
+        .map(|c| c.connector_id.clone())
+        .unwrap_or_else(|| "builtin_qr_fhir_adapter".to_string());
+
+    // 1. Live hospital HTTP / FHIR pull when an enabled connector with a real base_url is configured
+    if let Some(ref conn) = connector
+        && conn.enabled
+        && !conn.base_url.trim().is_empty()
+        && !conn.base_url.starts_with("mock://")
+    {
+        let endpoint = format!(
+            "{}/reports/pull",
+            conn.base_url.trim_end_matches('/')
+        );
+        let mut http_req = state
+            .http_client
+            .post(&endpoint)
+            .timeout(std::time::Duration::from_millis(conn.timeout_ms.max(1000)))
+            .json(&serde_json::json!({
+                "report_no": effective_report_no,
+                "qr_code_payload": req.qr_code_payload,
+                "visit_no": req.visit_no,
+                "report_types": req.report_types,
+                "date_from": req.date_from,
+                "date_to": req.date_to,
+            }));
+        if let Some(ref secret) = conn.api_secret {
+            match conn.auth_mode {
+                HospitalAuthMode::Bearer => {
+                    http_req = http_req.header(header::AUTHORIZATION, format!("Bearer {secret}"));
+                }
+                HospitalAuthMode::ApiKey => {
+                    http_req = http_req.header("x-api-key", secret);
+                }
+                _ => {}
+            }
+        }
+        match http_req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(val) = resp.json::<serde_json::Value>().await {
+                    if val.get("resourceType").and_then(|v| v.as_str()) == Some("Bundle") {
+                        let bundle = convert_fhir_bundle_to_clinical_exams(&val);
+                        merged_exams.merge(bundle.clone());
+                        imported_reports.push(HospitalExternalReport {
+                            report_no: effective_report_no.clone(),
+                            hospital_name: conn.hospital_name.clone(),
+                            department: "医院检验/影像科".to_string(),
+                            report_type: "comprehensive".to_string(),
+                            reported_at: Some(Utc::now()),
+                            cloud_film_url: qr_hint.cloud_film_url.clone(),
+                            report_pdf_url: None,
+                            summary: bundle.to_searchable_text(),
+                            clinical_exams: bundle,
+                        });
+                        pull_mode = "fhir_bundle_import".to_string();
+                    } else if let Ok(ext_report) =
+                        serde_json::from_value::<HospitalExternalReport>(val.clone())
+                    {
+                        merged_exams.merge(ext_report.clinical_exams.clone());
+                        source_hospital = ext_report.hospital_name.clone();
+                        imported_reports.push(ext_report);
+                        pull_mode = "live_hospital_api".to_string();
+                    }
+                }
+            }
+            Ok(resp) => {
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!(
+                        "hospital connector {} returned HTTP {}",
+                        conn.connector_id,
+                        resp.status().as_u16()
+                    ),
+                );
+            }
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("failed to reach hospital connector {}: {e}", conn.connector_id),
+                );
+            }
+        }
+    }
+
+    // 2. Fallback / QR cloud-film link parser when no live hospital server is wired yet
+    if imported_reports.is_empty() {
+        let mut bundle = ClinicalExamBundle::default();
+        if let Some(ref url) = qr_hint.cloud_film_url {
+            let modality = match qr_hint
+                .report_type
+                .as_deref()
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "mri" => ImagingModality::Mri,
+                "ct" => ImagingModality::Ct,
+                "us" | "ultrasound" => ImagingModality::Ultrasound,
+                "ecg" => ImagingModality::Ecg,
+                "xray" | "dr" => ImagingModality::Xray,
+                _ => ImagingModality::Other,
+            };
+            let media = ClinicalMediaAsset {
+                asset_id: format!("cloudfilm_{effective_report_no}"),
+                category: if modality == ImagingModality::Mri {
+                    ClinicalMediaCategory::MriImage
+                } else {
+                    ClinicalMediaCategory::LabReportImage
+                },
+                title: format!("医院手机电子报告/云胶片 ({effective_report_no})"),
+                mime_type: "text/uri-list".to_string(),
+                uri_or_path: Some(url.clone()),
+                data_base64: None,
+                sha256: None,
+                body_site: None,
+                captured_at: Some(Utc::now()),
+                caption: Some(format!("来源链接: {url}")),
+                tags: vec!["医院电子报告".to_string(), "云胶片".to_string()],
+            };
+            bundle.media_assets.push(media.clone());
+            bundle.imaging_exams.push(ImagingExamRecord {
+                exam_id: format!("exam_qr_{effective_report_no}"),
+                modality,
+                exam_name: format!("手机扫码关联报告 ({effective_report_no})"),
+                body_part: String::new(),
+                examined_at: Some(Utc::now()),
+                findings: format!("已关联医院电子报告/云胶片链接：{url}"),
+                impression: "待院内 LIS/PACS 正式授权连接器拉取完整结构化正文".to_string(),
+                contrast_used: None,
+                images: vec![media],
+            });
+        }
+        merged_exams.merge(bundle.clone());
+        imported_reports.push(HospitalExternalReport {
+            report_no: effective_report_no.clone(),
+            hospital_name: source_hospital.clone(),
+            department: "检验/影像科".to_string(),
+            report_type: qr_hint
+                .report_type
+                .unwrap_or_else(|| "comprehensive".to_string()),
+            reported_at: Some(Utc::now()),
+            cloud_film_url: qr_hint.cloud_film_url,
+            report_pdf_url: None,
+            summary: if bundle.is_empty() {
+                format!("已登记医院报告单号 {effective_report_no}，等待配置院内 HIS/LIS/PACS 连接器后自动同步")
+            } else {
+                bundle.to_searchable_text()
+            },
+            clinical_exams: bundle,
+        });
+    }
+
+    let attached_event_id = if req.auto_attach_to_patient {
+        let summary_text = imported_reports
+            .first()
+            .map(|r| r.summary.as_str())
+            .unwrap_or("");
+        let dept = imported_reports
+            .first()
+            .map(|r| r.department.as_str())
+            .unwrap_or("全科医学科");
+        match persist_hospital_bundle_to_patient(
+            &state,
+            &req.patient_id,
+            &source_hospital,
+            dept,
+            &effective_report_no,
+            summary_text,
+            merged_exams.clone(),
+        )
+        .await
+        {
+            Ok(eid) => Some(eid),
+            Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, e),
+        }
+    } else {
+        None
+    };
+
+    Json(HospitalReportPullResponse {
+        source_hospital,
+        connector_id,
+        pull_mode,
+        imported_reports,
+        merged_clinical_exams: merged_exams,
+        attached_event_id,
+        pii_scrubbed: true,
+    })
+    .into_response()
+}
+
+async fn hospital_report_webhook_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<HospitalWebhookPushPayload>,
+) -> Response {
+    let auth = match authenticate_request(&state, &headers, 10).await {
+        Ok(a) => a,
+        Err(e) => return auth_err_response(e),
+    };
+    if !auth.is_admin && auth.api_key.is_none() {
+        return auth_err_response(AuthError::forbidden(
+            "admin or hospital API key required for webhook push",
+        ));
+    }
+    if let Err(verr) = validate_patient_id(&payload.patient_id) {
+        return json_error(StatusCode::BAD_REQUEST, verr.message);
+    }
+
+    let mut bundle = payload.clinical_exams;
+    if let Some(ref fhir) = payload.fhir_bundle {
+        bundle.merge(convert_fhir_bundle_to_clinical_exams(fhir));
+    }
+    if let Some(ref url) = payload.cloud_film_url {
+        bundle.media_assets.push(ClinicalMediaAsset {
+            asset_id: format!("webhook_film_{}", payload.report_no),
+            category: ClinicalMediaCategory::MriImage,
+            title: format!("{} 云胶片 ({})", payload.hospital_name, payload.report_no),
+            mime_type: "text/uri-list".to_string(),
+            uri_or_path: Some(url.clone()),
+            data_base64: None,
+            sha256: None,
+            body_site: None,
+            captured_at: Some(Utc::now()),
+            caption: payload.summary.clone(),
+            tags: vec!["云胶片".to_string(), payload.hospital_code.clone()],
+        });
+    }
+
+    match persist_hospital_bundle_to_patient(
+        &state,
+        &payload.patient_id,
+        &payload.hospital_name,
+        payload.department.as_deref().unwrap_or("检验/影像科"),
+        &payload.report_no,
+        payload.summary.as_deref().unwrap_or(""),
+        bundle,
+    )
+    .await
+    {
+        Ok(event_id) => Json(serde_json::json!({
+            "accepted": true,
+            "patient_id": payload.patient_id,
+            "report_no": payload.report_no,
+            "event_id": event_id,
+            "pii_scrubbed": true,
+        }))
+        .into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FhirImportRequest {
+    patient_id: String,
+    #[serde(default = "default_fhir_hospital")]
+    hospital_name: String,
+    #[serde(default)]
+    report_no: Option<String>,
+    #[serde(default)]
+    department: Option<String>,
+    fhir_bundle: serde_json::Value,
+}
+
+fn default_fhir_hospital() -> String {
+    "HL7 FHIR 医院电子报告".to_string()
+}
+
+async fn import_fhir_bundle_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<FhirImportRequest>,
+) -> Response {
+    let auth = match authenticate_request(&state, &headers, 10).await {
+        Ok(a) => a,
+        Err(e) => return auth_err_response(e),
+    };
+    if let Err(e) = check_patient_access(&state, &auth, &req.patient_id) {
+        return auth_err_response(e);
+    }
+    if let Err(verr) = validate_patient_id(&req.patient_id) {
+        return json_error(StatusCode::BAD_REQUEST, verr.message);
+    }
+
+    let bundle = convert_fhir_bundle_to_clinical_exams(&req.fhir_bundle);
+    let report_no = req
+        .report_no
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("FHIR{}", Uuid::new_v4().simple().to_string()[..8].to_uppercase()));
+
+    match persist_hospital_bundle_to_patient(
+        &state,
+        &req.patient_id,
+        &req.hospital_name,
+        req.department.as_deref().unwrap_or("检验/影像科"),
+        &report_no,
+        &bundle.to_searchable_text(),
+        bundle.clone(),
+    )
+    .await
+    {
+        Ok(event_id) => Json(serde_json::json!({
+            "imported": true,
+            "patient_id": req.patient_id,
+            "report_no": report_no,
+            "event_id": event_id,
+            "clinical_exams": bundle,
         }))
         .into_response(),
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, e),

@@ -8,6 +8,7 @@ import {
   type BatchImportItem,
   type QueuedImportFile,
 } from '../utils/batchFiles';
+import ClinicalMediaDropzone, { type LocalClinicalMediaItem } from './ClinicalMediaDropzone.vue';
 
 const toast = useToast();
 
@@ -24,6 +25,7 @@ const activeMode = ref<'batch_ai' | 'local_path'>('batch_ai');
 const fileInputRef = ref<HTMLInputElement | null>(null);
 const isDragging = ref(false);
 const queuedFiles = ref<QueuedImportFile[]>([]);
+const patientAttachedMedia = ref<LocalClinicalMediaItem[]>([]);
 const pastedText = ref('');
 const pastedLabel = ref('自由粘贴病例.txt');
 
@@ -258,12 +260,44 @@ async function handleCommitNormalizedRecords() {
   }
   isBusy.value = true;
   try {
+    const strippedMedia = patientAttachedMedia.value.map(({ previewUrl: _p, ...rest }) => rest);
+    const recordsToCommit = normalizedRecords.value.map((rec) => {
+      if (strippedMedia.length === 0) return rec;
+      const events = [...(rec.l3_visit_events || [])];
+      if (events.length > 0) {
+        const first = { ...events[0] };
+        const exams = { ...(first.clinical_exams || {}) };
+        exams.media_assets = [...(exams.media_assets || []), ...strippedMedia];
+        first.clinical_exams = exams;
+        events[0] = first;
+      } else {
+        events.push({
+          event_id: `evt_media_${Date.now()}`,
+          occurred_at: new Date().toISOString(),
+          chief_complaint: '患者医学图片与检查资料导入',
+          extracted_symptoms: [],
+          recommended_department: '全科医学科',
+          urgency_level: 3,
+          summary: `附带 ${strippedMedia.length} 张医学检查/伤口/诱因图片`,
+          clinical_exams: {
+            vital_signs: [],
+            lab_panels: [],
+            imaging_exams: [],
+            wound_assessments: [],
+            trigger_substances: [],
+            media_assets: strippedMedia,
+          },
+        });
+      }
+      return { ...rec, l3_visit_events: events };
+    });
     commitResult.value = await invokeStudio<any>('commit_patient_records', {
       req: {
-        records: normalizedRecords.value,
+        records: recordsToCommit,
         detected_pii_columns: detectedPiiBadges.value,
       },
     });
+    patientAttachedMedia.value = [];
     setStatus(
       `批量入库完成：已写入 ${commitResult.value.imported_patients} 位病人 L2 画像与 ${commitResult.value.imported_l3_events} 条 L3 就诊事件`,
       'success',
@@ -477,6 +511,15 @@ async function handleCommitLocalPath() {
             placeholder="例如：患者女，42岁，既往高血压5年，青霉素过敏。本次因反复头晕伴心悸2天就诊..."
             class="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-xs font-mono text-slate-200"
           />
+        </div>
+
+        <!-- Direct Clinical Image Attachment for Patient Cases -->
+        <div class="space-y-2 pt-2 border-t border-slate-800">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-medium text-emerald-300">附带患者检查图片（化验单拍照、核磁/CT、伤口照、诱因物质照，自动随病历 AES-256-GCM 加密入库）</span>
+            <span v-if="patientAttachedMedia.length" class="text-[11px] text-emerald-400">已附带 {{ patientAttachedMedia.length }} 张图片</span>
+          </div>
+          <ClinicalMediaDropzone v-model="patientAttachedMedia" compact />
         </div>
       </div>
 
