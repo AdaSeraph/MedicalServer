@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install musl static build toolchain
         run: |
@@ -68,7 +68,7 @@ jobs:
           tar -czf medical-server-cloud-linux-x86_64.tar.gz -C cloud_pkg .
 
       - name: Upload Cloud Server Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-cloud-linux-x86_64
           path: medical-server-cloud-linux-x86_64.tar.gz
@@ -79,13 +79,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -93,7 +93,7 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}/medical-server
           tags: |
@@ -102,7 +102,7 @@ jobs:
             type=semver,pattern={{version}}
 
       - name: Build and push Cloud Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: deploy/Dockerfile
@@ -127,7 +127,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Linux Tauri & packaging dependencies
         if: runner.os == 'Linux'
@@ -151,7 +151,7 @@ jobs:
           key: installer-${{ matrix.label }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -203,7 +203,7 @@ jobs:
           ls -lh installers_out
 
       - name: Upload Desktop Installer Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-installer-${{ matrix.label }}
           path: installers_out/*
@@ -225,7 +225,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Linux Tauri & native build dependencies
         if: runner.os == 'Linux'
@@ -248,7 +248,7 @@ jobs:
           key: suite-${{ matrix.target }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -292,7 +292,7 @@ jobs:
           Compress-Archive -Path dist_pkg\* -DestinationPath "medical-suite-${{ matrix.target }}.zip" -Force
 
       - name: Upload Build Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-suite-${{ matrix.target }}
           path: medical-suite-${{ matrix.target }}.${{ matrix.archive }}
@@ -304,7 +304,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: artifacts
@@ -332,7 +332,7 @@ jobs:
           echo "title=${TITLE}" >> "$GITHUB_OUTPUT"
 
       - name: Create or Update GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.name }}
           name: ${{ steps.tag.outputs.title }}
