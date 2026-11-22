@@ -1,14 +1,16 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
+use chrono::Utc;
 use medical_core::ecs::{
     ExtractedSymptoms, RagEvidence, RedFlagAlert, TriageExecutionResult, TriageRequest,
     TriageSlots,
 };
 use medical_core::llm::{ProbeResult, ProviderConfig, RouterConfig};
 use medical_core::models::{
-    EpidemicContext, KnowledgeDocument, MedicalDictionaries, RedFlagLevel, RedFlagRule,
-    SymptomSynonym, TargetPopulation,
+    EpidemicContext, KnowledgeDocument, MedicalDictionaries, PatientRecord, RedFlagLevel,
+    RedFlagRule, SymptomSynonym, TargetPopulation,
 };
 use medical_core::storage::{
     ApiKeyRecord, GatewayMetricsSummary, IngestionCheckpoint, IssueApiKeyRequest, IssuedApiKey,
@@ -16,12 +18,19 @@ use medical_core::storage::{
 use medical_core::validation::Validate;
 use medical_pipeline::{
     BookMetadataDefaults, CustomChunkRule, JobProgress, PatientImportReport, PatientMaskingConfig,
-    export_error_samples_jsonl, import_patients_file, parse_collection_bundle_file,
-    parse_medical_book_file, stream_knowledge_jsonl,
+    export_error_samples_jsonl, import_patients_csv_str, import_patients_file,
+    import_patients_json_str, import_patients_xlsx_bytes, parse_collection_bundle_file,
+    parse_collection_bundle_str, parse_docx_book, parse_markdown_book, parse_medical_book_file,
+    parse_pdf_book, parse_plain_text_book, stream_knowledge_jsonl,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+use crate::ai_normalize::{
+    AiImportPrompts, AiKnowledgeNormalizeResponse, AiPatientNormalizeResponse, BatchImportItem,
+    ai_normalize_knowledge_batch_with_state, ai_normalize_patient_batch_with_state,
+    default_ai_import_prompts,
+};
 use crate::state::StudioState;
 
 // ===========================================================================
@@ -256,6 +265,236 @@ pub async fn export_import_errors(
     export_import_errors_impl(&state, job_id, output_path).await
 }
 
+#[tauri::command]
+pub fn get_ai_import_prompts() -> AiImportPrompts {
+    default_ai_import_prompts()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AiNormalizeKnowledgeRequest {
+    pub items: Vec<BatchImportItem>,
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub custom_prompt: Option<String>,
+    #[serde(default)]
+    pub defaults: BookMetadataDefaults,
+}
+
+pub async fn ai_normalize_knowledge_batch_impl(
+    state: &StudioState,
+    req: AiNormalizeKnowledgeRequest,
+) -> Result<AiKnowledgeNormalizeResponse, String> {
+    ai_normalize_knowledge_batch_with_state(
+        state,
+        &req.items,
+        req.provider_id.as_deref(),
+        req.custom_prompt.as_deref(),
+        &req.defaults,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn ai_normalize_knowledge_batch(
+    state: State<'_, StudioState>,
+    req: AiNormalizeKnowledgeRequest,
+) -> Result<AiKnowledgeNormalizeResponse, String> {
+    ai_normalize_knowledge_batch_impl(&state, req).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchKnowledgePreviewRequest {
+    pub items: Vec<BatchImportItem>,
+    #[serde(default)]
+    pub defaults: BookMetadataDefaults,
+    #[serde(default)]
+    pub custom_rule: Option<CustomChunkRule>,
+}
+
+pub async fn batch_preview_knowledge_items_impl(
+    req: BatchKnowledgePreviewRequest,
+) -> Result<KnowledgePreviewResponse, String> {
+    if req.items.is_empty() {
+        return Err("请至少添加一个文件或文本进行批量解析".to_string());
+    }
+    let mut all_docs = Vec::new();
+    let mut errors = Vec::new();
+
+    for item in &req.items {
+        let ext = Path::new(&item.name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+
+        let parsed: Result<Vec<KnowledgeDocument>, String> = if let Some(fp) = &item.file_path {
+            let p = Path::new(fp);
+            let fext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or(ext.clone());
+            match fext.as_str() {
+                "json" => parse_collection_bundle_file(p)
+                    .map(|pkg| pkg.knowledge_documents)
+                    .map_err(|e| e.to_string()),
+                "jsonl" => stream_knowledge_jsonl(p, 0, None)
+                    .map(|rep| rep.records)
+                    .map_err(|e| e.to_string()),
+                _ => parse_medical_book_file(p, &req.defaults, req.custom_rule.as_ref(), None)
+                    .map_err(|e| e.to_string()),
+            }
+        } else if let Some(b64) = &item.content_base64 {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64.trim())
+                .map_err(|e| format!("base64 decode failed: {e}"));
+            match bytes {
+                Ok(b) => match ext.as_str() {
+                    "docx" => parse_docx_book(&b, &req.defaults, req.custom_rule.as_ref())
+                        .map_err(|e| e.to_string()),
+                    "pdf" => parse_pdf_book(&b, &req.defaults, req.custom_rule.as_ref(), None)
+                        .map_err(|e| e.to_string()),
+                    _ => {
+                        let txt = String::from_utf8_lossy(&b);
+                        parse_knowledge_text_by_ext(&ext, &txt, &req.defaults, req.custom_rule.as_ref())
+                    }
+                },
+                Err(e) => Err(e),
+            }
+        } else if let Some(txt) = &item.content_text {
+            parse_knowledge_text_by_ext(&ext, txt, &req.defaults, req.custom_rule.as_ref())
+        } else {
+            Err("导入项内容为空".to_string())
+        };
+
+        match parsed {
+            Ok(docs) => all_docs.extend(docs),
+            Err(e) => errors.push(format!("[{}] {e}", item.name)),
+        }
+    }
+
+    let total_chunks = all_docs.len();
+    Ok(KnowledgePreviewResponse {
+        total_chunks,
+        preview_chunks: all_docs,
+        errors,
+        metadata_fields: vec![
+            "target_population",
+            "department",
+            "authority_level",
+            "seasonal_tags",
+        ],
+        regex_applied: req.custom_rule.is_some(),
+    })
+}
+
+fn parse_knowledge_text_by_ext(
+    ext: &str,
+    text: &str,
+    defaults: &BookMetadataDefaults,
+    custom_rule: Option<&CustomChunkRule>,
+) -> Result<Vec<KnowledgeDocument>, String> {
+    match ext {
+        "json" => parse_collection_bundle_str(text)
+            .map(|pkg| pkg.knowledge_documents)
+            .map_err(|e| e.to_string()),
+        "jsonl" => {
+            let mut docs = Vec::new();
+            for (idx, line) in text.lines().enumerate() {
+                let t = line.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                let doc: KnowledgeDocument = serde_json::from_str(t)
+                    .map_err(|e| format!("line {}: {e}", idx + 1))?;
+                doc.validate()
+                    .map_err(|e| format!("line {}: {e}", idx + 1))?;
+                docs.push(doc);
+            }
+            Ok(docs)
+        }
+        "md" | "markdown" => parse_markdown_book(text, defaults).map_err(|e| e.to_string()),
+        _ => parse_plain_text_book(text, defaults, custom_rule).map_err(|e| e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn batch_preview_knowledge_items(
+    req: BatchKnowledgePreviewRequest,
+) -> Result<KnowledgePreviewResponse, String> {
+    batch_preview_knowledge_items_impl(req).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommitKnowledgeDocumentsRequest {
+    pub job_id: String,
+    #[serde(default = "default_ns")]
+    pub tenant_namespace: String,
+    pub documents: Vec<KnowledgeDocument>,
+}
+
+pub async fn commit_knowledge_documents_impl(
+    state: &StudioState,
+    req: CommitKnowledgeDocumentsRequest,
+) -> Result<JobProgress, String> {
+    if req.documents.is_empty() {
+        return Err("没有可写入数据库的规范化知识条目".to_string());
+    }
+    let started = Instant::now();
+    let mut valid_docs = Vec::with_capacity(req.documents.len());
+    let mut failed_count = 0u64;
+    for doc in req.documents {
+        if doc.validate().is_ok() {
+            valid_docs.push(doc);
+        } else {
+            failed_count += 1;
+        }
+    }
+    if valid_docs.is_empty() {
+        return Err("所有知识条目校验均未通过，无法写入数据库".to_string());
+    }
+
+    let job_id = if req.job_id.trim().is_empty() {
+        format!("job_ai_kb_{}", Utc::now().timestamp())
+    } else {
+        req.job_id.trim().to_string()
+    };
+
+    let mut cp = state
+        .checkpoints
+        .load_or_init(
+            &job_id,
+            "batch_ai_import",
+            "knowledge_batch",
+            (valid_docs.len() as u64) + failed_count,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let written = state
+        .indexer
+        .upsert_documents(&valid_docs, &req.tenant_namespace)
+        .await
+        .map_err(|e| e.to_string())?;
+    cp.processed_items = written;
+    cp.failed_items = failed_count;
+    cp.last_doc_id = valid_docs.last().map(|d| d.doc_id.clone());
+    state
+        .checkpoints
+        .save_progress(&mut cp, medical_core::storage::CheckpointStatus::Completed)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(medical_pipeline::CheckpointManager::build_progress(&cp, started))
+}
+
+#[tauri::command]
+pub async fn commit_knowledge_documents(
+    state: State<'_, StudioState>,
+    req: CommitKnowledgeDocumentsRequest,
+) -> Result<JobProgress, String> {
+    commit_knowledge_documents_impl(&state, req).await
+}
+
 // ===========================================================================
 // Module 2: 病人历史数据批量导入与脱敏中心
 // ===========================================================================
@@ -346,6 +585,221 @@ pub async fn apply_masking_and_import_patients(
     salt: Option<String>,
 ) -> Result<PatientImportCommitResult, String> {
     apply_masking_and_import_patients_impl(&state, file_path, salt).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AiNormalizePatientRequest {
+    pub items: Vec<BatchImportItem>,
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub custom_prompt: Option<String>,
+    #[serde(default)]
+    pub salt: Option<String>,
+    #[serde(default = "default_true")]
+    pub pre_scrub_pii: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+pub async fn ai_normalize_patient_batch_impl(
+    state: &StudioState,
+    req: AiNormalizePatientRequest,
+) -> Result<AiPatientNormalizeResponse, String> {
+    let salt_bytes = req
+        .salt
+        .filter(|v| !v.trim().is_empty())
+        .map(String::into_bytes)
+        .unwrap_or_else(|| PatientMaskingConfig::default().salt);
+
+    ai_normalize_patient_batch_with_state(
+        state,
+        &req.items,
+        req.provider_id.as_deref(),
+        req.custom_prompt.as_deref(),
+        &salt_bytes,
+        req.pre_scrub_pii,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn ai_normalize_patient_batch(
+    state: State<'_, StudioState>,
+    req: AiNormalizePatientRequest,
+) -> Result<AiPatientNormalizeResponse, String> {
+    ai_normalize_patient_batch_impl(&state, req).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchPatientPreviewRequest {
+    pub items: Vec<BatchImportItem>,
+    #[serde(default)]
+    pub salt: Option<String>,
+}
+
+pub async fn batch_preview_patient_items_impl(
+    req: BatchPatientPreviewRequest,
+) -> Result<PatientImportReport, String> {
+    if req.items.is_empty() {
+        return Err("请至少添加一个病例文件进行批量预检".to_string());
+    }
+    let mut cfg = PatientMaskingConfig::default();
+    if let Some(s) = req.salt.filter(|v| !v.trim().is_empty()) {
+        cfg.salt = s.into_bytes();
+    }
+
+    let mut records = Vec::new();
+    let mut detected_pii_columns = Vec::new();
+    let mut failed_rows = Vec::new();
+    let mut total_input_rows = 0usize;
+
+    for item in &req.items {
+        let ext = Path::new(&item.name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+
+        let report_res = if let Some(fp) = &item.file_path {
+            import_patients_file(fp, &cfg).map_err(|e| e.to_string())
+        } else if let Some(b64) = &item.content_base64 {
+            base64::engine::general_purpose::STANDARD
+                .decode(b64.trim())
+                .map_err(|e| format!("base64 decode failed: {e}"))
+                .and_then(|bytes| match ext.as_str() {
+                    "xlsx" | "xls" => import_patients_xlsx_bytes(&bytes, &cfg)
+                        .map_err(|e| e.to_string()),
+                    "json" => {
+                        let txt = String::from_utf8_lossy(&bytes);
+                        import_patients_json_str(&txt, &cfg).map_err(|e| e.to_string())
+                    }
+                    "csv" => {
+                        let txt = String::from_utf8_lossy(&bytes);
+                        import_patients_csv_str(&txt, &cfg).map_err(|e| e.to_string())
+                    }
+                    other => Err(format!(
+                        "规则预检不支持 .{other} 格式，请使用「AI 批量规范化」处理非结构化病例"
+                    )),
+                })
+        } else if let Some(txt) = &item.content_text {
+            match ext.as_str() {
+                "json" => import_patients_json_str(txt, &cfg).map_err(|e| e.to_string()),
+                "csv" => import_patients_csv_str(txt, &cfg).map_err(|e| e.to_string()),
+                other => Err(format!(
+                    "规则预检不支持 .{other} 格式，请使用「AI 批量规范化」处理非结构化病例"
+                )),
+            }
+        } else {
+            Err("导入项内容为空".to_string())
+        };
+
+        match report_res {
+            Ok(rep) => {
+                total_input_rows += rep.total_input_rows;
+                records.extend(rep.records);
+                for col in rep.detected_pii_columns {
+                    if !detected_pii_columns.contains(&col) {
+                        detected_pii_columns.push(col);
+                    }
+                }
+                for f in rep.failed_rows {
+                    failed_rows.push(format!("[{}] {f}", item.name));
+                }
+            }
+            Err(e) => failed_rows.push(format!("[{}] {e}", item.name)),
+        }
+    }
+
+    Ok(PatientImportReport {
+        records,
+        detected_pii_columns,
+        failed_rows,
+        total_input_rows,
+    })
+}
+
+#[tauri::command]
+pub async fn batch_preview_patient_items(
+    req: BatchPatientPreviewRequest,
+) -> Result<PatientImportReport, String> {
+    batch_preview_patient_items_impl(req).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommitPatientRecordsRequest {
+    pub records: Vec<PatientRecord>,
+    #[serde(default)]
+    pub detected_pii_columns: Vec<String>,
+}
+
+pub async fn commit_patient_records_impl(
+    state: &StudioState,
+    req: CommitPatientRecordsRequest,
+) -> Result<PatientImportCommitResult, String> {
+    if req.records.is_empty() {
+        return Err("没有可写入数据库的规范化病例记录".to_string());
+    }
+
+    let mut imported_patients = 0usize;
+    let mut imported_l3_events = 0usize;
+    let mut failed_rows = Vec::new();
+
+    for (idx, rec) in req.records.iter().enumerate() {
+        if let Err(e) = rec.validate() {
+            failed_rows.push(format!("record {}: 隐私/结构校验失败: {e}", idx + 1));
+            continue;
+        }
+        state
+            .stores
+            .patient_memory
+            .upsert_l2_profile(
+                &rec.patient_id,
+                rec.consent_long_term_memory,
+                &rec.l2_profile,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        imported_patients += 1;
+
+        for ev in &rec.l3_visit_events {
+            state
+                .stores
+                .patient_memory
+                .insert_l3_event(&rec.patient_id, ev)
+                .await
+                .map_err(|e| e.to_string())?;
+            if let Ok(vec) = state
+                .embedder
+                .embed_one(&format!("{} {}", ev.chief_complaint, ev.summary))
+                .await
+            {
+                let _ = state
+                    .stores
+                    .patient_l3_vectors
+                    .upsert_event_vector(&rec.patient_id, ev, vec)
+                    .await;
+            }
+            imported_l3_events += 1;
+        }
+    }
+
+    Ok(PatientImportCommitResult {
+        imported_patients,
+        imported_l3_events,
+        failed_rows,
+        detected_pii_columns: req.detected_pii_columns,
+    })
+}
+
+#[tauri::command]
+pub async fn commit_patient_records(
+    state: State<'_, StudioState>,
+    req: CommitPatientRecordsRequest,
+) -> Result<PatientImportCommitResult, String> {
+    commit_patient_records_impl(&state, req).await
 }
 
 // ===========================================================================

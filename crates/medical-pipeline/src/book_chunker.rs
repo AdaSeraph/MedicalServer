@@ -343,12 +343,8 @@ pub fn parse_plain_text_book(
     build_chunks_from_trees(trees, defaults)
 }
 
-/// Parses a `.docx` medical book using `docx-rs` and feeds extracted paragraphs into the semantic chunker.
-pub fn parse_docx_book(
-    bytes: &[u8],
-    defaults: &BookMetadataDefaults,
-    custom_rule: Option<&CustomChunkRule>,
-) -> PipelineResult<Vec<KnowledgeDocument>> {
+/// Extracts plain text (preserving Word Heading1/Heading2 as Markdown `#`/`##`) from `.docx` bytes.
+pub fn extract_docx_text(bytes: &[u8]) -> PipelineResult<String> {
     let docx = docx_rs::read_docx(bytes)
         .map_err(|e| PipelineError::Parse(format!("docx-rs parse error: {e}")))?;
 
@@ -383,8 +379,17 @@ pub fn parse_docx_book(
             lines.push(trimmed.to_string());
         }
     }
+    Ok(lines.join("\n"))
+}
 
-    let joined = lines.join("\n");
+/// Parses a `.docx` medical book using `docx-rs` and feeds extracted paragraphs into the semantic chunker.
+pub fn parse_docx_book(
+    bytes: &[u8],
+    defaults: &BookMetadataDefaults,
+    custom_rule: Option<&CustomChunkRule>,
+) -> PipelineResult<Vec<KnowledgeDocument>> {
+    let joined = extract_docx_text(bytes)?;
+    let lines: Vec<String> = joined.lines().map(ToString::to_string).collect();
     if joined.contains("\n# ") || joined.starts_with("# ") {
         parse_markdown_book(&joined, defaults)
     } else if custom_rule.is_some() || joined.contains("【疾病】") {
@@ -409,13 +414,11 @@ pub fn parse_docx_book(
     }
 }
 
-/// Parses a `.pdf` medical book using `pdf-extract` + `lopdf` fallback, with OCR plugin hook for scanned PDFs.
-pub fn parse_pdf_book(
+/// Extracts plain text from `.pdf` bytes using `pdf-extract` + `lopdf` fallback and optional OCR.
+pub fn extract_pdf_text(
     bytes: &[u8],
-    defaults: &BookMetadataDefaults,
-    custom_rule: Option<&CustomChunkRule>,
     ocr: Option<&dyn OcrPlugin>,
-) -> PipelineResult<Vec<KnowledgeDocument>> {
+) -> PipelineResult<String> {
     // Primary text-layer extraction via pdf-extract
     let mut extracted = pdf_extract::extract_text_from_mem(bytes)
         .ok()
@@ -442,6 +445,17 @@ pub fn parse_pdf_book(
             return Err(PipelineError::ScannedPdfNeedsOcr);
         }
     }
+    Ok(extracted)
+}
+
+/// Parses a `.pdf` medical book using `pdf-extract` + `lopdf` fallback, with OCR plugin hook for scanned PDFs.
+pub fn parse_pdf_book(
+    bytes: &[u8],
+    defaults: &BookMetadataDefaults,
+    custom_rule: Option<&CustomChunkRule>,
+    ocr: Option<&dyn OcrPlugin>,
+) -> PipelineResult<Vec<KnowledgeDocument>> {
+    let extracted = extract_pdf_text(bytes, ocr)?;
 
     if extracted.contains("\n# ") || extracted.starts_with("# ") {
         parse_markdown_book(&extracted, defaults)

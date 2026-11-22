@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::path::Path;
 
-use calamine::{Data, Reader, open_workbook_auto};
+use calamine::{Data, Reader, open_workbook_auto, open_workbook_auto_from_rs};
 use chrono::{DateTime, Utc};
 use medical_core::crypto::{hash_api_key, hash_patient_id};
 use medical_core::models::{Gender, L2Profile, L3VisitEvent, PatientRecord};
@@ -174,11 +175,19 @@ pub fn import_patients_csv(
     path: impl AsRef<Path>,
     config: &PatientMaskingConfig,
 ) -> PipelineResult<PatientImportReport> {
+    let raw = std::fs::read_to_string(path.as_ref())?;
+    import_patients_csv_str(&raw, config)
+}
+
+/// Parses CSV text directly and masks all rows in parallel via `rayon`.
+pub fn import_patients_csv_str(
+    csv_text: &str,
+    config: &PatientMaskingConfig,
+) -> PipelineResult<PatientImportReport> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(true)
-        .from_path(path.as_ref())
-        .map_err(|e| PipelineError::Parse(format!("csv open error: {e}")))?;
+        .from_reader(csv_text.as_bytes());
 
     let headers: Vec<String> = reader
         .headers()
@@ -216,7 +225,23 @@ pub fn import_patients_xlsx(
 ) -> PipelineResult<PatientImportReport> {
     let mut workbook = open_workbook_auto(path.as_ref())
         .map_err(|e| PipelineError::Parse(format!("calamine workbook open error: {e}")))?;
+    import_patients_workbook(&mut workbook, config)
+}
 
+/// Parses Excel `.xlsx`/`.xls` bytes via `calamine` and masks all rows in parallel via `rayon`.
+pub fn import_patients_xlsx_bytes(
+    bytes: &[u8],
+    config: &PatientMaskingConfig,
+) -> PipelineResult<PatientImportReport> {
+    let mut workbook = open_workbook_auto_from_rs(Cursor::new(bytes))
+        .map_err(|e| PipelineError::Parse(format!("calamine workbook bytes open error: {e}")))?;
+    import_patients_workbook(&mut workbook, config)
+}
+
+fn import_patients_workbook<RS: std::io::Read + std::io::Seek>(
+    workbook: &mut calamine::Sheets<RS>,
+    config: &PatientMaskingConfig,
+) -> PipelineResult<PatientImportReport> {
     let sheet_names = workbook.sheet_names().to_vec();
     let first_sheet = sheet_names
         .first()
@@ -260,13 +285,49 @@ pub fn import_patients_xlsx(
     mask_raw_rows_parallel(raw_rows, detection.detected_pii_columns, Vec::new(), config)
 }
 
+/// Extracts all sheets of an Excel `.xlsx`/`.xls` byte buffer into human-readable TSV text for AI normalization.
+pub fn extract_xlsx_as_text(bytes: &[u8]) -> PipelineResult<String> {
+    let mut workbook = open_workbook_auto_from_rs(Cursor::new(bytes))
+        .map_err(|e| PipelineError::Parse(format!("calamine workbook bytes open error: {e}")))?;
+    let sheet_names = workbook.sheet_names().to_vec();
+    let mut out = String::new();
+    for name in sheet_names {
+        let Ok(range) = workbook.worksheet_range(&name) else {
+            continue;
+        };
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!("=== Sheet: {name} ===\n"));
+        for row in range.rows() {
+            let vals: Vec<String> = row
+                .iter()
+                .map(|cell| cell_to_string(cell).trim().replace('\t', " "))
+                .collect();
+            if vals.iter().any(|v| !v.is_empty()) {
+                out.push_str(&vals.join("\t"));
+                out.push('\n');
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Reads a raw JSON array of patient records via `sonic-rs` and masks them in parallel via `rayon`.
 pub fn import_patients_json(
     path: impl AsRef<Path>,
     config: &PatientMaskingConfig,
 ) -> PipelineResult<PatientImportReport> {
     let raw = std::fs::read_to_string(path.as_ref())?;
-    let cleaned = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+    import_patients_json_str(&raw, config)
+}
+
+/// Parses a raw JSON array of patient records from a string and masks them in parallel via `rayon`.
+pub fn import_patients_json_str(
+    raw: &str,
+    config: &PatientMaskingConfig,
+) -> PipelineResult<PatientImportReport> {
+    let cleaned = raw.strip_prefix('\u{feff}').unwrap_or(raw);
     let items: Vec<RawPatientJsonItem> = sonic_rs::from_str(cleaned)
         .map_err(|e| PipelineError::Parse(format!("sonic-rs patient json error: {e}")))?;
 

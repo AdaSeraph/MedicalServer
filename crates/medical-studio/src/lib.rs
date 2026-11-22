@@ -1,3 +1,4 @@
+pub mod ai_normalize;
 pub mod commands;
 pub mod state;
 
@@ -23,9 +24,16 @@ pub fn run() {
             commands::resume_knowledge_import,
             commands::get_import_job_status,
             commands::export_import_errors,
+            commands::get_ai_import_prompts,
+            commands::ai_normalize_knowledge_batch,
+            commands::batch_preview_knowledge_items,
+            commands::commit_knowledge_documents,
             // Module 2: Patient Import & Masking Center
             commands::preview_patient_import,
             commands::apply_masking_and_import_patients,
+            commands::ai_normalize_patient_batch,
+            commands::batch_preview_patient_items,
+            commands::commit_patient_records,
             // Module 3: Seasonal & Epidemic Context Console
             commands::list_epidemic_contexts,
             commands::upsert_epidemic_context,

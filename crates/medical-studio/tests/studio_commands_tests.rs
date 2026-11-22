@@ -1,22 +1,28 @@
 use std::path::PathBuf;
 
 use chrono::NaiveDate;
-use medical_core::llm::{ModelTier, ProviderConfig, ProviderKind, RouterConfig};
+use medical_core::llm::{MockLlmProvider, ModelTier, ProviderConfig, ProviderKind, RouterConfig};
 use medical_core::models::{EpidemicContext, RedFlagLevel, RedFlagRule, Season, SymptomSynonym};
 use medical_core::storage::IssueApiKeyRequest;
 use medical_pipeline::BookMetadataDefaults;
+use medical_studio::ai_normalize::{
+    BatchImportItem, ai_normalize_knowledge_with_provider, ai_normalize_patient_with_provider,
+};
 use medical_studio::commands::{
-    KnowledgePreviewRequest, StartKnowledgeImportRequest, WhiteboxTriageRequest,
-    apply_masking_and_import_patients_impl, delete_llm_provider_impl, delete_red_flag_rule_impl,
-    delete_symptom_synonym_impl, export_import_errors_impl, get_gateway_metrics_impl,
-    get_import_job_status_impl, get_medical_dictionaries_impl, get_router_config_impl,
-    issue_api_key_impl, list_api_keys_impl, list_debug_patients_impl, list_epidemic_contexts_impl,
-    list_llm_providers_impl, notify_server_hot_reload_impl, preview_knowledge_chunks_impl,
-    preview_patient_import_impl, reset_ecs_debug_session_impl, resume_knowledge_import_impl,
-    revoke_api_key_impl, run_ecs_whitebox_triage_impl, save_red_flag_rule_impl,
-    save_router_config_impl, save_symptom_synonym_impl, start_knowledge_import_impl,
-    test_dictionary_sandbox_impl, test_llm_provider_connectivity_impl, upsert_epidemic_context_impl,
-    upsert_llm_provider_impl,
+    BatchKnowledgePreviewRequest, BatchPatientPreviewRequest, CommitKnowledgeDocumentsRequest,
+    CommitPatientRecordsRequest, KnowledgePreviewRequest, StartKnowledgeImportRequest,
+    WhiteboxTriageRequest, apply_masking_and_import_patients_impl,
+    batch_preview_knowledge_items_impl, batch_preview_patient_items_impl,
+    commit_knowledge_documents_impl, commit_patient_records_impl, delete_llm_provider_impl,
+    delete_red_flag_rule_impl, delete_symptom_synonym_impl, export_import_errors_impl,
+    get_gateway_metrics_impl, get_import_job_status_impl, get_medical_dictionaries_impl,
+    get_router_config_impl, issue_api_key_impl, list_api_keys_impl, list_debug_patients_impl,
+    list_epidemic_contexts_impl, list_llm_providers_impl, notify_server_hot_reload_impl,
+    preview_knowledge_chunks_impl, preview_patient_import_impl, reset_ecs_debug_session_impl,
+    resume_knowledge_import_impl, revoke_api_key_impl, run_ecs_whitebox_triage_impl,
+    save_red_flag_rule_impl, save_router_config_impl, save_symptom_synonym_impl,
+    start_knowledge_import_impl, test_dictionary_sandbox_impl,
+    test_llm_provider_connectivity_impl, upsert_epidemic_context_impl, upsert_llm_provider_impl,
 };
 use medical_studio::StudioState;
 
@@ -374,4 +380,173 @@ async fn test_llm_provider_config_and_connectivity_probe() {
     assert!(!remaining.iter().any(|p| p.id == "custom_fallback"));
 
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn test_ai_batch_normalize_and_commit_knowledge_and_patients() {
+    let state = StudioState::new_offline().await.unwrap();
+
+    // 1. AI Knowledge Batch Normalization (including <think> block, markdown fence & Chinese enums) -> DB commit
+    let kb_mock = MockLlmProvider::new("mock_norm_kb", "qwen-norm", ModelTier::Reasoning)
+        .with_default_json(
+            r#"<think>分析输入文本并规范化为标准知识块</think>
+```json
+{
+  "documents": [
+    {
+      "disease_name": "急性支气管炎",
+      "aliases": ["气管炎"],
+      "source_type": "临床指南",
+      "authority_level": 0.92,
+      "department": "呼吸内科",
+      "target_population": ["成人", "老人"],
+      "section_type": "临床表现",
+      "content": "急性支气管炎多由病毒感染引起，主要表现为持续干咳或伴白色黏痰、低热及胸骨后不适。",
+      "key_symptoms": ["咳嗽", "低热", "胸骨后不适"],
+      "red_flag_signs": ["呼吸困难", "高热持续超过3天"],
+      "seasonal_tags": ["winter"]
+    }
+  ]
+}
+```"#,
+        );
+
+    let kb_items = vec![
+        BatchImportItem {
+            name: "notes_1.txt".to_string(),
+            content_text: Some("急性支气管炎：干咳、低热、胸骨后不适，建议挂呼吸内科。".to_string()),
+            content_base64: None,
+            file_path: None,
+        },
+        BatchImportItem {
+            name: "notes_2.md".to_string(),
+            content_text: Some("# 急性支气管炎\n冬季高发，如呼吸困难需急诊。".to_string()),
+            content_base64: None,
+            file_path: None,
+        },
+    ];
+
+    let kb_norm = ai_normalize_knowledge_with_provider(
+        &kb_mock,
+        &kb_items,
+        None,
+        &BookMetadataDefaults::default(),
+        10_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(kb_norm.documents.len(), 2);
+    assert_eq!(kb_norm.item_results.len(), 2);
+    assert!(kb_norm.errors.is_empty());
+
+    let kb_prog = commit_knowledge_documents_impl(
+        &state,
+        CommitKnowledgeDocumentsRequest {
+            job_id: "studio_ai_kb_batch_01".to_string(),
+            tenant_namespace: "default".to_string(),
+            documents: kb_norm.documents,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(kb_prog.completed);
+    assert_eq!(kb_prog.processed_items, 2);
+
+    // 2. Rule-based batch preview for knowledge items
+    let rule_kb = batch_preview_knowledge_items_impl(BatchKnowledgePreviewRequest {
+        items: vec![BatchImportItem {
+            name: "sample.md".to_string(),
+            content_text: Some("# 偏头痛\n## 临床表现\n单侧搏动性头痛伴畏光恶心。\n## 推荐科室\n神经内科".to_string()),
+            content_base64: None,
+            file_path: None,
+        }],
+        defaults: BookMetadataDefaults::default(),
+        custom_rule: None,
+    })
+    .await
+    .unwrap();
+    assert!(rule_kb.total_chunks >= 1);
+
+    // 3. AI Patient Case Batch Normalization (with plaintext PII scrubbing + salted SHA-256 hashing) -> DB commit
+    let pat_mock = MockLlmProvider::new("mock_norm_pat", "qwen-norm", ModelTier::Reasoning)
+        .with_default_json(
+            r#"{
+  "patients": [
+    {
+      "patient_identifier": "110101198505121234",
+      "age": 41,
+      "gender": "女",
+      "is_pregnant": false,
+      "chronic_diseases": ["高血压"],
+      "allergies": ["青霉素"],
+      "visit_events": [
+        {
+          "chief_complaint": "患者姓名：张三，手机号13800138000，反复头晕伴心悸2天",
+          "extracted_symptoms": ["头晕", "心悸"],
+          "recommended_department": "心血管内科",
+          "urgency_level": 2,
+          "summary": "中年女性既往高血压，近期头晕心悸，建议心血管内科评估。"
+        }
+      ]
+    }
+  ]
+}"#,
+        );
+
+    let pat_items = vec![BatchImportItem {
+        name: "emr_freeform.txt".to_string(),
+        content_text: Some(
+            "患者姓名：张三，身份证110101198505121234，电话13800138000，女，41岁，既往高血压，青霉素过敏，主诉头晕心悸2天。"
+                .to_string(),
+        ),
+        content_base64: None,
+        file_path: None,
+    }];
+
+    let pat_norm = ai_normalize_patient_with_provider(
+        &pat_mock,
+        &pat_items,
+        None,
+        b"hospital-test-salt",
+        true,
+        10_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(pat_norm.records.len(), 1);
+    let rec = &pat_norm.records[0];
+    assert!(rec.patient_id.starts_with("pat_sha256_"));
+    assert_eq!(rec.l2_profile.age_group, "40-49");
+    assert!(!rec.l3_visit_events[0].chief_complaint.contains("13800138000"));
+    assert!(!rec.l3_visit_events[0].chief_complaint.contains("张三"));
+
+    let pat_commit = commit_patient_records_impl(
+        &state,
+        CommitPatientRecordsRequest {
+            records: pat_norm.records,
+            detected_pii_columns: pat_norm.detected_pii_types,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(pat_commit.imported_patients, 1);
+    assert_eq!(pat_commit.imported_l3_events, 1);
+
+    // 4. Rule-based batch preview for patient CSV text
+    let rule_pat = batch_preview_patient_items_impl(BatchPatientPreviewRequest {
+        items: vec![BatchImportItem {
+            name: "batch.csv".to_string(),
+            content_text: Some(
+                "姓名,身份证号,年龄,性别,慢病史,主诉,推荐科室\n李四,110101199001011234,36,男,无,发热咳嗽两天,呼吸内科\n"
+                    .to_string(),
+            ),
+            content_base64: None,
+            file_path: None,
+        }],
+        salt: Some("hospital-test-salt".to_string()),
+    })
+    .await
+    .unwrap();
+    assert_eq!(rule_pat.records.len(), 1);
+    assert!(rule_pat.records[0].patient_id.starts_with("pat_sha256_"));
 }

@@ -6,8 +6,9 @@ pub mod json_stream;
 pub mod patient_import;
 
 pub use book_chunker::{
-    BookMetadataDefaults, CustomChunkRule, NoopOcrPlugin, OcrPlugin, parse_docx_book,
-    parse_markdown_book, parse_medical_book_file, parse_pdf_book, parse_plain_text_book,
+    BookMetadataDefaults, CustomChunkRule, NoopOcrPlugin, OcrPlugin, extract_docx_text,
+    extract_pdf_text, parse_docx_book, parse_markdown_book, parse_medical_book_file,
+    parse_pdf_book, parse_plain_text_book,
 };
 pub use checkpoint::{CheckpointManager, JobProgress, export_error_samples_jsonl};
 pub use error::{PipelineError, PipelineResult};
@@ -21,6 +22,7 @@ pub use json_stream::{
 };
 pub use patient_import::{
     PatientImportReport, PatientMaskingConfig, PiiColumnDetection, bucket_age_group,
-    detect_pii_columns, import_patients_csv, import_patients_file, import_patients_json,
-    import_patients_xlsx,
+    detect_pii_columns, extract_xlsx_as_text, import_patients_csv, import_patients_csv_str,
+    import_patients_file, import_patients_json, import_patients_json_str, import_patients_xlsx,
+    import_patients_xlsx_bytes,
 };
