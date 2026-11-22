@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use base64::Engine;
@@ -84,16 +85,67 @@ pub const DEFAULT_PATIENT_NORMALIZE_PROMPT: &str = r#"你是一名专业的医�
 3. urgency_level 为 1~4 的整数（1=危急120/抢救，2=急诊/优先，3=常规门诊，4=健康咨询/慢病随访）。
 4. 若输入包含多份病例或表格多行，请全部提取至 patients 数组中；同一患者多次就诊可放入同一条记录的 visit_events 中。"#;
 
+pub const DEFAULT_KNOWLEDGE_INSPECT_PROMPT: &str = r#"你是一名医院医学知识库质控与分类巡查专家。
+用户会提供「当前知识库已有科室分类」以及一批「待入库医学知识条目」。
+请你逐条巡查其质量、隐私合规、重复/冲突风险，并给出最合理的标准分类建议，严格输出如下 JSON：
+{
+  "inspections": [
+    {
+      "doc_id": "对应条目的 doc_id",
+      "status": "pass | warning | reject",
+      "suggested_department": "优先对齐已有科室名称；如属新科室请用标准临床科室名",
+      "suggested_section_type": "clinical_manifestation | differential_diagnosis | red_flag | triage_rule",
+      "category_tags": ["主题/亚专科/人群标签1", "标签2"],
+      "is_duplicate": false,
+      "duplicate_of": null,
+      "issues": ["发现的质量/分类/缺失/合规问题（无问题则空数组）"],
+      "recommendation": "简短巡查结论与改进建议（<=50字）"
+    }
+  ]
+}
+巡查标准：
+1. 仅输出合法 JSON，不要输出解释文字。
+2. 若内容属于非医学噪声、空洞无临床价值、或含未脱敏个人隐私（姓名/身份证/手机号），标记 status="reject"。
+3. 若科室名称与已有知识库分类不一致（如“心内科”应统一为“心血管内科”）、或缺少核心症状/急症指征、或与已有条目疑似重复，标记 status="warning" 并在 suggested_department / issues 中给出修正建议。
+4. 若质量良好且分类准确，标记 status="pass"。
+5. 必须覆盖输入中的每一条 doc_id。"#;
+
+pub const DEFAULT_PATIENT_INSPECT_PROMPT: &str = r#"你是一名医院临床病历质控与分诊归类巡查专家。
+用户会提供一批待入库的匿名化病例记录，请你逐条巡查是否存在残留隐私(PII)、逻辑矛盾、急危重症分级偏差，并按临床科室与风险维度归类，严格输出如下 JSON：
+{
+  "inspections": [
+    {
+      "patient_id": "对应病例的 patient_id",
+      "status": "pass | warning | reject",
+      "suggested_department": "最匹配的主要临床科室（如呼吸内科、心血管内科、急诊科）",
+      "risk_level": "high | medium | low",
+      "category_tags": ["慢病管理", "呼吸系统", "高龄风险"],
+      "pii_risk": false,
+      "issues": ["发现的问题（无问题则空数组）"],
+      "recommendation": "简短巡查结论与建议（<=50字）"
+    }
+  ]
+}
+巡查标准：
+1. 仅输出合法 JSON，不要输出解释文字。
+2. 如发现任何疑似姓名、手机号、身份证号、详细门牌号等残留隐私，必须标记 pii_risk=true 且 status="reject"。
+3. 如就诊事件紧急度与主诉明显不符、或缺少有效症状/主诉，标记 status="warning"。
+4. 必须覆盖输入中的每一条 patient_id。"#;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AiImportPrompts {
     pub knowledge_prompt: String,
     pub patient_prompt: String,
+    pub knowledge_inspect_prompt: String,
+    pub patient_inspect_prompt: String,
 }
 
 pub fn default_ai_import_prompts() -> AiImportPrompts {
     AiImportPrompts {
         knowledge_prompt: DEFAULT_KNOWLEDGE_NORMALIZE_PROMPT.to_string(),
         patient_prompt: DEFAULT_PATIENT_NORMALIZE_PROMPT.to_string(),
+        knowledge_inspect_prompt: DEFAULT_KNOWLEDGE_INSPECT_PROMPT.to_string(),
+        patient_inspect_prompt: DEFAULT_PATIENT_INSPECT_PROMPT.to_string(),
     }
 }
 
@@ -1081,4 +1133,620 @@ fn parse_gender_lenient(raw: &str) -> Gender {
         "other" | "其他" => Gender::Other,
         _ => Gender::Unknown,
     }
+}
+
+// ===========================================================================
+// AI Inspection & Auto-Classification (AI 巡查分类)
+// ===========================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InspectionStatus {
+    Pass,
+    Warning,
+    Reject,
+}
+
+impl InspectionStatus {
+    fn parse_lenient(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "reject" | "rejected" | "fail" | "failed" | "异常" | "剔除" => Self::Reject,
+            "warning" | "warn" | "review" | "复核" | "警告" => Self::Warning,
+            _ => Self::Pass,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CategoryCount {
+    pub name: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InspectionSummary {
+    pub total: usize,
+    pub pass_count: usize,
+    pub warning_count: usize,
+    pub reject_count: usize,
+    pub duplicate_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeInspectionItem {
+    pub doc_id: String,
+    pub disease_name: String,
+    pub status: InspectionStatus,
+    pub original_department: String,
+    pub suggested_department: String,
+    pub suggested_section_type: SectionType,
+    pub category_tags: Vec<String>,
+    pub is_duplicate: bool,
+    pub duplicate_of: Option<String>,
+    pub issues: Vec<String>,
+    pub recommendation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiKnowledgeInspectionResponse {
+    pub items: Vec<KnowledgeInspectionItem>,
+    pub summary: InspectionSummary,
+    pub category_distribution: Vec<CategoryCount>,
+    pub provider_used: String,
+    pub model_used: String,
+    pub total_tokens: u32,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatientInspectionItem {
+    pub patient_id: String,
+    pub status: InspectionStatus,
+    pub suggested_department: String,
+    pub risk_level: String,
+    pub category_tags: Vec<String>,
+    pub pii_risk: bool,
+    pub issues: Vec<String>,
+    pub recommendation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiPatientInspectionResponse {
+    pub items: Vec<PatientInspectionItem>,
+    pub summary: InspectionSummary,
+    pub category_distribution: Vec<CategoryCount>,
+    pub provider_used: String,
+    pub model_used: String,
+    pub total_tokens: u32,
+    pub errors: Vec<String>,
+}
+
+pub async fn ai_inspect_knowledge_batch_with_state(
+    state: &StudioState,
+    documents: &[KnowledgeDocument],
+    provider_id: Option<&str>,
+    custom_prompt: Option<&str>,
+    tenant_namespace: Option<&str>,
+) -> Result<AiKnowledgeInspectionResponse, String> {
+    let cfg = resolve_llm_provider_config(state, provider_id).await?;
+    let provider = OpenAiCompatibleLlmProvider::new(cfg.clone())
+        .map_err(|e| format!("初始化 AI 客户端失败: {e}"))?;
+    let existing_docs = state
+        .tantivy
+        .list_all_documents(tenant_namespace)
+        .unwrap_or_default();
+    let timeout_ms = cfg.timeout_ms.max(60_000);
+    ai_inspect_knowledge_with_provider(
+        &provider,
+        documents,
+        &existing_docs,
+        custom_prompt,
+        timeout_ms,
+    )
+    .await
+}
+
+pub async fn ai_inspect_knowledge_with_provider(
+    provider: &dyn LlmProvider,
+    documents: &[KnowledgeDocument],
+    existing_docs: &[KnowledgeDocument],
+    custom_prompt: Option<&str>,
+    timeout_ms: u64,
+) -> Result<AiKnowledgeInspectionResponse, String> {
+    if documents.is_empty() {
+        return Err("当前没有待巡查分类的知识条目".to_string());
+    }
+
+    let system_prompt = custom_prompt
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_KNOWLEDGE_INSPECT_PROMPT);
+
+    // Build existing taxonomy & deterministic duplicate lookup
+    let mut existing_dept_counts: HashMap<String, usize> = HashMap::new();
+    let mut existing_by_id: HashMap<String, String> = HashMap::new();
+    let mut existing_by_key: HashMap<(String, String), String> = HashMap::new();
+    for d in existing_docs {
+        *existing_dept_counts.entry(d.department.clone()).or_insert(0) += 1;
+        existing_by_id.insert(d.doc_id.clone(), d.doc_id.clone());
+        existing_by_key.insert(
+            (
+                d.disease_name.trim().to_ascii_lowercase(),
+                d.section_type.as_str().to_string(),
+            ),
+            d.doc_id.clone(),
+        );
+    }
+
+    let mut existing_dept_list: Vec<(String, usize)> = existing_dept_counts.into_iter().collect();
+    existing_dept_list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let existing_taxonomy_desc = if existing_dept_list.is_empty() {
+        "当前知识库为空，请使用国家标准临床科室名称分类".to_string()
+    } else {
+        existing_dept_list
+            .iter()
+            .map(|(dept, cnt)| format!("{dept}({cnt}条)"))
+            .collect::<Vec<_>>()
+            .join("、")
+    };
+
+    // Pre-check local duplicates & PII
+    let mut local_dup_map: HashMap<String, Option<String>> = HashMap::new();
+    let mut local_pii_map: HashMap<String, Vec<String>> = HashMap::new();
+    for doc in documents {
+        let dup = existing_by_id
+            .get(&doc.doc_id)
+            .or_else(|| {
+                existing_by_key.get(&(
+                    doc.disease_name.trim().to_ascii_lowercase(),
+                    doc.section_type.as_str().to_string(),
+                ))
+            })
+            .cloned();
+        local_dup_map.insert(doc.doc_id.clone(), dup);
+
+        let scrubbed = scrub_pii(&doc.content);
+        if !scrubbed.redactions.is_empty() {
+            local_pii_map.insert(doc.doc_id.clone(), scrubbed.redactions);
+        }
+    }
+
+    // Batch documents (up to 10 per LLM request, max 4 concurrent)
+    let batches: Vec<Vec<KnowledgeDocument>> =
+        documents.chunks(10).map(|c| c.to_vec()).collect();
+    let taxonomy_ref = existing_taxonomy_desc.as_str();
+    let local_dup_ref = &local_dup_map;
+
+    let mut batch_outcomes: Vec<(
+        usize,
+        Vec<KnowledgeDocument>,
+        Result<medical_core::llm::LlmResponse, medical_core::llm::LlmError>,
+    )> = stream::iter(batches.into_iter().enumerate().map(|(batch_idx, batch)| async move {
+        let compact_items: Vec<Value> = batch
+            .iter()
+            .map(|d| {
+                let snippet: String = d.content.chars().take(360).collect();
+                serde_json::json!({
+                    "doc_id": d.doc_id,
+                    "disease_name": d.disease_name,
+                    "department": d.department,
+                    "section_type": d.section_type.as_str(),
+                    "key_symptoms": d.key_symptoms,
+                    "red_flag_signs": d.red_flag_signs,
+                    "seasonal_tags": d.seasonal_tags,
+                    "authority_level": d.authority_level,
+                    "local_duplicate_hint": local_dup_ref.get(&d.doc_id).and_then(|o| o.clone()),
+                    "content_snippet": snippet,
+                })
+            })
+            .collect();
+
+        let user_msg = format!(
+            "当前知识库已有科室分类：{}\n\n待巡查分类条目（共 {} 条）：\n{}",
+            taxonomy_ref,
+            batch.len(),
+            serde_json::to_string_pretty(&compact_items).unwrap_or_default()
+        );
+        let mut req = LlmRequest::new(
+            ModelTier::Reasoning,
+            vec![LlmMessage::system(system_prompt), LlmMessage::user(user_msg)],
+        );
+        req.temperature = Some(0.1);
+        req.max_tokens = Some(4096);
+        req.response_format_json = true;
+        req.timeout_ms = Some(timeout_ms);
+        let res = provider.complete_json(&req).await;
+        (batch_idx, batch, res)
+    }))
+    .buffer_unordered(4)
+    .collect()
+    .await;
+    batch_outcomes.sort_by_key(|(idx, _, _)| *idx);
+
+    let mut inspected_items = Vec::with_capacity(documents.len());
+    let mut errors = Vec::new();
+    let mut total_tokens = 0u32;
+
+    for (batch_idx, batch, outcome) in batch_outcomes {
+        let mut parsed_by_id: HashMap<String, Value> = HashMap::new();
+        match outcome {
+            Ok(resp) => {
+                total_tokens = total_tokens.saturating_add(resp.usage.total_tokens);
+                let payload = extract_json_payload(&resp.content);
+                match serde_json::from_str::<Value>(&payload) {
+                    Ok(val) => {
+                        let arr = val
+                            .as_array()
+                            .cloned()
+                            .or_else(|| {
+                                val.get("inspections")
+                                    .or_else(|| val.get("items"))
+                                    .or_else(|| val.get("results"))
+                                    .and_then(Value::as_array)
+                                    .cloned()
+                            })
+                            .unwrap_or_default();
+                        for entry in arr {
+                            if let Some(obj) = entry.as_object()
+                                && let Some(id) = get_str(obj, &["doc_id", "id"])
+                            {
+                                parsed_by_id.insert(id, entry);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        errors.push(format!("批次 #{} AI 巡查 JSON 解析失败: {e}", batch_idx + 1));
+                    }
+                }
+            }
+            Err(e) => {
+                errors.push(format!("批次 #{} 调用 AI 巡查失败: {e}", batch_idx + 1));
+            }
+        }
+
+        for doc in batch {
+            let local_dup = local_dup_map.get(&doc.doc_id).and_then(|o| o.clone());
+            let local_pii = local_pii_map.get(&doc.doc_id).cloned().unwrap_or_default();
+
+            let mut item = if let Some(obj) =
+                parsed_by_id.get(&doc.doc_id).and_then(Value::as_object)
+            {
+                let status = get_str(obj, &["status"])
+                    .map(|s| InspectionStatus::parse_lenient(&s))
+                    .unwrap_or(InspectionStatus::Pass);
+                let suggested_department =
+                    get_str(obj, &["suggested_department", "department", "建议科室"])
+                        .unwrap_or_else(|| doc.department.clone());
+                let suggested_section_type =
+                    get_str(obj, &["suggested_section_type", "section_type"])
+                        .map(|s| parse_section_type(&s))
+                        .unwrap_or(doc.section_type);
+                let category_tags = get_str_list(obj, &["category_tags", "tags", "分类标签"]);
+                let ai_dup = obj
+                    .get("is_duplicate")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let duplicate_of =
+                    get_str(obj, &["duplicate_of"]).or_else(|| local_dup.clone());
+                let is_duplicate = ai_dup || duplicate_of.is_some();
+                let issues = get_str_list(obj, &["issues", "问题"]);
+                let recommendation = get_str(obj, &["recommendation", "建议"])
+                    .unwrap_or_else(|| "巡查完成".to_string());
+
+                KnowledgeInspectionItem {
+                    doc_id: doc.doc_id.clone(),
+                    disease_name: doc.disease_name.clone(),
+                    status,
+                    original_department: doc.department.clone(),
+                    suggested_department,
+                    suggested_section_type,
+                    category_tags,
+                    is_duplicate,
+                    duplicate_of,
+                    issues,
+                    recommendation,
+                }
+            } else {
+                KnowledgeInspectionItem {
+                    doc_id: doc.doc_id.clone(),
+                    disease_name: doc.disease_name.clone(),
+                    status: if local_dup.is_some() {
+                        InspectionStatus::Warning
+                    } else {
+                        InspectionStatus::Pass
+                    },
+                    original_department: doc.department.clone(),
+                    suggested_department: doc.department.clone(),
+                    suggested_section_type: doc.section_type,
+                    category_tags: doc.seasonal_tags.clone(),
+                    is_duplicate: local_dup.is_some(),
+                    duplicate_of: local_dup.clone(),
+                    issues: Vec::new(),
+                    recommendation: "已完成本地规则复核".to_string(),
+                }
+            };
+
+            if !local_pii.is_empty() {
+                item.status = InspectionStatus::Reject;
+                item.issues.push(format!(
+                    "本地隐私防火墙检出疑似未脱敏信息: {}",
+                    local_pii.join("、")
+                ));
+            }
+            if item.is_duplicate && item.status == InspectionStatus::Pass {
+                item.status = InspectionStatus::Warning;
+                if item.issues.is_empty() {
+                    item.issues.push("与已有知识库条目疑似重复".to_string());
+                }
+            }
+
+            inspected_items.push(item);
+        }
+    }
+
+    let mut summary = InspectionSummary {
+        total: inspected_items.len(),
+        ..Default::default()
+    };
+    let mut dept_counts: HashMap<String, usize> = HashMap::new();
+    for it in &inspected_items {
+        match it.status {
+            InspectionStatus::Pass => summary.pass_count += 1,
+            InspectionStatus::Warning => summary.warning_count += 1,
+            InspectionStatus::Reject => summary.reject_count += 1,
+        }
+        if it.is_duplicate {
+            summary.duplicate_count += 1;
+        }
+        *dept_counts.entry(it.suggested_department.clone()).or_insert(0) += 1;
+    }
+
+    let mut category_distribution: Vec<CategoryCount> = dept_counts
+        .into_iter()
+        .map(|(name, count)| CategoryCount { name, count })
+        .collect();
+    category_distribution.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+
+    Ok(AiKnowledgeInspectionResponse {
+        items: inspected_items,
+        summary,
+        category_distribution,
+        provider_used: provider.id().to_string(),
+        model_used: provider.model_name().to_string(),
+        total_tokens,
+        errors,
+    })
+}
+
+pub async fn ai_inspect_patient_batch_with_state(
+    state: &StudioState,
+    records: &[PatientRecord],
+    provider_id: Option<&str>,
+    custom_prompt: Option<&str>,
+) -> Result<AiPatientInspectionResponse, String> {
+    let cfg = resolve_llm_provider_config(state, provider_id).await?;
+    let provider = OpenAiCompatibleLlmProvider::new(cfg.clone())
+        .map_err(|e| format!("初始化 AI 客户端失败: {e}"))?;
+    let existing_docs = state.tantivy.list_all_documents(None).unwrap_or_default();
+    let mut existing_depts: Vec<String> = existing_docs
+        .into_iter()
+        .map(|d| d.department)
+        .collect();
+    existing_depts.sort();
+    existing_depts.dedup();
+    let timeout_ms = cfg.timeout_ms.max(60_000);
+    ai_inspect_patient_with_provider(&provider, records, &existing_depts, custom_prompt, timeout_ms)
+        .await
+}
+
+pub async fn ai_inspect_patient_with_provider(
+    provider: &dyn LlmProvider,
+    records: &[PatientRecord],
+    existing_departments: &[String],
+    custom_prompt: Option<&str>,
+    timeout_ms: u64,
+) -> Result<AiPatientInspectionResponse, String> {
+    if records.is_empty() {
+        return Err("当前没有待巡查分类的病例记录".to_string());
+    }
+
+    let system_prompt = custom_prompt
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_PATIENT_INSPECT_PROMPT);
+
+    let dept_hint = if existing_departments.is_empty() {
+        "全科医学科、呼吸内科、心血管内科、消化内科、急诊科、儿科".to_string()
+    } else {
+        existing_departments.join("、")
+    };
+
+    let batches: Vec<Vec<PatientRecord>> = records.chunks(10).map(|c| c.to_vec()).collect();
+    let dept_hint_ref = dept_hint.as_str();
+
+    let mut batch_outcomes: Vec<(
+        usize,
+        Vec<PatientRecord>,
+        Result<medical_core::llm::LlmResponse, medical_core::llm::LlmError>,
+    )> = stream::iter(batches.into_iter().enumerate().map(|(batch_idx, batch)| async move {
+        let compact: Vec<Value> = batch
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "patient_id": r.patient_id,
+                    "age_group": r.l2_profile.age_group,
+                    "gender": r.l2_profile.gender,
+                    "is_pregnant": r.l2_profile.is_pregnant,
+                    "chronic_diseases": r.l2_profile.chronic_diseases,
+                    "allergies": r.l2_profile.allergies,
+                    "visit_events": r.l3_visit_events.iter().take(3).map(|e| serde_json::json!({
+                        "chief_complaint": e.chief_complaint,
+                        "extracted_symptoms": e.extracted_symptoms,
+                        "recommended_department": e.recommended_department,
+                        "urgency_level": e.urgency_level,
+                        "summary": e.summary,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+
+        let user_msg = format!(
+            "参考临床科室分类：{}\n\n待巡查分类病例（共 {} 位）：\n{}",
+            dept_hint_ref,
+            batch.len(),
+            serde_json::to_string_pretty(&compact).unwrap_or_default()
+        );
+        let mut req = LlmRequest::new(
+            ModelTier::Reasoning,
+            vec![LlmMessage::system(system_prompt), LlmMessage::user(user_msg)],
+        );
+        req.temperature = Some(0.1);
+        req.max_tokens = Some(4096);
+        req.response_format_json = true;
+        req.timeout_ms = Some(timeout_ms);
+        let res = provider.complete_json(&req).await;
+        (batch_idx, batch, res)
+    }))
+    .buffer_unordered(4)
+    .collect()
+    .await;
+    batch_outcomes.sort_by_key(|(idx, _, _)| *idx);
+
+    let mut inspected_items = Vec::with_capacity(records.len());
+    let mut errors = Vec::new();
+    let mut total_tokens = 0u32;
+
+    for (batch_idx, batch, outcome) in batch_outcomes {
+        let mut parsed_by_id: HashMap<String, Value> = HashMap::new();
+        match outcome {
+            Ok(resp) => {
+                total_tokens = total_tokens.saturating_add(resp.usage.total_tokens);
+                let payload = extract_json_payload(&resp.content);
+                match serde_json::from_str::<Value>(&payload) {
+                    Ok(val) => {
+                        let arr = val
+                            .as_array()
+                            .cloned()
+                            .or_else(|| {
+                                val.get("inspections")
+                                    .or_else(|| val.get("items"))
+                                    .or_else(|| val.get("results"))
+                                    .and_then(Value::as_array)
+                                    .cloned()
+                            })
+                            .unwrap_or_default();
+                        for entry in arr {
+                            if let Some(obj) = entry.as_object()
+                                && let Some(id) = get_str(obj, &["patient_id", "id"])
+                            {
+                                parsed_by_id.insert(id, entry);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        errors.push(format!("批次 #{} AI 病例巡查 JSON 解析失败: {e}", batch_idx + 1));
+                    }
+                }
+            }
+            Err(e) => {
+                errors.push(format!("批次 #{} 调用 AI 病例巡查失败: {e}", batch_idx + 1));
+            }
+        }
+
+        for rec in batch {
+            let local_val_err = rec.validate().err().map(|e| e.to_string());
+            let fallback_dept = rec
+                .l3_visit_events
+                .first()
+                .map(|e| e.recommended_department.clone())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "全科医学科".to_string());
+
+            let mut item = if let Some(obj) =
+                parsed_by_id.get(&rec.patient_id).and_then(Value::as_object)
+            {
+                let status = get_str(obj, &["status"])
+                    .map(|s| InspectionStatus::parse_lenient(&s))
+                    .unwrap_or(InspectionStatus::Pass);
+                let suggested_department =
+                    get_str(obj, &["suggested_department", "department", "建议科室"])
+                        .unwrap_or(fallback_dept);
+                let risk_level = get_str(obj, &["risk_level", "风险等级"])
+                    .unwrap_or_else(|| "low".to_string());
+                let category_tags = get_str_list(obj, &["category_tags", "tags", "分类标签"]);
+                let pii_risk = obj
+                    .get("pii_risk")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let issues = get_str_list(obj, &["issues", "问题"]);
+                let recommendation = get_str(obj, &["recommendation", "建议"])
+                    .unwrap_or_else(|| "病例巡查完成".to_string());
+
+                PatientInspectionItem {
+                    patient_id: rec.patient_id.clone(),
+                    status,
+                    suggested_department,
+                    risk_level,
+                    category_tags,
+                    pii_risk,
+                    issues,
+                    recommendation,
+                }
+            } else {
+                PatientInspectionItem {
+                    patient_id: rec.patient_id.clone(),
+                    status: InspectionStatus::Pass,
+                    suggested_department: fallback_dept,
+                    risk_level: "low".to_string(),
+                    category_tags: rec.l2_profile.chronic_diseases.clone(),
+                    pii_risk: false,
+                    issues: Vec::new(),
+                    recommendation: "已完成本地隐私合规校验".to_string(),
+                }
+            };
+
+            if let Some(err_msg) = local_val_err {
+                item.status = InspectionStatus::Reject;
+                item.pii_risk = true;
+                item.issues.push(format!("隐私/结构校验未通过: {err_msg}"));
+            }
+            if item.pii_risk {
+                item.status = InspectionStatus::Reject;
+            }
+
+            inspected_items.push(item);
+        }
+    }
+
+    let mut summary = InspectionSummary {
+        total: inspected_items.len(),
+        ..Default::default()
+    };
+    let mut dept_counts: HashMap<String, usize> = HashMap::new();
+    for it in &inspected_items {
+        match it.status {
+            InspectionStatus::Pass => summary.pass_count += 1,
+            InspectionStatus::Warning => summary.warning_count += 1,
+            InspectionStatus::Reject => summary.reject_count += 1,
+        }
+        *dept_counts
+            .entry(it.suggested_department.clone())
+            .or_insert(0) += 1;
+    }
+
+    let mut category_distribution: Vec<CategoryCount> = dept_counts
+        .into_iter()
+        .map(|(name, count)| CategoryCount { name, count })
+        .collect();
+    category_distribution.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+
+    Ok(AiPatientInspectionResponse {
+        items: inspected_items,
+        summary,
+        category_distribution,
+        provider_used: provider.id().to_string(),
+        model_used: provider.model_name().to_string(),
+        total_tokens,
+        errors,
+    })
 }

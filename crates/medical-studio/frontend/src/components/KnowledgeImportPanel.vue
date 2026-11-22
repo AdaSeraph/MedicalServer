@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { invokeStudio } from '../api/tauri';
 import { useToast } from '../composables/useToast';
 import {
@@ -18,7 +18,34 @@ interface LlmProviderItem {
   enabled: boolean;
 }
 
+interface DepartmentCategory {
+  department: string;
+  doc_count: number;
+  diseases: string[];
+  section_types: string[];
+}
+
+interface CategoryCountItem {
+  name: string;
+  count: number;
+}
+
+interface KnowledgeCategoriesData {
+  total_documents: number;
+  departments: DepartmentCategory[];
+  section_types: CategoryCountItem[];
+  source_types: CategoryCountItem[];
+  seasonal_tags: CategoryCountItem[];
+  populations: CategoryCountItem[];
+}
+
 const activeMode = ref<'batch_ai' | 'local_path'>('batch_ai');
+
+// Existing KB categories overview
+const kbCategories = ref<KnowledgeCategoriesData | null>(null);
+const selectedBrowseDept = ref<string | null>(null);
+const browseDocs = ref<any[]>([]);
+const isLoadingCategories = ref(false);
 
 // Batch & AI normalization state
 const fileInputRef = ref<HTMLInputElement | null>(null);
@@ -41,10 +68,27 @@ const jobId = ref('job_kb_001');
 const tenantNamespace = ref('default');
 
 const isBusy = ref(false);
+const isInspecting = ref(false);
 const normalizedDocs = ref<any[]>([]);
 const itemResults = ref<any[]>([]);
 const normalizeErrors = ref<string[]>([]);
 const lastAiMeta = ref<{ provider: string; model: string; tokens: number } | null>(null);
+const inspectionResult = ref<any>(null);
+
+const inspectionByDocId = computed(() => {
+  const map: Record<string, any> = {};
+  for (const item of inspectionResult.value?.items ?? []) {
+    map[item.doc_id] = item;
+  }
+  return map;
+});
+
+const sectionTypeLabel: Record<string, string> = {
+  clinical_manifestation: '临床表现',
+  differential_diagnosis: '鉴别诊断',
+  red_flag: '急症红线',
+  triage_rule: '分诊规则',
+};
 
 // Local path / resumable mode state
 const filePath = ref('e2e/fixtures/knowledge/books_sample.md');
@@ -84,8 +128,134 @@ async function loadInitialConfig() {
   }
 }
 
+async function loadCategories() {
+  isLoadingCategories.value = true;
+  try {
+    kbCategories.value = await invokeStudio<KnowledgeCategoriesData>('get_knowledge_categories', {
+      tenantNamespace: tenantNamespace.value.trim() || null,
+    });
+    if (selectedBrowseDept.value) {
+      await browseDepartment(selectedBrowseDept.value);
+    }
+  } catch (err) {
+    setStatus(`加载已有知识库分类失败：${String(err)}`, 'error');
+  } finally {
+    isLoadingCategories.value = false;
+  }
+}
+
+async function browseDepartment(dept: string) {
+  if (selectedBrowseDept.value === dept && browseDocs.value.length > 0) {
+    selectedBrowseDept.value = null;
+    browseDocs.value = [];
+    return;
+  }
+  selectedBrowseDept.value = dept;
+  try {
+    browseDocs.value = await invokeStudio<any[]>('list_knowledge_documents', {
+      department: dept,
+      tenantNamespace: tenantNamespace.value.trim() || null,
+      limit: 50,
+    });
+  } catch (err) {
+    toast.error(`加载科室「${dept}」文档失败：${String(err)}`);
+  }
+}
+
+async function quickExportKnowledge(dept?: string | null) {
+  try {
+    const res = await invokeStudio<any>('export_exchange_package', {
+      req: {
+        description: dept
+          ? `MedicalStudio 知识库分类导出：${dept}`
+          : 'MedicalStudio 全部医学知识库导出',
+        include_knowledge: true,
+        knowledge_departments: dept ? [dept] : [],
+        tenant_namespace: tenantNamespace.value.trim() || null,
+        include_patients: false,
+        include_epidemics: false,
+        include_dictionaries: false,
+        format: 'json',
+      },
+    });
+    const blob = new Blob([res.content], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = res.filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    toast.success(`已导出 ${res.stats.knowledge_count} 条知识至 ${res.filename}`);
+  } catch (err) {
+    toast.error(`导出知识库失败：${String(err)}`);
+  }
+}
+
+async function handleAiInspectKnowledge() {
+  if (normalizedDocs.value.length === 0) {
+    setStatus('当前没有待巡查分类的知识条目，请先解析或规范化资料', 'error');
+    return;
+  }
+  isInspecting.value = true;
+  setStatus(`正在对 ${normalizedDocs.value.length} 条待入库知识执行 AI 巡查分类（自动对齐已有科室分类、检测重复与质量）...`, 'info');
+  try {
+    const res = await invokeStudio<any>('ai_inspect_knowledge_batch', {
+      req: {
+        documents: normalizedDocs.value,
+        provider_id: selectedProviderId.value || null,
+        tenant_namespace: tenantNamespace.value.trim() || null,
+      },
+    });
+    inspectionResult.value = res;
+    setStatus(
+      `AI 巡查分类完成：通过 ${res.summary.pass_count}、需复核 ${res.summary.warning_count}、建议剔除 ${res.summary.reject_count}、疑似重复 ${res.summary.duplicate_count}（模型：${res.model_used}）`,
+      res.summary.reject_count > 0 ? 'info' : 'success',
+    );
+  } catch (err) {
+    setStatus(`AI 巡查分类失败：${String(err)}`, 'error');
+  } finally {
+    isInspecting.value = false;
+  }
+}
+
+function applyAllAiClassifications() {
+  if (!inspectionResult.value) return;
+  let deptUpdated = 0;
+  for (const doc of normalizedDocs.value) {
+    const ins = inspectionByDocId.value[doc.doc_id];
+    if (!ins) continue;
+    if (ins.suggested_department && ins.suggested_department !== doc.department) {
+      doc.department = ins.suggested_department;
+      deptUpdated++;
+    }
+    if (ins.suggested_section_type) {
+      doc.section_type = ins.suggested_section_type;
+    }
+    if (Array.isArray(ins.category_tags) && ins.category_tags.length > 0) {
+      const merged = new Set([...(doc.seasonal_tags ?? []), ...ins.category_tags]);
+      doc.seasonal_tags = Array.from(merged);
+    }
+  }
+  setStatus(`已一键应用 AI 巡查分类建议（规范调整科室 ${deptUpdated} 条，并补充分类标签）`, 'success');
+}
+
+function removeRejectedAndDuplicates() {
+  if (!inspectionResult.value) return;
+  const before = normalizedDocs.value.length;
+  normalizedDocs.value = normalizedDocs.value.filter((doc) => {
+    const ins = inspectionByDocId.value[doc.doc_id];
+    if (!ins) return true;
+    return ins.status !== 'reject' && !ins.is_duplicate;
+  });
+  const removed = before - normalizedDocs.value.length;
+  setStatus(`已剔除 ${removed} 条异常或重复条目，剩余 ${normalizedDocs.value.length} 条可安全入库`, 'info');
+}
+
 onMounted(() => {
   loadInitialConfig();
+  loadCategories();
 });
 
 function triggerFileSelect() {
@@ -267,6 +437,8 @@ async function handleCommitNormalizedDocs() {
       `批量入库成功：已双写 ${jobProgress.value.processed_items} 条标准知识到向量库与全文索引（任务 ${batchJobId}）`,
       'success',
     );
+    inspectionResult.value = null;
+    await loadCategories();
   } catch (err) {
     setStatus(`写入数据库失败：${String(err)}`, 'error');
   } finally {
@@ -316,6 +488,7 @@ async function handleStartImport() {
       },
     });
     setStatus(`导入完成：已处理 ${jobProgress.value.processed_items} 条`, 'success');
+    await loadCategories();
   } catch (err) {
     setStatus(`导入失败：${String(err)}`, 'error');
   }
@@ -382,6 +555,109 @@ async function handleExportErrors() {
         </button>
       </div>
     </header>
+
+    <!-- Existing Knowledge Base Categories Overview -->
+    <div class="bg-slate-900 p-4 rounded-xl border border-slate-800 space-y-3">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <div class="flex items-center gap-2">
+          <h3 class="text-sm font-semibold text-white">已有知识库分类总览</h3>
+          <span class="px-2 py-0.5 rounded-full bg-sky-950/80 border border-sky-700/60 text-xs text-sky-300">
+            共 {{ kbCategories?.total_documents ?? 0 }} 条 · {{ kbCategories?.departments?.length ?? 0 }} 个科室分类
+          </span>
+        </div>
+        <div class="flex items-center gap-2 text-xs">
+          <button
+            @click="loadCategories"
+            :disabled="isLoadingCategories"
+            class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
+          >
+            {{ isLoadingCategories ? '刷新中...' : '刷新分类' }}
+          </button>
+          <button
+            v-if="(kbCategories?.total_documents ?? 0) > 0"
+            @click="quickExportKnowledge(selectedBrowseDept)"
+            class="px-2.5 py-1 rounded bg-sky-700 hover:bg-sky-600 text-white"
+          >
+            {{ selectedBrowseDept ? `导出「${selectedBrowseDept}」` : '快捷导出全部知识库' }}
+          </button>
+        </div>
+      </div>
+
+      <div v-if="!kbCategories || kbCategories.total_documents === 0" class="text-xs text-slate-500">
+        当前知识库暂无已入库文档。导入知识后，这里会自动汇总展示全部科室分类、疾病覆盖与知识类型统计。
+      </div>
+
+      <template v-else>
+        <!-- Department category chips -->
+        <div class="flex flex-wrap gap-2">
+          <button
+            v-for="cat in kbCategories.departments"
+            :key="cat.department"
+            @click="browseDepartment(cat.department)"
+            :class="
+              selectedBrowseDept === cat.department
+                ? 'bg-sky-600 text-white border-sky-400'
+                : 'bg-slate-950 text-slate-200 border-slate-700 hover:border-sky-600'
+            "
+            class="px-3 py-1.5 rounded-lg border text-xs transition-colors flex items-center gap-2"
+            :title="`覆盖疾病：${cat.diseases.slice(0, 8).join('、')}`"
+          >
+            <span class="font-medium">{{ cat.department }}</span>
+            <span class="px-1.5 py-0.5 rounded bg-slate-800/80 text-[11px] text-sky-300">{{ cat.doc_count }} 条</span>
+            <span class="text-[11px] opacity-70">{{ cat.diseases.length }} 种疾病</span>
+          </button>
+        </div>
+
+        <!-- Section types & tags distribution -->
+        <div class="flex flex-wrap items-center gap-2 text-[11px] text-slate-400 pt-1">
+          <span>知识类型分布：</span>
+          <span
+            v-for="st in kbCategories.section_types"
+            :key="st.name"
+            class="px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-slate-300"
+          >
+            {{ sectionTypeLabel[st.name] || st.name }} ({{ st.count }})
+          </span>
+          <template v-if="kbCategories.seasonal_tags.length > 0">
+            <span class="ml-2">热门标签：</span>
+            <span
+              v-for="tag in kbCategories.seasonal_tags.slice(0, 8)"
+              :key="tag.name"
+              class="px-2 py-0.5 rounded bg-amber-950/60 border border-amber-800/50 text-amber-200"
+            >
+              #{{ tag.name }} ({{ tag.count }})
+            </span>
+          </template>
+        </div>
+
+        <!-- Browse documents in selected department -->
+        <div v-if="selectedBrowseDept" class="pt-3 border-t border-slate-800 space-y-2">
+          <div class="flex items-center justify-between text-xs">
+            <span class="text-sky-300 font-medium">
+              「{{ selectedBrowseDept }}」已有知识条目（显示 {{ browseDocs.length }} 条）
+            </span>
+            <button @click="selectedBrowseDept = null; browseDocs = []" class="text-slate-400 hover:text-white">
+              收起
+            </button>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-60 overflow-y-auto pr-1">
+            <div
+              v-for="doc in browseDocs"
+              :key="doc.doc_id"
+              class="p-2.5 rounded-lg bg-slate-950 border border-slate-800 text-xs space-y-1"
+            >
+              <div class="flex items-center justify-between gap-2">
+                <span class="font-semibold text-white truncate">{{ doc.disease_name }}</span>
+                <span class="px-1.5 py-0.5 rounded bg-slate-800 text-[10px] text-slate-300">
+                  {{ sectionTypeLabel[doc.section_type] || doc.section_type }}
+                </span>
+              </div>
+              <p class="text-[11px] text-slate-400 line-clamp-2">{{ doc.content }}</p>
+            </div>
+          </div>
+        </div>
+      </template>
+    </div>
 
     <!-- Mode 1: Batch Upload + AI Normalization -->
     <div v-if="activeMode === 'batch_ai'" class="space-y-4">
@@ -645,25 +921,101 @@ async function handleExportErrors() {
 
     <!-- Normalized Knowledge Cards Preview -->
     <div v-if="normalizedDocs.length > 0" class="space-y-3">
-      <div class="sticky top-0 z-10 flex items-center justify-between py-2.5 px-3 rounded-xl bg-slate-900/95 backdrop-blur border border-slate-700/80 shadow-md">
-        <h3 class="text-sm font-semibold text-white">标准格式预览（共 {{ normalizedDocs.length }} 条，校验通过后可写入数据库）</h3>
-        <button
-          :disabled="isBusy"
-          @click="handleCommitNormalizedDocs"
-          class="px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-xs font-medium text-white"
-        >
-          确认全部写入数据库 ({{ normalizedDocs.length }})
-        </button>
+      <div class="sticky top-0 z-10 flex flex-wrap items-center justify-between gap-2 py-2.5 px-3 rounded-xl bg-slate-900/95 backdrop-blur border border-slate-700/80 shadow-md">
+        <h3 class="text-sm font-semibold text-white">标准格式预览（共 {{ normalizedDocs.length }} 条，建议先执行 AI 巡查分类再入库）</h3>
+        <div class="flex flex-wrap items-center gap-2">
+          <button
+            :disabled="isBusy || isInspecting"
+            @click="handleAiInspectKnowledge"
+            class="px-3.5 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-xs font-medium text-white"
+          >
+            {{ isInspecting ? 'AI 巡查分类中...' : 'AI 巡查分类' }}
+          </button>
+          <button
+            v-if="inspectionResult"
+            @click="applyAllAiClassifications"
+            class="px-3 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 text-xs font-medium text-white"
+          >
+            一键应用 AI 分类建议
+          </button>
+          <button
+            v-if="inspectionResult && (inspectionResult.summary.reject_count > 0 || inspectionResult.summary.duplicate_count > 0)"
+            @click="removeRejectedAndDuplicates"
+            class="px-3 py-1.5 rounded-lg bg-rose-700 hover:bg-rose-600 text-xs font-medium text-white"
+          >
+            剔除异常与重复项
+          </button>
+          <button
+            :disabled="isBusy || isInspecting"
+            @click="handleCommitNormalizedDocs"
+            class="px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-xs font-medium text-white"
+          >
+            确认全部写入数据库 ({{ normalizedDocs.length }})
+          </button>
+        </div>
       </div>
+
+      <!-- AI Inspection Summary Banner -->
+      <div v-if="inspectionResult" class="p-3.5 rounded-xl bg-slate-900 border border-amber-700/60 space-y-2 text-xs">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="flex flex-wrap items-center gap-3">
+            <span class="font-semibold text-amber-300">AI 巡查分类报告：</span>
+            <span class="text-emerald-400">通过 {{ inspectionResult.summary.pass_count }}</span>
+            <span class="text-amber-300">需复核 {{ inspectionResult.summary.warning_count }}</span>
+            <span class="text-rose-400">建议剔除 {{ inspectionResult.summary.reject_count }}</span>
+            <span class="text-sky-300">疑似重复 {{ inspectionResult.summary.duplicate_count }}</span>
+          </div>
+          <span class="text-slate-400">
+            模型：{{ inspectionResult.model_used }} · Tokens：{{ inspectionResult.total_tokens }}
+          </span>
+        </div>
+        <div v-if="inspectionResult.category_distribution?.length" class="flex flex-wrap items-center gap-1.5">
+          <span class="text-slate-400">AI 归类科室分布：</span>
+          <span
+            v-for="c in inspectionResult.category_distribution"
+            :key="c.name"
+            class="px-2 py-0.5 rounded-full bg-indigo-950/80 border border-indigo-700/60 text-indigo-200"
+          >
+            {{ c.name }} ({{ c.count }})
+          </span>
+        </div>
+      </div>
+
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
         <article
           v-for="chunk in normalizedDocs"
           :key="chunk.doc_id"
-          class="p-4 rounded-xl bg-slate-900 border border-slate-800 space-y-2"
+          :class="
+            inspectionByDocId[chunk.doc_id]?.status === 'reject'
+              ? 'border-rose-700/80 bg-rose-950/20'
+              : inspectionByDocId[chunk.doc_id]?.status === 'warning'
+                ? 'border-amber-700/70 bg-amber-950/10'
+                : 'border-slate-800 bg-slate-900'
+          "
+          class="p-4 rounded-xl border space-y-2"
         >
           <div class="flex items-center justify-between gap-2">
             <h3 class="font-semibold text-white">{{ chunk.disease_name }}</h3>
             <div class="flex items-center gap-2">
+              <span
+                v-if="inspectionByDocId[chunk.doc_id]"
+                :class="
+                  inspectionByDocId[chunk.doc_id].status === 'pass'
+                    ? 'bg-emerald-950 text-emerald-300 border-emerald-700'
+                    : inspectionByDocId[chunk.doc_id].status === 'warning'
+                      ? 'bg-amber-950 text-amber-300 border-amber-700'
+                      : 'bg-rose-950 text-rose-300 border-rose-700'
+                "
+                class="text-[11px] px-2 py-0.5 rounded-full border"
+              >
+                {{
+                  inspectionByDocId[chunk.doc_id].status === 'pass'
+                    ? '巡查通过'
+                    : inspectionByDocId[chunk.doc_id].status === 'warning'
+                      ? '需复核'
+                      : '建议剔除'
+                }}
+              </span>
               <span class="text-xs px-2 py-0.5 rounded bg-sky-900 text-sky-200">{{ chunk.department }}</span>
               <button
                 @click="removeNormalizedDoc(chunk.doc_id)"
@@ -674,8 +1026,28 @@ async function handleExportErrors() {
               </button>
             </div>
           </div>
+
+          <!-- Per-item AI Inspection Feedback -->
+          <div
+            v-if="inspectionByDocId[chunk.doc_id]"
+            class="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800 text-[11px] space-y-1"
+          >
+            <div class="flex flex-wrap items-center gap-2 text-slate-300">
+              <span v-if="inspectionByDocId[chunk.doc_id].suggested_department !== chunk.department" class="text-amber-300">
+                建议归类科室：{{ inspectionByDocId[chunk.doc_id].suggested_department }}
+              </span>
+              <span v-if="inspectionByDocId[chunk.doc_id].is_duplicate" class="px-1.5 py-0.5 rounded bg-amber-900/60 text-amber-200">
+                疑似与已有条目重复 {{ inspectionByDocId[chunk.doc_id].duplicate_of ? `(${inspectionByDocId[chunk.doc_id].duplicate_of})` : '' }}
+              </span>
+              <span class="text-slate-400">{{ inspectionByDocId[chunk.doc_id].recommendation }}</span>
+            </div>
+            <div v-if="inspectionByDocId[chunk.doc_id].issues?.length" class="text-rose-300">
+              问题：{{ inspectionByDocId[chunk.doc_id].issues.join('；') }}
+            </div>
+          </div>
+
           <div class="flex flex-wrap gap-1.5 text-xs">
-            <span class="px-2 py-0.5 rounded bg-slate-800 text-slate-300">{{ chunk.section_type }}</span>
+            <span class="px-2 py-0.5 rounded bg-slate-800 text-slate-300">{{ sectionTypeLabel[chunk.section_type] || chunk.section_type }}</span>
             <span class="px-2 py-0.5 rounded bg-slate-800 text-emerald-300">权威度 {{ chunk.authority_level }}</span>
             <span class="px-2 py-0.5 rounded bg-slate-800 text-sky-300">适用人群 {{ (chunk.target_population || []).join('/') }}</span>
             <span v-for="sym in (chunk.key_symptoms || []).slice(0, 5)" :key="sym" class="px-2 py-0.5 rounded bg-indigo-900/60 text-indigo-200">{{ sym }}</span>

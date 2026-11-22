@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { invokeStudio } from '../api/tauri';
 import { useToast } from '../composables/useToast';
 import {
@@ -38,11 +38,21 @@ const salt = ref('medical-server-hospital-salt-v1');
 const filePath = ref('e2e/fixtures/patients/raw_pii_patients.csv');
 
 const isBusy = ref(false);
+const isInspecting = ref(false);
 const normalizedRecords = ref<any[]>([]);
 const detectedPiiBadges = ref<string[]>([]);
 const itemResults = ref<any[]>([]);
 const errors = ref<string[]>([]);
 const lastAiMeta = ref<{ provider: string; model: string; tokens: number } | null>(null);
+const inspectionResult = ref<any>(null);
+
+const inspectionByPatientId = computed(() => {
+  const map: Record<string, any> = {};
+  for (const item of inspectionResult.value?.items ?? []) {
+    map[item.patient_id] = item;
+  }
+  return map;
+});
 
 const commitResult = ref<any>(null);
 const message = ref('');
@@ -274,6 +284,44 @@ async function handleOneClickAiImport() {
 
 function removeNormalizedRecord(index: number) {
   normalizedRecords.value.splice(index, 1);
+}
+
+async function handleAiInspectPatients() {
+  if (normalizedRecords.value.length === 0) {
+    setStatus('当前没有待巡查分类的病例记录', 'error');
+    return;
+  }
+  isInspecting.value = true;
+  setStatus(`正在对 ${normalizedRecords.value.length} 份病例执行 AI 巡查分类（隐私复查 + 科室归类 + 风险分级）...`, 'info');
+  try {
+    const res = await invokeStudio<any>('ai_inspect_patient_batch', {
+      req: {
+        records: normalizedRecords.value,
+        provider_id: selectedProviderId.value || null,
+      },
+    });
+    inspectionResult.value = res;
+    setStatus(
+      `AI 病例巡查分类完成：通过 ${res.summary.pass_count}、需复核 ${res.summary.warning_count}、建议剔除 ${res.summary.reject_count}（模型：${res.model_used}）`,
+      res.summary.reject_count > 0 ? 'info' : 'success',
+    );
+  } catch (err) {
+    setStatus(`AI 病例巡查分类失败：${String(err)}`, 'error');
+  } finally {
+    isInspecting.value = false;
+  }
+}
+
+function removeRejectedPatients() {
+  if (!inspectionResult.value) return;
+  const before = normalizedRecords.value.length;
+  normalizedRecords.value = normalizedRecords.value.filter((rec) => {
+    const ins = inspectionByPatientId.value[rec.patient_id];
+    if (!ins) return true;
+    return ins.status !== 'reject' && !ins.pii_risk;
+  });
+  const removed = before - normalizedRecords.value.length;
+  setStatus(`已剔除 ${removed} 条异常或高隐私风险病例，剩余 ${normalizedRecords.value.length} 条`, 'info');
 }
 
 // Local path mode (preserved)
@@ -596,15 +644,54 @@ async function handleCommitLocalPath() {
         </span>
       </div>
 
-      <div class="sticky top-0 z-10 flex items-center justify-between py-2.5 px-3 rounded-xl bg-slate-900/95 backdrop-blur border border-slate-700/80 shadow-md">
+      <div class="sticky top-0 z-10 flex flex-wrap items-center justify-between gap-2 py-2.5 px-3 rounded-xl bg-slate-900/95 backdrop-blur border border-slate-700/80 shadow-md">
         <h3 class="text-sm font-semibold text-white">标准匿名病例预览（共 {{ normalizedRecords.length }} 位患者）</h3>
-        <button
-          :disabled="isBusy"
-          @click="handleCommitNormalizedRecords"
-          class="px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-xs font-medium text-white"
-        >
-          确认全部写入数据库 ({{ normalizedRecords.length }})
-        </button>
+        <div class="flex flex-wrap items-center gap-2">
+          <button
+            :disabled="isBusy || isInspecting"
+            @click="handleAiInspectPatients"
+            class="px-3.5 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-xs font-medium text-white"
+          >
+            {{ isInspecting ? 'AI 巡查分类中...' : 'AI 巡查分类' }}
+          </button>
+          <button
+            v-if="inspectionResult && inspectionResult.summary.reject_count > 0"
+            @click="removeRejectedPatients"
+            class="px-3 py-1.5 rounded-lg bg-rose-700 hover:bg-rose-600 text-xs font-medium text-white"
+          >
+            剔除异常/高隐私风险病例 ({{ inspectionResult.summary.reject_count }})
+          </button>
+          <button
+            :disabled="isBusy || isInspecting"
+            @click="handleCommitNormalizedRecords"
+            class="px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-xs font-medium text-white"
+          >
+            确认全部写入数据库 ({{ normalizedRecords.length }})
+          </button>
+        </div>
+      </div>
+
+      <!-- Patient AI Inspection Summary -->
+      <div v-if="inspectionResult" class="p-3.5 rounded-xl bg-slate-900 border border-amber-700/60 space-y-2 text-xs">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="flex flex-wrap items-center gap-3">
+            <span class="font-semibold text-amber-300">AI 病例巡查分类报告：</span>
+            <span class="text-emerald-400">通过 {{ inspectionResult.summary.pass_count }}</span>
+            <span class="text-amber-300">需复核 {{ inspectionResult.summary.warning_count }}</span>
+            <span class="text-rose-400">建议剔除 {{ inspectionResult.summary.reject_count }}</span>
+          </div>
+          <span class="text-slate-400">模型：{{ inspectionResult.model_used }}</span>
+        </div>
+        <div v-if="inspectionResult.category_distribution?.length" class="flex flex-wrap items-center gap-1.5">
+          <span class="text-slate-400">AI 科室归类分布：</span>
+          <span
+            v-for="c in inspectionResult.category_distribution"
+            :key="c.name"
+            class="px-2 py-0.5 rounded-full bg-indigo-950/80 border border-indigo-700/60 text-indigo-200"
+          >
+            {{ c.name }} ({{ c.count }})
+          </span>
+        </div>
       </div>
 
       <div class="overflow-x-auto rounded-xl border border-slate-800">
@@ -617,6 +704,7 @@ async function handleCommitLocalPath() {
               <th class="p-3">慢病史</th>
               <th class="p-3">过敏史</th>
               <th class="p-3">推荐科室 / 急诊级</th>
+              <th class="p-3">AI 巡查分类</th>
               <th class="p-3">脱敏后 L3 主诉与摘要</th>
               <th class="p-3">操作</th>
             </tr>
@@ -641,6 +729,26 @@ async function handleCommitLocalPath() {
                   {{ rec.l3_visit_events[0].recommended_department }} · L{{ rec.l3_visit_events[0].urgency_level }}
                 </span>
                 <span v-else class="text-slate-500">-</span>
+              </td>
+              <td class="p-3">
+                <div v-if="inspectionByPatientId[rec.patient_id]" class="space-y-1">
+                  <span
+                    :class="
+                      inspectionByPatientId[rec.patient_id].status === 'pass'
+                        ? 'bg-emerald-950 text-emerald-300 border-emerald-700'
+                        : inspectionByPatientId[rec.patient_id].status === 'warning'
+                          ? 'bg-amber-950 text-amber-300 border-amber-700'
+                          : 'bg-rose-950 text-rose-300 border-rose-700'
+                    "
+                    class="inline-block px-2 py-0.5 rounded-full border text-[10px]"
+                  >
+                    {{ inspectionByPatientId[rec.patient_id].suggested_department }} · {{ inspectionByPatientId[rec.patient_id].risk_level }}
+                  </span>
+                  <div v-if="inspectionByPatientId[rec.patient_id].issues?.length" class="text-[10px] text-rose-300">
+                    {{ inspectionByPatientId[rec.patient_id].issues.join('；') }}
+                  </div>
+                </div>
+                <span v-else class="text-slate-600">未巡查</span>
               </td>
               <td class="p-3 max-w-xs">
                 <div class="text-slate-200">{{ rec.l3_visit_events?.[0]?.chief_complaint || '-' }}</div>

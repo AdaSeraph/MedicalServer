@@ -79,7 +79,8 @@ pub fn slot_question_system(
 
     let force_complete = slots.turn >= slots.max_turns
         || scratch.should_converge
-        || llm_json.action.eq_ignore_ascii_case("completed");
+        || llm_json.action.eq_ignore_ascii_case("completed")
+        || llm_json.action.eq_ignore_ascii_case("complete");
 
     if force_complete {
         let top_item = evidence.items.first();

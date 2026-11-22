@@ -849,11 +849,40 @@ fn build_reasoning_request(
         .as_ref()
         .map(|l2| {
             format!(
-                "年龄段:{}, 慢病:{:?}, 过敏:{:?}",
-                l2.age_group, l2.chronic_diseases, l2.allergies
+                "年龄段:{}, 性别:{:?}, 妊娠:{}, 慢病:{:?}, 过敏:{:?}, 手术史:{:?}, 长期用药:{:?}",
+                l2.age_group,
+                l2.gender,
+                l2.is_pregnant,
+                l2.chronic_diseases,
+                l2.allergies,
+                l2.surgical_history,
+                l2.long_term_medications
             )
         })
         .unwrap_or_else(|| "无长期档案".to_string());
+
+    let l3_text: String = if recall.l3_events.is_empty() {
+        "无相关历史就诊病例".to_string()
+    } else {
+        recall
+            .l3_events
+            .iter()
+            .take(3)
+            .map(|r| {
+                format!(
+                    "- [{}] 主诉:{} | 症状:{:?} | 历史推荐科室:{} (紧急度L{}) | 摘要:{} (相似度:{:.2})",
+                    r.event.occurred_at.format("%Y-%m-%d"),
+                    r.event.chief_complaint,
+                    r.event.extracted_symptoms,
+                    r.event.recommended_department,
+                    r.event.urgency_level,
+                    r.event.summary,
+                    r.similarity_score
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
 
     let turns_text: String = session_mem
         .turns
@@ -868,14 +897,15 @@ fn build_reasoning_request(
         "若信息仍不足可继续短追问(action=\"follow_up\")，追问正文严格<=30字且附带2~4个快捷选项；若信息充分也可直接输出completed"
     };
 
-    let sys_prompt = "你是医院智能预检分诊AI。严禁输出确诊结论和具体处方药剂量。严格按JSON输出：{\"action\":\"follow_up|completed\",\"question\":\"...\",\"quick_options\":[\"...\"],\"primary_department\":\"...\",\"secondary_departments\":[],\"urgency_level\":2,\"summary\":\"...\"}";
+    let sys_prompt = "你是医院智能预检分诊AI。请综合患者的对话历史、L2长期健康画像、L3历史就诊病例、季节流行病背景与医学知识库依据进行分诊推理。严禁输出确诊结论和具体处方药剂量。严格按JSON输出：{\"action\":\"follow_up|completed\",\"question\":\"...\",\"quick_options\":[\"...\"],\"primary_department\":\"...\",\"secondary_departments\":[],\"urgency_level\":2,\"summary\":\"...\"}";
     let user_prompt = format!(
-        "当前轮次:{}/{}\n患者本轮主诉:{}\n对话历史:\n{}\nL2画像:{}\n季节流行病:{}\n优先追问提示:{:?}\n目标槽位:{:?}\n决策要求:{}\n知识库依据:\n{}",
+        "当前轮次:{}/{}\n患者本轮主诉:{}\n对话历史:\n{}\nL2画像:{}\nL3历史病例:\n{}\n季节流行病:{}\n优先追问提示:{:?}\n目标槽位:{:?}\n决策要求:{}\n知识库依据:\n{}",
         slots.turn,
         slots.max_turns,
         scrubbed_utterance,
         turns_text,
         l2_text,
+        l3_text,
         epi_text,
         scratch.priority_hint,
         scratch.target_slot,

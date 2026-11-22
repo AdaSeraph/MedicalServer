@@ -28,12 +28,16 @@ pub fn run() {
             commands::ai_normalize_knowledge_batch,
             commands::batch_preview_knowledge_items,
             commands::commit_knowledge_documents,
+            commands::get_knowledge_categories,
+            commands::list_knowledge_documents,
+            commands::ai_inspect_knowledge_batch,
             // Module 2: Patient Import & Masking Center
             commands::preview_patient_import,
             commands::apply_masking_and_import_patients,
             commands::ai_normalize_patient_batch,
             commands::batch_preview_patient_items,
             commands::commit_patient_records,
+            commands::ai_inspect_patient_batch,
             // Module 3: Seasonal & Epidemic Context Console
             commands::list_epidemic_contexts,
             commands::upsert_epidemic_context,
@@ -50,6 +54,7 @@ pub fn run() {
             commands::run_ecs_whitebox_triage,
             commands::reset_ecs_debug_session,
             commands::list_debug_patients,
+            commands::get_ecs_runtime_status,
             // Module 6: AI LLM & Open API Gateway Config Center
             commands::list_llm_providers,
             commands::upsert_llm_provider,
@@ -61,6 +66,16 @@ pub fn run() {
             commands::issue_api_key,
             commands::revoke_api_key,
             commands::get_gateway_metrics,
+            // Module 7: Data Export & Peer Exchange
+            commands::export_exchange_package,
+            commands::preview_exchange_package,
+            commands::import_exchange_package,
+            // Module 8: Patient Revisit Feedback & New Patient Consultation
+            commands::lookup_patient_by_serial,
+            commands::list_patient_summaries,
+            commands::create_or_update_patient_profile,
+            commands::submit_patient_revisit_feedback,
+            commands::run_consultation_triage,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MedicalStudio Tauri application");

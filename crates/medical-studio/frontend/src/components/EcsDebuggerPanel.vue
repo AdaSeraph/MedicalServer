@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref } from 'vue';
+import { computed, nextTick, onActivated, onMounted, ref } from 'vue';
 import { invokeStudio } from '../api/tauri';
 import { useToast } from '../composables/useToast';
 
@@ -14,6 +14,15 @@ const utterance = ref('');
 const isSending = ref(false);
 const showRawJson = ref(false);
 const chatContainerRef = ref<HTMLDivElement | null>(null);
+const runtimeStatus = ref<{
+  using_real_llm: boolean;
+  active_providers: string[];
+  knowledge_doc_count: number;
+  patient_count: number;
+  epidemic_count: number;
+  synonym_count: number;
+  red_flag_count: number;
+} | null>(null);
 
 const messages = ref<
   { role: string; text: string; options?: string[]; card?: any; redFlag?: string }[]
@@ -44,10 +53,17 @@ async function scrollChatToBottom() {
 
 async function init() {
   try {
-    patients.value = await invokeStudio<string[]>('list_debug_patients');
-    selectedPatient.value = patients.value[0] ?? 'pat_sha256_demo_001';
+    const [pts, st] = await Promise.all([
+      invokeStudio<string[]>('list_debug_patients'),
+      invokeStudio<any>('get_ecs_runtime_status'),
+    ]);
+    patients.value = pts ?? [];
+    if (!selectedPatient.value || !patients.value.includes(selectedPatient.value)) {
+      selectedPatient.value = patients.value[0] ?? 'pat_sha256_demo_001';
+    }
+    runtimeStatus.value = st;
   } catch (err) {
-    toast.error(`加载调试患者列表失败：${String(err)}`);
+    toast.error(`加载调试状态与患者列表失败：${String(err)}`);
   }
 }
 
@@ -105,6 +121,7 @@ async function resetSession(silent = false) {
 }
 
 onMounted(init);
+onActivated(init);
 </script>
 
 <template>
@@ -130,6 +147,12 @@ onMounted(init);
           <option v-for="p in patients" :key="p" :value="p">{{ p.slice(0, 22) }}...</option>
         </select>
         <button
+          @click="init"
+          class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200"
+        >
+          刷新数据源
+        </button>
+        <button
           @click="resetSession(false)"
           class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200"
         >
@@ -137,6 +160,44 @@ onMounted(init);
         </button>
       </div>
     </header>
+
+    <!-- Runtime Data Linkage Status Bar -->
+    <div
+      v-if="runtimeStatus"
+      class="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-800 text-xs"
+    >
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="text-slate-400 font-medium">当前分诊联动数据源：</span>
+        <span
+          :class="runtimeStatus.knowledge_doc_count > 0 ? 'bg-sky-950/80 text-sky-300 border-sky-700/60' : 'bg-slate-800 text-slate-400 border-slate-700'"
+          class="px-2 py-0.5 rounded-full border"
+        >
+          知识库 {{ runtimeStatus.knowledge_doc_count }} 条
+        </span>
+        <span class="px-2 py-0.5 rounded-full bg-emerald-950/80 text-emerald-300 border border-emerald-700/60">
+          病例库 {{ runtimeStatus.patient_count }} 份
+        </span>
+        <span class="px-2 py-0.5 rounded-full bg-amber-950/80 text-amber-300 border border-amber-700/60">
+          流行病 {{ runtimeStatus.epidemic_count }} 条
+        </span>
+      </div>
+      <div class="flex items-center gap-2">
+        <span
+          :class="
+            runtimeStatus.using_real_llm
+              ? 'bg-emerald-950 text-emerald-300 border-emerald-600'
+              : 'bg-amber-950 text-amber-300 border-amber-700'
+          "
+          class="px-2.5 py-0.5 rounded-full border font-medium"
+        >
+          {{
+            runtimeStatus.using_real_llm
+              ? `真实 AI 对话引擎：${runtimeStatus.active_providers.join(' / ')}`
+              : '离线 Mock 模拟模式（在模块 6 配置真实 API Key 后自动切换真实 AI 对话）'
+          }}
+        </span>
+      </div>
+    </div>
 
     <!-- Quick Test Scenario Chips -->
     <div class="flex flex-wrap items-center gap-2 text-xs">
@@ -292,14 +353,64 @@ onMounted(init);
 
             <!-- Structured Slots & RAG -->
             <div class="p-3 rounded-lg bg-slate-950 border border-slate-800 space-y-2">
-              <div class="text-amber-300 font-semibold">TriageSlots & RAG Evidence</div>
+              <div class="text-amber-300 font-semibold">TriageSlots & RAG Evidence（知识库召回）</div>
               <div class="grid grid-cols-2 gap-2 text-[11px]">
                 <div><span class="text-slate-400">轮次：</span>{{ latestTrace.triage_slots?.turn }} / {{ latestTrace.triage_slots?.max_turns }}</div>
-                <div><span class="text-slate-400">RAG 命中：</span>{{ latestTrace.rag_evidence?.items?.length ?? latestTrace.rag_evidence?.hits?.length ?? 0 }} 条</div>
+                <div><span class="text-slate-400">RAG 命中：</span>{{ latestTrace.rag_evidence?.items?.length ?? 0 }} 条</div>
                 <div><span class="text-slate-400">主诉：</span>{{ latestTrace.triage_slots?.chief_complaint || '-' }}</div>
                 <div><span class="text-slate-400">病程：</span>{{ latestTrace.triage_slots?.duration || '-' }}</div>
                 <div><span class="text-slate-400">体温/生命体征：</span>{{ latestTrace.triage_slots?.temperature_or_vitals || '-' }}</div>
                 <div><span class="text-slate-400">流行病加权：</span>{{ (latestTrace.rag_evidence?.seasonal_context_applied || []).join('、') || '无' }}</div>
+              </div>
+              <div v-if="latestTrace.session_memory?.rewritten_query" class="text-[11px] text-slate-400 pt-1 border-t border-slate-800">
+                <span class="text-slate-500">检索改写 Query：</span>{{ latestTrace.session_memory.rewritten_query }}
+              </div>
+              <div v-if="latestTrace.rag_evidence?.items?.length" class="space-y-1.5 pt-1 border-t border-slate-800">
+                <div
+                  v-for="item in latestTrace.rag_evidence.items.slice(0, 3)"
+                  :key="item.doc_id"
+                  class="p-2 rounded bg-slate-900 border border-slate-800 text-[11px] space-y-0.5"
+                >
+                  <div class="flex items-center justify-between gap-2">
+                    <span class="font-semibold text-sky-300">{{ item.disease_name }} · {{ item.department }}</span>
+                    <span class="font-mono text-emerald-300">得分 {{ Number(item.final_score).toFixed(3) }}</span>
+                  </div>
+                  <p class="text-slate-400 line-clamp-2">{{ item.snippet }}</p>
+                </div>
+              </div>
+              <div v-else class="text-[11px] text-slate-500 pt-1 border-t border-slate-800">
+                本次未命中知识库条目（请确认已在模块 1 导入对应医学知识）
+              </div>
+            </div>
+
+            <!-- Patient Case Memory (L2 + L3) -->
+            <div class="p-3 rounded-lg bg-slate-950 border border-slate-800 space-y-2">
+              <div class="flex items-center justify-between">
+                <span class="text-emerald-300 font-semibold">Patient Memory（L2 画像 & L3 历史病例）</span>
+                <span class="text-[11px] text-slate-400">
+                  L3 召回 {{ latestTrace.memory_recall?.l3_events?.length ?? 0 }} 条
+                </span>
+              </div>
+              <div v-if="latestTrace.patient_profile?.l2_profile" class="grid grid-cols-2 gap-1.5 text-[11px]">
+                <div><span class="text-slate-400">年龄段/性别：</span>{{ latestTrace.patient_profile.l2_profile.age_group }} / {{ latestTrace.patient_profile.l2_profile.gender }}</div>
+                <div><span class="text-slate-400">慢病：</span>{{ (latestTrace.patient_profile.l2_profile.chronic_diseases || []).join('、') || '无' }}</div>
+                <div><span class="text-slate-400">过敏史：</span>{{ (latestTrace.patient_profile.l2_profile.allergies || []).join('、') || '无' }}</div>
+                <div><span class="text-slate-400">长期用药：</span>{{ (latestTrace.patient_profile.l2_profile.long_term_medications || []).join('、') || '无' }}</div>
+              </div>
+              <div v-else class="text-[11px] text-slate-500">当前患者无 L2 长期健康画像</div>
+
+              <div v-if="latestTrace.memory_recall?.l3_events?.length" class="space-y-1 pt-1 border-t border-slate-800">
+                <div
+                  v-for="ev in latestTrace.memory_recall.l3_events"
+                  :key="ev.event.event_id"
+                  class="p-2 rounded bg-slate-900 border border-slate-800 text-[11px]"
+                >
+                  <div class="flex items-center justify-between text-emerald-300">
+                    <span>历史主诉：{{ ev.event.chief_complaint }}</span>
+                    <span class="font-mono text-slate-400">{{ ev.event.recommended_department }} · L{{ ev.event.urgency_level }}</span>
+                  </div>
+                  <div class="text-slate-400 mt-0.5">{{ ev.event.summary }}</div>
+                </div>
               </div>
             </div>
           </template>

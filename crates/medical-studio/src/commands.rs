@@ -1,17 +1,21 @@
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use chrono::Utc;
+use medical_core::crypto::hash_patient_id;
 use medical_core::ecs::{
     ExtractedSymptoms, RagEvidence, RedFlagAlert, TriageExecutionResult, TriageRequest,
     TriageSlots,
 };
 use medical_core::llm::{ProbeResult, ProviderConfig, RouterConfig};
 use medical_core::models::{
-    EpidemicContext, KnowledgeDocument, MedicalDictionaries, PatientRecord, RedFlagLevel,
-    RedFlagRule, SymptomSynonym, TargetPopulation,
+    DataCollectionPackage, EpidemicContext, KnowledgeDocument, L2Profile, L3VisitEvent,
+    MedicalDictionaries, PatientRecord, RedFlagLevel, RedFlagRule, SymptomSynonym,
+    TargetPopulation, TriageStatus,
 };
+use medical_core::privacy::scrub_pii;
 use medical_core::storage::{
     ApiKeyRecord, GatewayMetricsSummary, IngestionCheckpoint, IssueApiKeyRequest, IssuedApiKey,
 };
@@ -27,7 +31,9 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::ai_normalize::{
-    AiImportPrompts, AiKnowledgeNormalizeResponse, AiPatientNormalizeResponse, BatchImportItem,
+    AiImportPrompts, AiKnowledgeInspectionResponse, AiKnowledgeNormalizeResponse,
+    AiPatientInspectionResponse, AiPatientNormalizeResponse, BatchImportItem, CategoryCount,
+    ai_inspect_knowledge_batch_with_state, ai_inspect_patient_batch_with_state,
     ai_normalize_knowledge_batch_with_state, ai_normalize_patient_batch_with_state,
     default_ai_import_prompts,
 };
@@ -1261,6 +1267,7 @@ pub async fn upsert_llm_provider_impl(
         .upsert_provider(&config)
         .await
         .map_err(|e| e.to_string())?;
+    let _ = state.sync_ecs_resources().await;
     Ok(config)
 }
 
@@ -1276,12 +1283,14 @@ pub async fn delete_llm_provider_impl(
     state: &StudioState,
     provider_id: String,
 ) -> Result<bool, String> {
-    state
+    let deleted = state
         .stores
         .llm_providers
         .delete_provider(&provider_id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let _ = state.sync_ecs_resources().await;
+    Ok(deleted)
 }
 
 #[tauri::command]
@@ -1448,6 +1457,7 @@ pub async fn save_router_config_impl(
         .save_router_config(&config)
         .await
         .map_err(|e| e.to_string())?;
+    let _ = state.sync_ecs_resources().await;
     Ok(config)
 }
 
@@ -1528,4 +1538,1167 @@ pub async fn get_gateway_metrics(
     window_hours: Option<u32>,
 ) -> Result<GatewayMetricsSummary, String> {
     get_gateway_metrics_impl(&state, window_hours).await
+}
+
+// ===========================================================================
+// Module 7: 已有知识库分类、AI 巡查分类、数据导出与交流共享、ECS 运行状态
+// ===========================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeDepartmentCategory {
+    pub department: String,
+    pub doc_count: usize,
+    pub diseases: Vec<String>,
+    pub section_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeCategoriesResponse {
+    pub total_documents: usize,
+    pub departments: Vec<KnowledgeDepartmentCategory>,
+    pub section_types: Vec<CategoryCount>,
+    pub source_types: Vec<CategoryCount>,
+    pub seasonal_tags: Vec<CategoryCount>,
+    pub populations: Vec<CategoryCount>,
+}
+
+pub async fn get_knowledge_categories_impl(
+    state: &StudioState,
+    tenant_namespace: Option<String>,
+) -> Result<KnowledgeCategoriesResponse, String> {
+    let docs = state
+        .tantivy
+        .list_all_documents(tenant_namespace.as_deref())
+        .map_err(|e| e.to_string())?;
+
+    let mut dept_map: HashMap<String, (usize, HashSet<String>, HashSet<String>)> = HashMap::new();
+    let mut section_map: HashMap<String, usize> = HashMap::new();
+    let mut source_map: HashMap<String, usize> = HashMap::new();
+    let mut tag_map: HashMap<String, usize> = HashMap::new();
+    let mut pop_map: HashMap<String, usize> = HashMap::new();
+
+    for d in &docs {
+        let entry = dept_map
+            .entry(d.department.clone())
+            .or_insert_with(|| (0, HashSet::new(), HashSet::new()));
+        entry.0 += 1;
+        entry.1.insert(d.disease_name.clone());
+        entry.2.insert(d.section_type.as_str().to_string());
+
+        *section_map
+            .entry(d.section_type.as_str().to_string())
+            .or_insert(0) += 1;
+        let src_str = serde_json::to_value(d.source_type)
+            .ok()
+            .and_then(|v| v.as_str().map(ToString::to_string))
+            .unwrap_or_else(|| "textbook".to_string());
+        *source_map.entry(src_str).or_insert(0) += 1;
+        for tag in &d.seasonal_tags {
+            if !tag.trim().is_empty() {
+                *tag_map.entry(tag.trim().to_string()).or_insert(0) += 1;
+            }
+        }
+        for pop in &d.target_population {
+            *pop_map.entry(pop.as_str().to_string()).or_insert(0) += 1;
+        }
+    }
+
+    let mut departments: Vec<KnowledgeDepartmentCategory> = dept_map
+        .into_iter()
+        .map(|(department, (doc_count, diseases_set, sections_set))| {
+            let mut diseases: Vec<String> = diseases_set.into_iter().collect();
+            diseases.sort();
+            let mut section_types: Vec<String> = sections_set.into_iter().collect();
+            section_types.sort();
+            KnowledgeDepartmentCategory {
+                department,
+                doc_count,
+                diseases,
+                section_types,
+            }
+        })
+        .collect();
+    departments.sort_by(|a, b| {
+        b.doc_count
+            .cmp(&a.doc_count)
+            .then_with(|| a.department.cmp(&b.department))
+    });
+
+    let to_sorted_counts = |map: HashMap<String, usize>| -> Vec<CategoryCount> {
+        let mut v: Vec<CategoryCount> = map
+            .into_iter()
+            .map(|(name, count)| CategoryCount { name, count })
+            .collect();
+        v.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+        v
+    };
+
+    Ok(KnowledgeCategoriesResponse {
+        total_documents: docs.len(),
+        departments,
+        section_types: to_sorted_counts(section_map),
+        source_types: to_sorted_counts(source_map),
+        seasonal_tags: to_sorted_counts(tag_map),
+        populations: to_sorted_counts(pop_map),
+    })
+}
+
+#[tauri::command]
+pub async fn get_knowledge_categories(
+    state: State<'_, StudioState>,
+    tenant_namespace: Option<String>,
+) -> Result<KnowledgeCategoriesResponse, String> {
+    get_knowledge_categories_impl(&state, tenant_namespace).await
+}
+
+pub async fn list_knowledge_documents_impl(
+    state: &StudioState,
+    department: Option<String>,
+    tenant_namespace: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<KnowledgeDocument>, String> {
+    let mut docs = state
+        .tantivy
+        .list_all_documents(tenant_namespace.as_deref())
+        .map_err(|e| e.to_string())?;
+    if let Some(dept) = department.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        docs.retain(|d| d.department == dept);
+    }
+    if let Some(lim) = limit {
+        docs.truncate(lim.max(1));
+    }
+    Ok(docs)
+}
+
+#[tauri::command]
+pub async fn list_knowledge_documents(
+    state: State<'_, StudioState>,
+    department: Option<String>,
+    tenant_namespace: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<KnowledgeDocument>, String> {
+    list_knowledge_documents_impl(&state, department, tenant_namespace, limit).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AiInspectKnowledgeRequest {
+    pub documents: Vec<KnowledgeDocument>,
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub custom_prompt: Option<String>,
+    #[serde(default)]
+    pub tenant_namespace: Option<String>,
+}
+
+pub async fn ai_inspect_knowledge_batch_impl(
+    state: &StudioState,
+    req: AiInspectKnowledgeRequest,
+) -> Result<AiKnowledgeInspectionResponse, String> {
+    ai_inspect_knowledge_batch_with_state(
+        state,
+        &req.documents,
+        req.provider_id.as_deref(),
+        req.custom_prompt.as_deref(),
+        req.tenant_namespace.as_deref(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn ai_inspect_knowledge_batch(
+    state: State<'_, StudioState>,
+    req: AiInspectKnowledgeRequest,
+) -> Result<AiKnowledgeInspectionResponse, String> {
+    ai_inspect_knowledge_batch_impl(&state, req).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AiInspectPatientRequest {
+    pub records: Vec<PatientRecord>,
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub custom_prompt: Option<String>,
+}
+
+pub async fn ai_inspect_patient_batch_impl(
+    state: &StudioState,
+    req: AiInspectPatientRequest,
+) -> Result<AiPatientInspectionResponse, String> {
+    ai_inspect_patient_batch_with_state(
+        state,
+        &req.records,
+        req.provider_id.as_deref(),
+        req.custom_prompt.as_deref(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn ai_inspect_patient_batch(
+    state: State<'_, StudioState>,
+    req: AiInspectPatientRequest,
+) -> Result<AiPatientInspectionResponse, String> {
+    ai_inspect_patient_batch_impl(&state, req).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExportExchangePackageRequest {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default = "default_true")]
+    pub include_knowledge: bool,
+    #[serde(default)]
+    pub knowledge_departments: Vec<String>,
+    #[serde(default)]
+    pub tenant_namespace: Option<String>,
+    #[serde(default = "default_true")]
+    pub include_patients: bool,
+    #[serde(default = "default_true")]
+    pub include_epidemics: bool,
+    #[serde(default = "default_true")]
+    pub include_dictionaries: bool,
+    /// "json" (full DataCollectionPackage exchange bundle) or "knowledge_jsonl"
+    #[serde(default = "default_export_format")]
+    pub format: String,
+    /// Optional local file path to also save directly to disk
+    #[serde(default)]
+    pub output_path: Option<String>,
+}
+
+fn default_export_format() -> String {
+    "json".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExchangePackageStats {
+    pub knowledge_count: usize,
+    pub patient_count: usize,
+    pub l3_event_count: usize,
+    pub epidemic_count: usize,
+    pub synonym_count: usize,
+    pub red_flag_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportExchangePackageResponse {
+    pub filename: String,
+    pub format: String,
+    pub content: String,
+    pub saved_path: Option<String>,
+    pub stats: ExchangePackageStats,
+}
+
+pub async fn export_exchange_package_impl(
+    state: &StudioState,
+    req: ExportExchangePackageRequest,
+) -> Result<ExportExchangePackageResponse, String> {
+    let mut knowledge_documents = if req.include_knowledge {
+        let mut docs = state
+            .tantivy
+            .list_all_documents(req.tenant_namespace.as_deref())
+            .map_err(|e| e.to_string())?;
+        if !req.knowledge_departments.is_empty() {
+            let allowed: HashSet<String> = req
+                .knowledge_departments
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !allowed.is_empty() {
+                docs.retain(|d| allowed.contains(&d.department));
+            }
+        }
+        docs
+    } else {
+        Vec::new()
+    };
+    knowledge_documents.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
+
+    let mut patient_records = Vec::new();
+    let mut l3_event_count = 0usize;
+    if req.include_patients {
+        let ids = state
+            .stores
+            .patient_memory
+            .list_patient_ids(10_000, 0)
+            .await
+            .map_err(|e| e.to_string())?;
+        for pid in ids {
+            if let Ok(Some(rec)) = state.stores.patient_memory.get_full_memory(&pid, 200).await {
+                l3_event_count += rec.l3_visit_events.len();
+                patient_records.push(rec);
+            }
+        }
+    }
+
+    let epidemic_contexts = if req.include_epidemics {
+        state
+            .stores
+            .epidemics
+            .list_all()
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        Vec::new()
+    };
+
+    let medical_dictionaries = if req.include_dictionaries {
+        Some(
+            state
+                .stores
+                .dictionaries
+                .load_dictionaries()
+                .await
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        None
+    };
+
+    let synonym_count = medical_dictionaries
+        .as_ref()
+        .map(|d| d.symptom_synonyms.len())
+        .unwrap_or(0);
+    let red_flag_count = medical_dictionaries
+        .as_ref()
+        .map(|d| d.red_flag_rules.len())
+        .unwrap_or(0);
+
+    let stats = ExchangePackageStats {
+        knowledge_count: knowledge_documents.len(),
+        patient_count: patient_records.len(),
+        l3_event_count,
+        epidemic_count: epidemic_contexts.len(),
+        synonym_count,
+        red_flag_count,
+    };
+
+    let ts = Utc::now().format("%Y%m%d_%H%M%S");
+    let fmt = req.format.trim().to_ascii_lowercase();
+    let (filename, content) = if fmt == "knowledge_jsonl" || fmt == "jsonl" {
+        let mut lines = Vec::with_capacity(knowledge_documents.len());
+        for doc in &knowledge_documents {
+            let line = serde_json::to_string(doc).map_err(|e| format!("序列化知识文档失败: {e}"))?;
+            lines.push(line);
+        }
+        (
+            format!("medical_knowledge_{ts}.jsonl"),
+            lines.join("\n"),
+        )
+    } else {
+        let pkg = DataCollectionPackage {
+            schema_version: "1.0.0".to_string(),
+            description: req.description.filter(|s| !s.trim().is_empty()).or_else(|| {
+                Some(format!(
+                    "MedicalStudio 学习交流共享包 (导出时间 {})",
+                    Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+                ))
+            }),
+            knowledge_documents,
+            patient_records,
+            epidemic_contexts,
+            medical_dictionaries,
+        };
+        let json = serde_json::to_string_pretty(&pkg)
+            .map_err(|e| format!("序列化共享包 JSON 失败: {e}"))?;
+        (format!("medical_exchange_bundle_{ts}.json"), json)
+    };
+
+    let mut saved_path = None;
+    if let Some(out_path) = req
+        .output_path
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        if let Some(parent) = Path::new(&out_path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("创建导出目录失败 ({out_path}): {e}"))?;
+        }
+        std::fs::write(&out_path, content.as_bytes())
+            .map_err(|e| format!("写入导出文件失败 ({out_path}): {e}"))?;
+        saved_path = Some(out_path);
+    }
+
+    Ok(ExportExchangePackageResponse {
+        filename,
+        format: if fmt == "knowledge_jsonl" || fmt == "jsonl" {
+            "knowledge_jsonl".to_string()
+        } else {
+            "json".to_string()
+        },
+        content,
+        saved_path,
+        stats,
+    })
+}
+
+#[tauri::command]
+pub async fn export_exchange_package(
+    state: State<'_, StudioState>,
+    req: ExportExchangePackageRequest,
+) -> Result<ExportExchangePackageResponse, String> {
+    export_exchange_package_impl(&state, req).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PreviewExchangePackageRequest {
+    pub content: String,
+    #[serde(default)]
+    pub tenant_namespace: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExchangePackagePreview {
+    pub schema_version: String,
+    pub description: Option<String>,
+    pub stats: ExchangePackageStats,
+    pub knowledge_departments: Vec<CategoryCount>,
+    pub duplicate_knowledge_count: usize,
+    pub package: DataCollectionPackage,
+}
+
+pub async fn preview_exchange_package_impl(
+    state: &StudioState,
+    req: PreviewExchangePackageRequest,
+) -> Result<ExchangePackagePreview, String> {
+    let pkg = parse_collection_bundle_str(&req.content).map_err(|e| format!("共享包解析校验失败: {e}"))?;
+
+    let existing_docs = state
+        .tantivy
+        .list_all_documents(req.tenant_namespace.as_deref())
+        .unwrap_or_default();
+    let existing_ids: HashSet<String> = existing_docs.iter().map(|d| d.doc_id.clone()).collect();
+    let existing_keys: HashSet<(String, String)> = existing_docs
+        .iter()
+        .map(|d| {
+            (
+                d.disease_name.trim().to_ascii_lowercase(),
+                d.section_type.as_str().to_string(),
+            )
+        })
+        .collect();
+
+    let mut dept_map: HashMap<String, usize> = HashMap::new();
+    let mut dup_count = 0usize;
+    for d in &pkg.knowledge_documents {
+        *dept_map.entry(d.department.clone()).or_insert(0) += 1;
+        if existing_ids.contains(&d.doc_id)
+            || existing_keys.contains(&(
+                d.disease_name.trim().to_ascii_lowercase(),
+                d.section_type.as_str().to_string(),
+            ))
+        {
+            dup_count += 1;
+        }
+    }
+    let mut knowledge_departments: Vec<CategoryCount> = dept_map
+        .into_iter()
+        .map(|(name, count)| CategoryCount { name, count })
+        .collect();
+    knowledge_departments.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+
+    let l3_event_count: usize = pkg
+        .patient_records
+        .iter()
+        .map(|p| p.l3_visit_events.len())
+        .sum();
+    let stats = ExchangePackageStats {
+        knowledge_count: pkg.knowledge_documents.len(),
+        patient_count: pkg.patient_records.len(),
+        l3_event_count,
+        epidemic_count: pkg.epidemic_contexts.len(),
+        synonym_count: pkg
+            .medical_dictionaries
+            .as_ref()
+            .map(|d| d.symptom_synonyms.len())
+            .unwrap_or(0),
+        red_flag_count: pkg
+            .medical_dictionaries
+            .as_ref()
+            .map(|d| d.red_flag_rules.len())
+            .unwrap_or(0),
+    };
+
+    Ok(ExchangePackagePreview {
+        schema_version: pkg.schema_version.clone(),
+        description: pkg.description.clone(),
+        stats,
+        knowledge_departments,
+        duplicate_knowledge_count: dup_count,
+        package: pkg,
+    })
+}
+
+#[tauri::command]
+pub async fn preview_exchange_package(
+    state: State<'_, StudioState>,
+    req: PreviewExchangePackageRequest,
+) -> Result<ExchangePackagePreview, String> {
+    preview_exchange_package_impl(&state, req).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImportExchangePackageRequest {
+    pub package: DataCollectionPackage,
+    #[serde(default = "default_ns")]
+    pub tenant_namespace: String,
+    #[serde(default = "default_true")]
+    pub import_knowledge: bool,
+    #[serde(default = "default_true")]
+    pub import_patients: bool,
+    #[serde(default = "default_true")]
+    pub import_epidemics: bool,
+    #[serde(default = "default_true")]
+    pub import_dictionaries: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExchangePackageImportResult {
+    pub imported_knowledge: u64,
+    pub imported_patients: usize,
+    pub imported_l3_events: usize,
+    pub imported_epidemics: usize,
+    pub imported_synonyms: usize,
+    pub imported_red_flags: usize,
+}
+
+pub async fn import_exchange_package_impl(
+    state: &StudioState,
+    req: ImportExchangePackageRequest,
+) -> Result<ExchangePackageImportResult, String> {
+    req.package
+        .validate()
+        .map_err(|e| format!("共享包校验失败: {e}"))?;
+
+    let mut imported_knowledge = 0u64;
+    if req.import_knowledge && !req.package.knowledge_documents.is_empty() {
+        imported_knowledge = state
+            .indexer
+            .upsert_documents(&req.package.knowledge_documents, &req.tenant_namespace)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    let mut imported_patients = 0usize;
+    let mut imported_l3_events = 0usize;
+    if req.import_patients {
+        for rec in &req.package.patient_records {
+            state
+                .stores
+                .patient_memory
+                .upsert_l2_profile(
+                    &rec.patient_id,
+                    rec.consent_long_term_memory,
+                    &rec.l2_profile,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            imported_patients += 1;
+
+            for ev in &rec.l3_visit_events {
+                state
+                    .stores
+                    .patient_memory
+                    .insert_l3_event(&rec.patient_id, ev)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if let Ok(vec) = state
+                    .embedder
+                    .embed_one(&format!("{} {}", ev.chief_complaint, ev.summary))
+                    .await
+                {
+                    let _ = state
+                        .stores
+                        .patient_l3_vectors
+                        .upsert_event_vector(&rec.patient_id, ev, vec)
+                        .await;
+                }
+                imported_l3_events += 1;
+            }
+        }
+    }
+
+    let mut imported_epidemics = 0usize;
+    if req.import_epidemics {
+        for ctx in &req.package.epidemic_contexts {
+            state
+                .stores
+                .epidemics
+                .upsert(ctx)
+                .await
+                .map_err(|e| e.to_string())?;
+            imported_epidemics += 1;
+        }
+    }
+
+    let mut imported_synonyms = 0usize;
+    let mut imported_red_flags = 0usize;
+    if req.import_dictionaries
+        && let Some(dicts) = &req.package.medical_dictionaries
+    {
+        for syn in &dicts.symptom_synonyms {
+            state
+                .stores
+                .dictionaries
+                .save_symptom_synonym(syn)
+                .await
+                .map_err(|e| e.to_string())?;
+            imported_synonyms += 1;
+        }
+        for rule in &dicts.red_flag_rules {
+            state
+                .stores
+                .dictionaries
+                .save_red_flag_rule(rule)
+                .await
+                .map_err(|e| e.to_string())?;
+            imported_red_flags += 1;
+        }
+    }
+
+    state.sync_ecs_resources().await?;
+
+    Ok(ExchangePackageImportResult {
+        imported_knowledge,
+        imported_patients,
+        imported_l3_events,
+        imported_epidemics,
+        imported_synonyms,
+        imported_red_flags,
+    })
+}
+
+#[tauri::command]
+pub async fn import_exchange_package(
+    state: State<'_, StudioState>,
+    req: ImportExchangePackageRequest,
+) -> Result<ExchangePackageImportResult, String> {
+    import_exchange_package_impl(&state, req).await
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EcsRuntimeStatus {
+    pub using_real_llm: bool,
+    pub active_providers: Vec<String>,
+    pub knowledge_doc_count: u64,
+    pub patient_count: usize,
+    pub epidemic_count: usize,
+    pub synonym_count: usize,
+    pub red_flag_count: usize,
+}
+
+pub async fn get_ecs_runtime_status_impl(
+    state: &StudioState,
+) -> Result<EcsRuntimeStatus, String> {
+    let (_, using_real_llm, active_providers) = state.build_active_model_router().await;
+    let knowledge_doc_count = state.tantivy.num_docs();
+    let patient_count = state
+        .stores
+        .patient_memory
+        .list_patient_ids(10_000, 0)
+        .await
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let epidemic_count = state
+        .stores
+        .epidemics
+        .list_all()
+        .await
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let dicts = state
+        .stores
+        .dictionaries
+        .load_dictionaries()
+        .await
+        .unwrap_or_default();
+
+    Ok(EcsRuntimeStatus {
+        using_real_llm,
+        active_providers,
+        knowledge_doc_count,
+        patient_count,
+        epidemic_count,
+        synonym_count: dicts.symptom_synonyms.len(),
+        red_flag_count: dicts.red_flag_rules.len(),
+    })
+}
+
+#[tauri::command]
+pub async fn get_ecs_runtime_status(
+    state: State<'_, StudioState>,
+) -> Result<EcsRuntimeStatus, String> {
+    get_ecs_runtime_status_impl(&state).await
+}
+
+// ===========================================================================
+// Module 8: 病人复诊反馈与新病人建档问诊（按序列号查询、实时更新病历）
+// ===========================================================================
+
+fn resolve_canonical_patient_id(serial_or_id: &str, salt: Option<&str>) -> Result<String, String> {
+    let trimmed = serial_or_id.trim();
+    if trimmed.is_empty() {
+        return Err("病人序列号不能为空".to_string());
+    }
+    if trimmed.starts_with("pat_sha256_") && trimmed.len() == 75 {
+        return Ok(trimmed.to_string());
+    }
+    let salt_bytes = salt
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.as_bytes().to_vec())
+        .unwrap_or_else(|| PatientMaskingConfig::default().salt);
+    Ok(hash_patient_id(trimmed, &salt_bytes))
+}
+
+fn sanitize_l2_profile(mut profile: L2Profile) -> L2Profile {
+    if profile.age_group.trim().is_empty() {
+        profile.age_group = "unknown".to_string();
+    } else {
+        profile.age_group = profile.age_group.trim().to_string();
+    }
+    let clean_vec = |items: Vec<String>| -> Vec<String> {
+        let mut out = Vec::new();
+        for item in items {
+            let s = scrub_pii(item.trim()).scrubbed_text;
+            let t = s.trim();
+            if !t.is_empty() && !out.iter().any(|x: &String| x == t) {
+                out.push(t.to_string());
+            }
+        }
+        out
+    };
+    profile.chronic_diseases = clean_vec(profile.chronic_diseases);
+    profile.allergies = clean_vec(profile.allergies);
+    profile.surgical_history = clean_vec(profile.surgical_history);
+    profile.long_term_medications = clean_vec(profile.long_term_medications);
+    profile
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatientLookupResponse {
+    pub found: bool,
+    pub input_serial: String,
+    pub resolved_patient_id: String,
+    pub record: Option<PatientRecord>,
+}
+
+pub async fn lookup_patient_by_serial_impl(
+    state: &StudioState,
+    serial_or_id: String,
+    salt: Option<String>,
+) -> Result<PatientLookupResponse, String> {
+    let trimmed = serial_or_id.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("请输入病人序列号或匿名 Patient ID".to_string());
+    }
+
+    // 1. Direct match (e.g., user pasted exact pat_sha256_...)
+    if let Ok(Some(rec)) = state.stores.patient_memory.get_full_memory(&trimmed, 50).await {
+        return Ok(PatientLookupResponse {
+            found: true,
+            input_serial: trimmed.clone(),
+            resolved_patient_id: rec.patient_id.clone(),
+            record: Some(rec),
+        });
+    }
+
+    // 2. Prefix match on stored patient_ids (convenient when user enters short suffix/prefix of pat_sha256_)
+    if trimmed.len() >= 8 {
+        if let Ok(all_ids) = state.stores.patient_memory.list_patient_ids(500, 0).await {
+            if let Some(matched_id) = all_ids
+                .into_iter()
+                .find(|id| id.starts_with(&trimmed) || id.ends_with(&trimmed))
+                && let Ok(Some(rec)) = state
+                    .stores
+                    .patient_memory
+                    .get_full_memory(&matched_id, 50)
+                    .await
+            {
+                return Ok(PatientLookupResponse {
+                    found: true,
+                    input_serial: trimmed,
+                    resolved_patient_id: matched_id,
+                    record: Some(rec),
+                });
+            }
+        }
+    }
+
+    // 3. Deterministic salted hash match for raw clinic serial numbers
+    let canonical_id = resolve_canonical_patient_id(&trimmed, salt.as_deref())?;
+    let record = state
+        .stores
+        .patient_memory
+        .get_full_memory(&canonical_id, 50)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(PatientLookupResponse {
+        found: record.is_some(),
+        input_serial: trimmed,
+        resolved_patient_id: canonical_id,
+        record,
+    })
+}
+
+#[tauri::command]
+pub async fn lookup_patient_by_serial(
+    state: State<'_, StudioState>,
+    serial_or_id: String,
+    salt: Option<String>,
+) -> Result<PatientLookupResponse, String> {
+    lookup_patient_by_serial_impl(&state, serial_or_id, salt).await
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatientSummaryItem {
+    pub patient_id: String,
+    pub age_group: String,
+    pub gender: medical_core::models::Gender,
+    pub chronic_diseases: Vec<String>,
+    pub visit_count: usize,
+    pub latest_complaint: Option<String>,
+    pub latest_department: Option<String>,
+    pub latest_visit_at: Option<chrono::DateTime<Utc>>,
+}
+
+pub async fn list_patient_summaries_impl(
+    state: &StudioState,
+    limit: Option<usize>,
+) -> Result<Vec<PatientSummaryItem>, String> {
+    let ids = state
+        .stores
+        .patient_memory
+        .list_patient_ids(limit.unwrap_or(200).clamp(1, 1000), 0)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(ids.len());
+    for pid in ids {
+        if let Ok(Some(rec)) = state.stores.patient_memory.get_full_memory(&pid, 50).await {
+            let latest = rec.l3_visit_events.first();
+            out.push(PatientSummaryItem {
+                patient_id: rec.patient_id,
+                age_group: rec.l2_profile.age_group,
+                gender: rec.l2_profile.gender,
+                chronic_diseases: rec.l2_profile.chronic_diseases,
+                visit_count: rec.l3_visit_events.len(),
+                latest_complaint: latest.map(|e| e.chief_complaint.clone()),
+                latest_department: latest.map(|e| e.recommended_department.clone()),
+                latest_visit_at: latest.map(|e| e.occurred_at),
+            });
+        }
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub async fn list_patient_summaries(
+    state: State<'_, StudioState>,
+    limit: Option<usize>,
+) -> Result<Vec<PatientSummaryItem>, String> {
+    list_patient_summaries_impl(&state, limit).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpsertPatientProfileRequest {
+    pub serial_or_id: String,
+    #[serde(default)]
+    pub salt: Option<String>,
+    #[serde(default = "default_true")]
+    pub consent_long_term_memory: bool,
+    pub l2_profile: L2Profile,
+}
+
+pub async fn create_or_update_patient_profile_impl(
+    state: &StudioState,
+    req: UpsertPatientProfileRequest,
+) -> Result<PatientRecord, String> {
+    let patient_id = resolve_canonical_patient_id(&req.serial_or_id, req.salt.as_deref())?;
+    let clean_l2 = sanitize_l2_profile(req.l2_profile);
+
+    state
+        .stores
+        .patient_memory
+        .upsert_l2_profile(&patient_id, req.consent_long_term_memory, &clean_l2)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    state
+        .stores
+        .patient_memory
+        .get_full_memory(&patient_id, 50)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "保存患者档案后读取失败".to_string())
+}
+
+#[tauri::command]
+pub async fn create_or_update_patient_profile(
+    state: State<'_, StudioState>,
+    req: UpsertPatientProfileRequest,
+) -> Result<PatientRecord, String> {
+    create_or_update_patient_profile_impl(&state, req).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubmitRevisitFeedbackRequest {
+    pub serial_or_id: String,
+    #[serde(default)]
+    pub salt: Option<String>,
+    /// e.g. "明显好转" | "部分好转" | "症状持续" | "症状加重" | "出现新症状" | "初诊建档"
+    #[serde(default)]
+    pub outcome_status: String,
+    pub chief_complaint: String,
+    #[serde(default)]
+    pub extracted_symptoms: Vec<String>,
+    pub actual_department: String,
+    #[serde(default = "default_urgency")]
+    pub urgency_level: u8,
+    pub feedback_summary: String,
+    #[serde(default)]
+    pub updated_l2_profile: Option<L2Profile>,
+}
+
+fn default_urgency() -> u8 {
+    3
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevisitFeedbackResult {
+    pub resolved_patient_id: String,
+    pub created_event: L3VisitEvent,
+    pub patient_record: PatientRecord,
+}
+
+pub async fn submit_patient_revisit_feedback_impl(
+    state: &StudioState,
+    req: SubmitRevisitFeedbackRequest,
+) -> Result<RevisitFeedbackResult, String> {
+    let patient_id = resolve_canonical_patient_id(&req.serial_or_id, req.salt.as_deref())?;
+    let chief_raw = req.chief_complaint.trim();
+    if chief_raw.is_empty() {
+        return Err("请填写本次复诊主诉或反馈主诉".to_string());
+    }
+
+    // Ensure L2 exists or update it with latest profile
+    if let Some(l2) = req.updated_l2_profile {
+        let clean_l2 = sanitize_l2_profile(l2);
+        state
+            .stores
+            .patient_memory
+            .upsert_l2_profile(&patient_id, true, &clean_l2)
+            .await
+            .map_err(|e| e.to_string())?;
+    } else if state
+        .stores
+        .patient_memory
+        .get_l2_profile(&patient_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .is_none()
+    {
+        state
+            .stores
+            .patient_memory
+            .upsert_l2_profile(
+                &patient_id,
+                true,
+                &L2Profile {
+                    age_group: "unknown".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    let outcome_prefix = req.outcome_status.trim();
+    let scrubbed_chief = scrub_pii(chief_raw).scrubbed_text;
+    let combined_summary_raw = if outcome_prefix.is_empty() {
+        req.feedback_summary.trim().to_string()
+    } else if req.feedback_summary.trim().is_empty() {
+        format!("[复诊转归: {outcome_prefix}] {scrubbed_chief}")
+    } else {
+        format!("[复诊转归: {outcome_prefix}] {}", req.feedback_summary.trim())
+    };
+    let scrubbed_summary = scrub_pii(&combined_summary_raw).scrubbed_text;
+
+    let department = if req.actual_department.trim().is_empty() {
+        "全科医学科".to_string()
+    } else {
+        req.actual_department.trim().to_string()
+    };
+
+    let symptoms: Vec<String> = req
+        .extracted_symptoms
+        .into_iter()
+        .map(|s| scrub_pii(s.trim()).scrubbed_text)
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+
+    let event = L3VisitEvent {
+        event_id: format!("evt_revisit_{}", uuid::Uuid::new_v4().simple()),
+        occurred_at: Utc::now(),
+        chief_complaint: scrubbed_chief,
+        extracted_symptoms: symptoms,
+        recommended_department: department,
+        urgency_level: req.urgency_level.clamp(1, 4),
+        summary: scrubbed_summary,
+    };
+
+    state
+        .stores
+        .patient_memory
+        .insert_l3_event(&patient_id, &event)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if let Ok(vec) = state
+        .embedder
+        .embed_one(&format!("{} {}", event.chief_complaint, event.summary))
+        .await
+    {
+        let _ = state
+            .stores
+            .patient_l3_vectors
+            .upsert_event_vector(&patient_id, &event, vec)
+            .await;
+    }
+
+    let patient_record = state
+        .stores
+        .patient_memory
+        .get_full_memory(&patient_id, 50)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "写入复诊记录后读取患者档案失败".to_string())?;
+
+    Ok(RevisitFeedbackResult {
+        resolved_patient_id: patient_id,
+        created_event: event,
+        patient_record,
+    })
+}
+
+#[tauri::command]
+pub async fn submit_patient_revisit_feedback(
+    state: State<'_, StudioState>,
+    req: SubmitRevisitFeedbackRequest,
+) -> Result<RevisitFeedbackResult, String> {
+    submit_patient_revisit_feedback_impl(&state, req).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConsultationTriageRequest {
+    pub session_id: String,
+    pub serial_or_id: String,
+    #[serde(default)]
+    pub salt: Option<String>,
+    /// True = 新病人初诊（不携带任何旧记忆，新建档案并在问诊中更新）；False = 老病人复诊（携带完整 L2/L3 记忆）
+    #[serde(default)]
+    pub is_new_patient: bool,
+    pub utterance: String,
+    #[serde(default)]
+    pub region_code: Option<String>,
+    #[serde(default)]
+    pub target_population: Vec<TargetPopulation>,
+    /// Optional live L2 profile update provided by clinician/patient during consultation
+    #[serde(default)]
+    pub live_l2_update: Option<L2Profile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsultationTriageResponse {
+    pub resolved_patient_id: String,
+    pub is_new_patient: bool,
+    pub triage: TriageExecutionResult,
+    pub updated_patient_record: Option<PatientRecord>,
+    pub memory_updated: bool,
+}
+
+pub async fn run_consultation_triage_impl(
+    state: &StudioState,
+    req: ConsultationTriageRequest,
+) -> Result<ConsultationTriageResponse, String> {
+    let patient_id = resolve_canonical_patient_id(&req.serial_or_id, req.salt.as_deref())?;
+
+    let prior_session = state
+        .stores
+        .session_cache
+        .get_session(&req.session_id)
+        .await
+        .ok()
+        .flatten();
+
+    // If this is a brand-new patient on turn 1, ensure no stale prior memory is recalled
+    // (we only create their fresh L2 record once they fill live_l2_update or when triage completes)
+    let mut memory_updated = false;
+    if let Some(l2) = req.live_l2_update {
+        let clean_l2 = sanitize_l2_profile(l2);
+        state
+            .stores
+            .patient_memory
+            .upsert_l2_profile(&patient_id, true, &clean_l2)
+            .await
+            .map_err(|e| e.to_string())?;
+        memory_updated = true;
+    }
+
+    // For a brand-new patient with no prior record yet:
+    // - Stage 2 will naturally find no L2/L3 history (zero prior memory!)
+    // - Stage 5 will automatically create & save the new patient's L2 + L3 record when triage completes
+    let triage_req = TriageRequest {
+        session_id: req.session_id,
+        patient_id: patient_id.clone(),
+        tenant_id: "default".to_string(),
+        region_code: req.region_code,
+        utterance: req.utterance,
+        target_population: if req.target_population.is_empty() {
+            vec![TargetPopulation::Adult]
+        } else {
+            req.target_population
+        },
+        consent_long_term_memory: Some(true),
+        prior_session,
+        stream_tx: None,
+    };
+
+    let triage = state
+        .triage_engine
+        .run_triage(triage_req)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if triage.response.status == TriageStatus::Completed && triage.trace.consolidation_completed {
+        memory_updated = true;
+    }
+
+    let updated_patient_record = state
+        .stores
+        .patient_memory
+        .get_full_memory(&patient_id, 50)
+        .await
+        .ok()
+        .flatten();
+
+    Ok(ConsultationTriageResponse {
+        resolved_patient_id: patient_id,
+        is_new_patient: req.is_new_patient,
+        triage,
+        updated_patient_record,
+        memory_updated,
+    })
+}
+
+#[tauri::command]
+pub async fn run_consultation_triage(
+    state: State<'_, StudioState>,
+    req: ConsultationTriageRequest,
+) -> Result<ConsultationTriageResponse, String> {
+    run_consultation_triage_impl(&state, req).await
 }

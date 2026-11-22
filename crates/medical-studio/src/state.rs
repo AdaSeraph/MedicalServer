@@ -8,7 +8,8 @@ use medical_core::ecs::{
 };
 use medical_core::llm::{
     EmbeddingProvider, LlmProvider, MockEmbeddingProvider, MockLlmProvider, MockRerankProvider,
-    ModelRouter, ModelTier, ProviderConfig, ProviderKind, RerankProvider, RouterConfig,
+    ModelRouter, ModelTier, OpenAiCompatibleLlmProvider, ProviderConfig, ProviderKind,
+    RerankProvider, RouterConfig,
 };
 use medical_core::models::{
     EpidemicContext, Gender, L2Profile, L3VisitEvent, Season,
@@ -97,21 +98,31 @@ impl StudioState {
                 },
             )
             .await;
+        let demo_l3_event = L3VisitEvent {
+            event_id: "evt_studio_demo_01".to_string(),
+            occurred_at: Utc::now(),
+            chief_complaint: "夜间干咳胸闷".to_string(),
+            extracted_symptoms: vec!["干咳".to_string(), "胸闷".to_string()],
+            recommended_department: "呼吸内科".to_string(),
+            urgency_level: 2,
+            summary: "换季轻度哮喘发作风险，建议呼吸内科评估".to_string(),
+        };
         let _ = stores
             .patient_memory
-            .insert_l3_event(
-                demo_pid,
-                &L3VisitEvent {
-                    event_id: "evt_studio_demo_01".to_string(),
-                    occurred_at: Utc::now(),
-                    chief_complaint: "夜间干咳胸闷".to_string(),
-                    extracted_symptoms: vec!["干咳".to_string(), "胸闷".to_string()],
-                    recommended_department: "呼吸内科".to_string(),
-                    urgency_level: 2,
-                    summary: "换季轻度哮喘发作风险，建议呼吸内科评估".to_string(),
-                },
-            )
+            .insert_l3_event(demo_pid, &demo_l3_event)
             .await;
+        if let Ok(vec) = embedder
+            .embed_one(&format!(
+                "{} {}",
+                demo_l3_event.chief_complaint, demo_l3_event.summary
+            ))
+            .await
+        {
+            let _ = stores
+                .patient_l3_vectors
+                .upsert_event_vector(demo_pid, &demo_l3_event, vec)
+                .await;
+        }
 
         // Seed default LLM providers & router config for Module 6
         let fast_cfg = ProviderConfig {
@@ -222,7 +233,10 @@ impl StudioState {
                 cipher: cipher.clone(),
             }),
             model_router: model_router.clone(),
-            config: TriageEngineConfig::default(),
+            config: TriageEngineConfig {
+                await_consolidation: true,
+                ..TriageEngineConfig::default()
+            },
         };
         let triage_engine = Arc::new(TriageEngine::new(Arc::new(ArcSwap::from_pointee(resources))));
         let checkpoints = CheckpointManager::new(stores.checkpoints.clone());
@@ -246,7 +260,121 @@ impl StudioState {
         })
     }
 
-    /// Recompiles dictionaries & epidemics into `TriageEngine` via `ArcSwap`.
+    /// Returns true if a provider config is one of the built-in placeholder entries.
+    pub fn is_placeholder_provider(cfg: &ProviderConfig) -> bool {
+        let key = cfg.api_key.trim();
+        key == "sk-studio-placeholder" || key == "sk-intranet-vllm"
+    }
+
+    /// Builds a `ModelRouter` from real enabled providers in `stores.llm_providers`,
+    /// falling back to the offline mock router when no real provider is configured.
+    pub async fn build_active_model_router(&self) -> (Arc<ModelRouter>, bool, Vec<String>) {
+        let providers = self
+            .stores
+            .llm_providers
+            .list_providers()
+            .await
+            .unwrap_or_default();
+        let saved_router_cfg = self
+            .stores
+            .llm_providers
+            .get_router_config()
+            .await
+            .unwrap_or_default();
+
+        let mut real_cfgs: Vec<ProviderConfig> = providers
+            .into_iter()
+            .filter(|p| p.enabled && !Self::is_placeholder_provider(p))
+            .collect();
+        real_cfgs.sort_by_key(|p| p.priority);
+
+        if real_cfgs.is_empty() {
+            return (
+                self.model_router.clone(),
+                false,
+                vec!["离线 Mock 模型 (mock-fast-v1 / mock-reasoning-v1)".to_string()],
+            );
+        }
+
+        let mut instances: Vec<Arc<dyn LlmProvider>> = Vec::new();
+        let mut active_ids = Vec::new();
+        let mut active_labels = Vec::new();
+
+        for cfg in &real_cfgs {
+            if let Ok(prov) = OpenAiCompatibleLlmProvider::new(cfg.clone()) {
+                instances.push(Arc::new(prov) as Arc<dyn LlmProvider>);
+                active_ids.push(cfg.id.clone());
+                active_labels.push(format!("{} ({})", cfg.name, cfg.model));
+            }
+        }
+
+        if instances.is_empty() {
+            return (
+                self.model_router.clone(),
+                false,
+                vec!["离线 Mock 模型 (mock-fast-v1 / mock-reasoning-v1)".to_string()],
+            );
+        }
+
+        let fast_chain: Vec<String> = saved_router_cfg
+            .fast_chain
+            .iter()
+            .filter(|id| active_ids.contains(id))
+            .cloned()
+            .collect();
+        let reasoning_chain: Vec<String> = saved_router_cfg
+            .reasoning_chain
+            .iter()
+            .filter(|id| active_ids.contains(id))
+            .cloned()
+            .collect();
+
+        let effective_fast = if fast_chain.is_empty() {
+            real_cfgs
+                .iter()
+                .filter(|c| c.tier == ModelTier::Fast)
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            fast_chain
+        };
+        let effective_reasoning = if reasoning_chain.is_empty() {
+            let r: Vec<String> = real_cfgs
+                .iter()
+                .filter(|c| c.tier == ModelTier::Reasoning)
+                .map(|c| c.id.clone())
+                .collect();
+            if r.is_empty() {
+                active_ids.clone()
+            } else {
+                r
+            }
+        } else {
+            reasoning_chain
+        };
+
+        let router = Arc::new(ModelRouter::new(
+            instances,
+            RouterConfig {
+                fast_chain: if effective_fast.is_empty() {
+                    active_ids.clone()
+                } else {
+                    effective_fast
+                },
+                reasoning_chain: effective_reasoning,
+                default_timeout_ms: saved_router_cfg.default_timeout_ms.max(15_000),
+                circuit_breaker_failure_threshold: saved_router_cfg
+                    .circuit_breaker_failure_threshold
+                    .max(1),
+                circuit_breaker_cooldown_secs: saved_router_cfg
+                    .circuit_breaker_cooldown_secs
+                    .max(5),
+            },
+        ));
+        (router, true, active_labels)
+    }
+
+    /// Recompiles dictionaries, epidemics & active LLM router into `TriageEngine` via `ArcSwap`.
     pub async fn sync_ecs_resources(&self) -> Result<(), String> {
         let current = self.triage_engine.resources();
         let raw_dicts = self
@@ -265,11 +393,12 @@ impl StudioState {
                 .await
                 .map_err(|e| e.to_string())?,
         );
+        let (model_router, _, _) = self.build_active_model_router().await;
         self.triage_engine.reload_resources(TriageResources {
             dictionary: compiled_dict,
             epidemics,
             clients: current.clients.clone(),
-            model_router: current.model_router.clone(),
+            model_router,
             config: current.config.clone(),
         });
         Ok(())

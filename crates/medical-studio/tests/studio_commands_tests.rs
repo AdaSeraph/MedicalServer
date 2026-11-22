@@ -2,28 +2,38 @@ use std::path::PathBuf;
 
 use chrono::NaiveDate;
 use medical_core::llm::{MockLlmProvider, ModelTier, ProviderConfig, ProviderKind, RouterConfig};
-use medical_core::models::{EpidemicContext, RedFlagLevel, RedFlagRule, Season, SymptomSynonym};
+use medical_core::models::{
+    EpidemicContext, Gender, L2Profile, RedFlagLevel, RedFlagRule, Season, SymptomSynonym,
+};
 use medical_core::storage::IssueApiKeyRequest;
 use medical_pipeline::BookMetadataDefaults;
 use medical_studio::ai_normalize::{
-    BatchImportItem, ai_normalize_knowledge_with_provider, ai_normalize_patient_with_provider,
+    BatchImportItem, InspectionStatus, ai_inspect_knowledge_with_provider,
+    ai_inspect_patient_with_provider, ai_normalize_knowledge_with_provider,
+    ai_normalize_patient_with_provider,
 };
 use medical_studio::commands::{
     BatchKnowledgePreviewRequest, BatchPatientPreviewRequest, CommitKnowledgeDocumentsRequest,
-    CommitPatientRecordsRequest, KnowledgePreviewRequest, StartKnowledgeImportRequest,
+    CommitPatientRecordsRequest, ConsultationTriageRequest, ExportExchangePackageRequest,
+    ImportExchangePackageRequest, KnowledgePreviewRequest, PreviewExchangePackageRequest,
+    StartKnowledgeImportRequest, SubmitRevisitFeedbackRequest, UpsertPatientProfileRequest,
     WhiteboxTriageRequest, apply_masking_and_import_patients_impl,
     batch_preview_knowledge_items_impl, batch_preview_patient_items_impl,
-    commit_knowledge_documents_impl, commit_patient_records_impl, delete_epidemic_context_impl,
-    delete_llm_provider_impl,
-    delete_red_flag_rule_impl, delete_symptom_synonym_impl, export_import_errors_impl,
-    get_gateway_metrics_impl, get_import_job_status_impl, get_medical_dictionaries_impl,
-    get_router_config_impl, issue_api_key_impl, list_api_keys_impl, list_debug_patients_impl,
-    list_epidemic_contexts_impl, list_llm_providers_impl, notify_server_hot_reload_impl,
-    preview_knowledge_chunks_impl, preview_patient_import_impl, reset_ecs_debug_session_impl,
-    resume_knowledge_import_impl, revoke_api_key_impl, run_ecs_whitebox_triage_impl,
+    commit_knowledge_documents_impl, commit_patient_records_impl,
+    create_or_update_patient_profile_impl, delete_epidemic_context_impl, delete_llm_provider_impl,
+    delete_red_flag_rule_impl, delete_symptom_synonym_impl, export_exchange_package_impl,
+    export_import_errors_impl, get_ecs_runtime_status_impl, get_gateway_metrics_impl,
+    get_import_job_status_impl, get_knowledge_categories_impl, get_medical_dictionaries_impl,
+    get_router_config_impl, import_exchange_package_impl, issue_api_key_impl, list_api_keys_impl,
+    list_debug_patients_impl, list_epidemic_contexts_impl, list_knowledge_documents_impl,
+    list_llm_providers_impl, list_patient_summaries_impl, lookup_patient_by_serial_impl,
+    notify_server_hot_reload_impl, preview_exchange_package_impl, preview_knowledge_chunks_impl,
+    preview_patient_import_impl, reset_ecs_debug_session_impl, resume_knowledge_import_impl,
+    revoke_api_key_impl, run_consultation_triage_impl, run_ecs_whitebox_triage_impl,
     save_red_flag_rule_impl, save_router_config_impl, save_symptom_synonym_impl,
-    start_knowledge_import_impl, test_dictionary_sandbox_impl,
-    test_llm_provider_connectivity_impl, upsert_epidemic_context_impl, upsert_llm_provider_impl,
+    start_knowledge_import_impl, submit_patient_revisit_feedback_impl,
+    test_dictionary_sandbox_impl, test_llm_provider_connectivity_impl,
+    upsert_epidemic_context_impl, upsert_llm_provider_impl,
 };
 use medical_studio::StudioState;
 
@@ -555,4 +565,309 @@ async fn test_ai_batch_normalize_and_commit_knowledge_and_patients() {
     .unwrap();
     assert_eq!(rule_pat.records.len(), 1);
     assert!(rule_pat.records[0].patient_id.starts_with("pat_sha256_"));
+}
+
+#[tokio::test]
+async fn test_knowledge_categories_ai_inspection_exchange_and_ecs_linkage() {
+    let state_a = StudioState::new_offline().await.unwrap();
+    let root = workspace_root();
+
+    // 1. Seed knowledge into User A's studio and verify existing categories
+    let jsonl_path = root.join("e2e/fixtures/knowledge/knowledge_100.jsonl");
+    start_knowledge_import_impl(
+        &state_a,
+        StartKnowledgeImportRequest {
+            job_id: "job_cat_01".to_string(),
+            file_path: jsonl_path.to_string_lossy().to_string(),
+            tenant_namespace: "default".to_string(),
+            defaults: BookMetadataDefaults::default(),
+            custom_rule: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let cats = get_knowledge_categories_impl(&state_a, None).await.unwrap();
+    assert_eq!(cats.total_documents, 100);
+    assert!(!cats.departments.is_empty());
+    let first_dept = cats.departments[0].department.clone();
+    let dept_docs = list_knowledge_documents_impl(&state_a, Some(first_dept.clone()), None, Some(10))
+        .await
+        .unwrap();
+    assert!(!dept_docs.is_empty());
+    assert!(dept_docs.iter().all(|d| d.department == first_dept));
+
+    // 2. AI Inspection & Classification for Knowledge (with duplicate + category alignment)
+    let mut candidate = dept_docs[0].clone();
+    candidate.department = "心内科".to_string(); // simulate misaligned department name
+    let inspect_mock = MockLlmProvider::new("mock_inspect", "mock-inspect-v1", ModelTier::Reasoning)
+        .with_default_json(format!(
+            r#"{{
+              "inspections": [
+                {{
+                  "doc_id": "{}",
+                  "status": "warning",
+                  "suggested_department": "{}",
+                  "suggested_section_type": "clinical_manifestation",
+                  "category_tags": ["重点科室", "复核对齐"],
+                  "is_duplicate": true,
+                  "duplicate_of": "{}",
+                  "issues": ["科室名称与已有分类不一致，建议统一"],
+                  "recommendation": "建议对齐已有科室并去重"
+                }}
+              ]
+            }}"#,
+            candidate.doc_id, first_dept, candidate.doc_id
+        ));
+    let inspect_res = ai_inspect_knowledge_with_provider(
+        &inspect_mock,
+        &[candidate.clone()],
+        &dept_docs,
+        None,
+        10_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(inspect_res.summary.total, 1);
+    assert_eq!(inspect_res.summary.warning_count, 1);
+    assert_eq!(inspect_res.summary.duplicate_count, 1);
+    assert_eq!(inspect_res.items[0].suggested_department, first_dept);
+    assert_eq!(inspect_res.items[0].status, InspectionStatus::Warning);
+
+    // 3. AI Inspection & Classification for Patients
+    let csv_path = root.join("e2e/fixtures/patients/raw_pii_patients.csv");
+    let pat_preview = preview_patient_import_impl(csv_path.to_string_lossy().to_string(), None)
+        .await
+        .unwrap();
+    let pat_inspect_mock =
+        MockLlmProvider::new("mock_pat_ins", "mock-pat-ins-v1", ModelTier::Reasoning)
+            .with_default_json(format!(
+                r#"{{
+                  "inspections": [
+                    {{
+                      "patient_id": "{}",
+                      "status": "pass",
+                      "suggested_department": "呼吸内科",
+                      "risk_level": "medium",
+                      "category_tags": ["呼吸系统"],
+                      "pii_risk": false,
+                      "issues": [],
+                      "recommendation": "脱敏完整，分类准确"
+                    }}
+                  ]
+                }}"#,
+                pat_preview.records[0].patient_id
+            ));
+    let pat_ins = ai_inspect_patient_with_provider(
+        &pat_inspect_mock,
+        &pat_preview.records[..1],
+        &[first_dept.clone()],
+        None,
+        10_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(pat_ins.summary.pass_count, 1);
+    assert_eq!(pat_ins.items[0].suggested_department, "呼吸内科");
+
+    // 4. Peer Exchange Export from User A -> Preview & Import into User B
+    let exported = export_exchange_package_impl(
+        &state_a,
+        ExportExchangePackageRequest {
+            description: Some("用户A分享的强化学习包".to_string()),
+            include_knowledge: true,
+            knowledge_departments: vec![first_dept.clone()],
+            tenant_namespace: None,
+            include_patients: true,
+            include_epidemics: true,
+            include_dictionaries: true,
+            format: "json".to_string(),
+            output_path: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(exported.stats.knowledge_count > 0);
+    assert!(exported.stats.patient_count >= 1);
+    assert!(exported.stats.epidemic_count >= 1);
+    assert!(exported.filename.ends_with(".json"));
+
+    let state_b = StudioState::new_offline().await.unwrap();
+    let preview_b = preview_exchange_package_impl(
+        &state_b,
+        PreviewExchangePackageRequest {
+            content: exported.content.clone(),
+            tenant_namespace: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(preview_b.stats.knowledge_count, exported.stats.knowledge_count);
+
+    let import_b = import_exchange_package_impl(
+        &state_b,
+        ImportExchangePackageRequest {
+            package: preview_b.package,
+            tenant_namespace: "default".to_string(),
+            import_knowledge: true,
+            import_patients: true,
+            import_epidemics: true,
+            import_dictionaries: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(import_b.imported_knowledge as usize, exported.stats.knowledge_count);
+
+    // 5. ECS Runtime Status: initially mock, switches to real LLM when a real provider is configured
+    let st_before = get_ecs_runtime_status_impl(&state_b).await.unwrap();
+    assert!(!st_before.using_real_llm);
+    assert_eq!(st_before.knowledge_doc_count as usize, exported.stats.knowledge_count);
+
+    upsert_llm_provider_impl(
+        &state_b,
+        ProviderConfig {
+            id: "real_deepseek".to_string(),
+            name: "Real DeepSeek".to_string(),
+            kind: ProviderKind::DeepSeek,
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            api_key: "sk-real-user-key-12345".to_string(),
+            model: "deepseek-chat".to_string(),
+            tier: ModelTier::Reasoning,
+            timeout_ms: 8000,
+            is_intranet: false,
+            enabled: true,
+            priority: 1,
+        },
+    )
+    .await
+    .unwrap();
+
+    let st_after = get_ecs_runtime_status_impl(&state_b).await.unwrap();
+    assert!(st_after.using_real_llm);
+    assert!(st_after.active_providers.iter().any(|p| p.contains("Real DeepSeek")));
+
+    // 6. Verify ECS Whitebox Triage recalls both L2 profile + L3 visit events + RAG knowledge
+    let demo_patients = list_debug_patients_impl(&state_a).await.unwrap();
+    let triage_res = run_ecs_whitebox_triage_impl(
+        &state_a,
+        WhiteboxTriageRequest {
+            session_id: "sess_verify_linkage".to_string(),
+            patient_id: demo_patients[0].clone(),
+            utterance: "夜间干咳胸闷伴发热两天".to_string(),
+            region_code: Some("CN-110000".to_string()),
+            target_population: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    assert!(triage_res.trace.patient_profile.loaded);
+    assert!(!triage_res.trace.memory_recall.l3_events.is_empty());
+    assert!(!triage_res.trace.rag_evidence.items.is_empty());
+}
+
+#[tokio::test]
+async fn test_patient_revisit_feedback_and_new_patient_consultation() {
+    let state = StudioState::new_offline().await.unwrap();
+    let new_serial = "PAT-20261122-NEW01".to_string();
+
+    // 1. Lookup brand-new serial -> not found
+    let lookup_before = lookup_patient_by_serial_impl(&state, new_serial.clone(), None)
+        .await
+        .unwrap();
+    assert!(!lookup_before.found);
+    assert!(lookup_before.resolved_patient_id.starts_with("pat_sha256_"));
+
+    // 2. New patient consultation -> zero prior memory on turn 1, auto-creates L2+L3 on completion
+    let first_visit = run_consultation_triage_impl(
+        &state,
+        ConsultationTriageRequest {
+            session_id: "sess_new_pat_01".to_string(),
+            serial_or_id: new_serial.clone(),
+            salt: None,
+            is_new_patient: true,
+            utterance: "发热39度咳嗽咽痛两天".to_string(),
+            region_code: Some("CN-110000".to_string()),
+            target_population: vec![],
+            live_l2_update: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!first_visit.triage.trace.patient_profile.loaded);
+    assert!(first_visit.triage.trace.memory_recall.l3_events.is_empty());
+    assert!(first_visit.memory_updated);
+    let created = first_visit
+        .updated_patient_record
+        .expect("new patient record should be created automatically");
+    assert_eq!(created.l3_visit_events.len(), 1);
+
+    // 3. Lookup same serial -> now found with 1 visit
+    let lookup_after = lookup_patient_by_serial_impl(&state, new_serial.clone(), None)
+        .await
+        .unwrap();
+    assert!(lookup_after.found);
+    assert_eq!(lookup_after.record.unwrap().l3_visit_events.len(), 1);
+
+    // 4. Update L2 profile during consultation & submit revisit feedback
+    let updated_l2 = create_or_update_patient_profile_impl(
+        &state,
+        UpsertPatientProfileRequest {
+            serial_or_id: new_serial.clone(),
+            salt: None,
+            consent_long_term_memory: true,
+            l2_profile: L2Profile {
+                age_group: "30-39".to_string(),
+                gender: Gender::Male,
+                is_pregnant: false,
+                chronic_diseases: vec!["过敏性鼻炎".to_string()],
+                allergies: vec!["头孢".to_string()],
+                surgical_history: vec![],
+                long_term_medications: vec![],
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(updated_l2.l2_profile.allergies, vec!["头孢".to_string()]);
+
+    let fb = submit_patient_revisit_feedback_impl(
+        &state,
+        SubmitRevisitFeedbackRequest {
+            serial_or_id: new_serial.clone(),
+            salt: None,
+            outcome_status: "部分好转".to_string(),
+            chief_complaint: "体温降至37.3度但仍有阵发性干咳".to_string(),
+            extracted_symptoms: vec!["干咳".to_string()],
+            actual_department: "呼吸内科".to_string(),
+            urgency_level: 3,
+            feedback_summary: "按呼吸内科方案用药3天后退烧，复诊评估咳嗽恢复情况".to_string(),
+            updated_l2_profile: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(fb.patient_record.l3_visit_events.len(), 2);
+
+    // 5. Revisit consultation recalls BOTH updated L2 profile and L3 history
+    let revisit = run_consultation_triage_impl(
+        &state,
+        ConsultationTriageRequest {
+            session_id: "sess_revisit_pat_02".to_string(),
+            serial_or_id: new_serial.clone(),
+            salt: None,
+            is_new_patient: false,
+            utterance: "今天复诊还是有点干咳".to_string(),
+            region_code: Some("CN-110000".to_string()),
+            target_population: vec![],
+            live_l2_update: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(revisit.triage.trace.patient_profile.loaded);
+    assert!(!revisit.triage.trace.memory_recall.l3_events.is_empty());
+
+    let summaries = list_patient_summaries_impl(&state, Some(50)).await.unwrap();
+    assert!(summaries.iter().any(|s| s.patient_id == revisit.resolved_patient_id && s.visit_count >= 2));
 }

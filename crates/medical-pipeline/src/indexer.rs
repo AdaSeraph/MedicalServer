@@ -11,8 +11,8 @@ use medical_core::storage::{
     KnowledgeSearchQuery, KnowledgeVectorFilter, KnowledgeVectorStore, StorageError, StorageResult,
     VectorizedKnowledgeChunk,
 };
-use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::collector::{DocSetCollector, TopDocs};
+use tantivy::query::{AllQuery, QueryParser};
 use tantivy::schema::{
     Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value,
 };
@@ -155,6 +155,53 @@ impl TantivyKnowledgeIndex {
     /// Returns total committed documents in the Tantivy index.
     pub fn num_docs(&self) -> u64 {
         self.reader.searcher().num_docs()
+    }
+
+    /// Lists all committed `KnowledgeDocument`s in the index, optionally filtered by tenant namespace.
+    pub fn list_all_documents(
+        &self,
+        tenant_namespace: Option<&str>,
+    ) -> PipelineResult<Vec<KnowledgeDocument>> {
+        let searcher = self.reader.searcher();
+        let doc_addrs = searcher
+            .search(&AllQuery, &DocSetCollector)
+            .map_err(|e| PipelineError::Index(e.to_string()))?;
+
+        let mut seen = HashSet::new();
+        let mut docs = Vec::with_capacity(doc_addrs.len());
+        for doc_addr in doc_addrs {
+            let retrieved: TantivyDocument = searcher
+                .doc(doc_addr)
+                .map_err(|e| PipelineError::Index(e.to_string()))?;
+            let doc_ns = retrieved
+                .get_first(self.fields.tenant_namespace)
+                .and_then(|v| v.as_str())
+                .unwrap_or("default");
+            if let Some(ns) = tenant_namespace.map(str::trim).filter(|s| !s.is_empty()) {
+                let is_public = doc_ns == "default" || doc_ns == "public";
+                if !is_public && doc_ns != ns {
+                    continue;
+                }
+            }
+            let Some(payload_val) = retrieved
+                .get_first(self.fields.payload_json)
+                .and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            if let Ok(doc) = serde_json::from_str::<KnowledgeDocument>(payload_val)
+                && seen.insert(doc.doc_id.clone())
+            {
+                docs.push(doc);
+            }
+        }
+        docs.sort_by(|a, b| {
+            a.department
+                .cmp(&b.department)
+                .then_with(|| a.disease_name.cmp(&b.disease_name))
+                .then_with(|| a.doc_id.cmp(&b.doc_id))
+        });
+        Ok(docs)
     }
 
     /// Executes BM25 full-text search with hard metadata filters.
