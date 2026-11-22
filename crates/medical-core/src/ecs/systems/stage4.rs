@@ -2,19 +2,20 @@ use std::collections::HashSet;
 
 use bevy_ecs::prelude::{Query, Res, ResMut};
 
-use crate::models::{RedFlagLevel, TriageResultCard, TriageStatus};
+use crate::models::{RedFlagLevel, TargetPopulation, TriageResultCard, TriageStatus};
 use crate::privacy::{MEDICAL_DISCLAIMER, check_medical_output_violations, sanitize_medical_output};
 
 use super::super::components::{
-    ExtractedSymptoms, MemoryRecall, RagEvidence, RedFlagAlert, TriageResponse, TriageSlots,
+    ExtractedSymptoms, MemoryRecall, PatientIdentity, PatientProfile, RagEvidence, RedFlagAlert,
+    TriageResponse, TriageSlots,
 };
 use super::super::schedules::{Stage4DecisionScratch, Stage4LlmOutcome};
 
 pub fn slot_evaluation_system(
     mut scratch: ResMut<Stage4DecisionScratch>,
-    mut query: Query<(&MemoryRecall, &RagEvidence, &mut TriageSlots)>,
+    mut query: Query<(&RedFlagAlert, &MemoryRecall, &RagEvidence, &mut TriageSlots)>,
 ) {
-    let Ok((recall, evidence, mut slots)) = query.get_single_mut() else {
+    let Ok((alert, recall, evidence, mut slots)) = query.get_single_mut() else {
         return;
     };
 
@@ -23,7 +24,9 @@ pub fn slot_evaluation_system(
     let top_score = evidence.items.first().map(|i| i.final_score).unwrap_or(0.0);
     let has_epidemic = recall.active_epidemics.iter().any(|e| e.intensity > 0.0);
 
-    let should_converge = slots.turn >= slots.max_turns
+    // Urgent red-flag must immediately converge without delaying the patient with follow-up turns
+    let should_converge = alert.level == RedFlagLevel::Urgent
+        || slots.turn >= slots.max_turns
         || (slots.duration.is_some()
             && (slots.temperature_or_vitals.is_some() || !slots.accompanying_symptoms.is_empty())
             && slots.turn >= 2
@@ -63,6 +66,8 @@ pub fn slot_question_system(
     outcome: Res<Stage4LlmOutcome>,
     scratch: Res<Stage4DecisionScratch>,
     mut query: Query<(
+        &PatientIdentity,
+        &PatientProfile,
         &RedFlagAlert,
         &RagEvidence,
         &TriageSlots,
@@ -73,11 +78,14 @@ pub fn slot_question_system(
     let Stage4LlmOutcome::Success(llm_json) = outcome.as_ref() else {
         return;
     };
-    let Ok((alert, evidence, slots, symptoms, mut response)) = query.get_single_mut() else {
+    let Ok((identity, profile, alert, evidence, slots, symptoms, mut response)) =
+        query.get_single_mut()
+    else {
         return;
     };
 
-    let force_complete = slots.turn >= slots.max_turns
+    let force_complete = alert.level == RedFlagLevel::Urgent
+        || slots.turn >= slots.max_turns
         || scratch.should_converge
         || llm_json.action.eq_ignore_ascii_case("completed")
         || llm_json.action.eq_ignore_ascii_case("complete");
@@ -89,7 +97,7 @@ pub fn slot_question_system(
             .clone()
             .filter(|s| !s.trim().is_empty())
             .or_else(|| top_item.map(|i| i.department.clone()))
-            .unwrap_or_else(|| infer_department_from_symptoms(symptoms));
+            .unwrap_or_else(|| infer_department_from_symptoms(symptoms, identity, profile));
 
         let secondary_departments = if !llm_json.secondary_departments.is_empty() {
             llm_json.secondary_departments.clone()
@@ -158,8 +166,22 @@ pub fn slot_question_system(
     }
 }
 
+fn is_likely_non_medical_query(symptoms: &ExtractedSymptoms) -> bool {
+    if !symptoms.normalized_terms.is_empty() || !symptoms.red_flag_term_hits.is_empty() {
+        return false;
+    }
+    let lower = symptoms.normalized_utterance.to_ascii_lowercase();
+    const NON_MED_MARKERS: &[&str] = &[
+        "python", "javascript", "rust", "java", "c++", "sql", "代码", "算法", "快速排序",
+        "写一段", "写个程序", "股票", "彩票", "天气预报", "翻译成",
+    ];
+    NON_MED_MARKERS.iter().any(|m| lower.contains(m))
+}
+
 pub fn fallback_rule_triage_system(
     mut query: Query<(
+        &PatientIdentity,
+        &PatientProfile,
         &RedFlagAlert,
         &RagEvidence,
         &TriageSlots,
@@ -167,12 +189,42 @@ pub fn fallback_rule_triage_system(
         &mut TriageResponse,
     )>,
 ) {
-    let Ok((alert, evidence, slots, symptoms, mut response)) = query.get_single_mut() else {
+    let Ok((identity, profile, alert, evidence, slots, symptoms, mut response)) =
+        query.get_single_mut()
+    else {
         return;
     };
 
+    if is_likely_non_medical_query(symptoms) && alert.level == RedFlagLevel::None {
+        response.status = TriageStatus::Completed;
+        response.red_flag = RedFlagLevel::None;
+        response.turn = slots.turn;
+        response.max_turns = slots.max_turns.clamp(1, 4);
+        response.question = None;
+        response.quick_options.clear();
+        response.seasonal_context_applied.clear();
+        response.triage_result = Some(TriageResultCard {
+            primary_department: "全科医学科".to_string(),
+            secondary_departments: vec!["医院人工导诊台".to_string()],
+            urgency_level: 4,
+            summary: "您输入的内容似乎与医疗健康症状无关。本助手仅用于就医前科室导诊，如有身体不适，请描述您的具体症状、持续时间和伴随表现。".to_string(),
+            disclaimer: MEDICAL_DISCLAIMER.to_string(),
+        });
+        response.citations.clear();
+        response.is_fallback = true;
+        return;
+    }
+
     let top_item = evidence.items.first();
-    let (primary_department, secondary_departments, urgency_level) =
+    let has_confident_evidence = top_item
+        .map(|item| {
+            (!symptoms.normalized_terms.is_empty() && item.final_score >= 0.45)
+                || item.bm25_score.unwrap_or(0.0) > 0.0
+                || item.final_score >= 0.72
+        })
+        .unwrap_or(false);
+
+    let (primary_department, secondary_departments, urgency_level, low_confidence) =
         if alert.level == RedFlagLevel::Urgent {
             (
                 "急诊科".to_string(),
@@ -180,18 +232,40 @@ pub fn fallback_rule_triage_system(
                     .map(|i| vec![i.department.clone()])
                     .unwrap_or_default(),
                 1_u8,
+                false,
             )
-        } else if let Some(item) = top_item {
-            (
-                item.department.clone(),
-                item.secondary_departments.clone(),
-                2_u8,
-            )
+        } else if has_confident_evidence && let Some(item) = top_item {
+            let inferred = infer_department_from_symptoms(symptoms, identity, profile);
+            // Respect high-risk population specialty overrides (e.g., pregnant abdominal pain / pediatric)
+            let is_pregnant = identity.target_population.contains(&TargetPopulation::Pregnant)
+                || profile
+                    .l2_profile
+                    .as_ref()
+                    .map(|l| l.is_pregnant)
+                    .unwrap_or(false);
+            let is_child = identity.target_population.contains(&TargetPopulation::Child);
+            if (is_pregnant && inferred == "妇产科") || (is_child && inferred == "儿科") {
+                (inferred, vec![item.department.clone()], 2_u8, false)
+            } else {
+                (
+                    item.department.clone(),
+                    item.secondary_departments.clone(),
+                    2_u8,
+                    false,
+                )
+            }
         } else {
+            let inferred = infer_department_from_symptoms(symptoms, identity, profile);
+            let is_vague = inferred == "全科医学科";
             (
-                infer_department_from_symptoms(symptoms),
-                vec!["全科医学科".to_string()],
+                inferred,
+                if is_vague {
+                    vec!["医院人工导诊台".to_string()]
+                } else {
+                    vec!["全科医学科".to_string()]
+                },
                 3_u8,
+                is_vague,
             )
         };
 
@@ -201,9 +275,15 @@ pub fn fallback_rule_triage_system(
         symptoms.normalized_terms.join("、")
     };
 
-    let raw_summary = format!(
-        "当前智能推理通道繁忙，已为您切换本地医学规则快速导诊。根据您描述的{symptom_desc}，建议优先前往{primary_department}进一步排查评估。"
-    );
+    let raw_summary = if low_confidence {
+        format!(
+            "当前智能推理通道繁忙且您提供的症状信息较少，难以精准定位单一专科。建议您先前往{primary_department}或咨询医院人工导诊台，或补充具体不适部位、持续时间及伴随症状后重新问诊。"
+        )
+    } else {
+        format!(
+            "当前智能推理通道繁忙，已为您切换本地医学规则快速导诊。根据您描述的{symptom_desc}，建议优先前往{primary_department}进一步排查评估。"
+        )
+    };
     let sanitized_summary = sanitize_medical_output(&raw_summary, false).sanitized_text;
 
     response.status = TriageStatus::Completed;
@@ -220,7 +300,11 @@ pub fn fallback_rule_triage_system(
         summary: sanitized_summary,
         disclaimer: MEDICAL_DISCLAIMER.to_string(),
     });
-    response.citations = evidence.citations.clone();
+    response.citations = if low_confidence {
+        Vec::new()
+    } else {
+        evidence.citations.clone()
+    };
     response.is_fallback = true;
 }
 
@@ -343,12 +427,45 @@ fn default_question_for_slot(target_slot: Option<&str>, evidence: &RagEvidence) 
     })
 }
 
-fn infer_department_from_symptoms(symptoms: &ExtractedSymptoms) -> String {
+fn infer_department_from_symptoms(
+    symptoms: &ExtractedSymptoms,
+    identity: &PatientIdentity,
+    profile: &PatientProfile,
+) -> String {
     let text = format!(
         "{} {}",
         symptoms.normalized_utterance,
         symptoms.normalized_terms.join(" ")
     );
+    let is_pregnant = identity.target_population.contains(&TargetPopulation::Pregnant)
+        || profile
+            .l2_profile
+            .as_ref()
+            .map(|l| l.is_pregnant)
+            .unwrap_or(false);
+    let is_child = identity.target_population.contains(&TargetPopulation::Child);
+
+    if is_pregnant
+        && (text.contains("腹痛")
+            || text.contains("肚子痛")
+            || text.contains("出血")
+            || text.contains("胎动")
+            || text.contains("见红")
+            || text.contains("宫缩"))
+    {
+        return "妇产科".to_string();
+    }
+    if is_child
+        && (text.contains("发热")
+            || text.contains("发烧")
+            || text.contains("咳嗽")
+            || text.contains("腹泻")
+            || text.contains("皮疹")
+            || text.contains("呕吐"))
+    {
+        return "儿科".to_string();
+    }
+
     if text.contains("胸痛") || text.contains("心悸") || text.contains("心慌") {
         "心血管内科".to_string()
     } else if text.contains("呼吸困难")
@@ -356,6 +473,7 @@ fn infer_department_from_symptoms(symptoms: &ExtractedSymptoms) -> String {
         || text.contains("干咳")
         || text.contains("高热")
         || text.contains("咽痛")
+        || text.contains("发热")
     {
         "呼吸内科".to_string()
     } else if text.contains("上腹痛")
@@ -363,6 +481,7 @@ fn infer_department_from_symptoms(symptoms: &ExtractedSymptoms) -> String {
         || text.contains("腹泻")
         || text.contains("水样便")
         || text.contains("恶心")
+        || text.contains("呕吐")
     {
         "消化内科".to_string()
     } else if text.contains("头晕") || text.contains("头痛") || text.contains("麻木") {

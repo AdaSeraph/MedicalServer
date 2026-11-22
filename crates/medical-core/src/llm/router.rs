@@ -132,6 +132,29 @@ impl ModelRouter {
         self.total_failures_counter.load(Ordering::Relaxed)
     }
 
+    /// Summarizes overall router availability taking circuit-breaker states into account.
+    pub fn router_health_summary(&self) -> &'static str {
+        let metrics = self.health_metrics();
+        if metrics.is_empty() {
+            return "no_providers";
+        }
+        let open_count = metrics
+            .iter()
+            .filter(|m| matches!(m.state, CircuitBreakerState::Open { .. }))
+            .count();
+        let half_open_count = metrics
+            .iter()
+            .filter(|m| matches!(m.state, CircuitBreakerState::HalfOpen))
+            .count();
+        if open_count == metrics.len() {
+            "circuit_open"
+        } else if open_count > 0 || half_open_count > 0 {
+            "degraded"
+        } else {
+            "ready"
+        }
+    }
+
     pub fn health_metrics(&self) -> Vec<ProviderHealthMetrics> {
         self.health
             .iter()

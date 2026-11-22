@@ -208,13 +208,68 @@ pub fn decode_key_32(secret: &str) -> CryptoResult<[u8; 32]> {
     Ok(out)
 }
 
-/// Computes an anonymized salted SHA-256 patient identifier (`pat_sha256_<hex>`).
+/// Standard RFC 2104 HMAC-SHA256 using `sha2::Sha256`.
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    const BLOCK_SIZE: usize = 64;
+    let mut key_block = [0u8; BLOCK_SIZE];
+    if key.len() > BLOCK_SIZE {
+        let hashed = Sha256::digest(key);
+        key_block[..32].copy_from_slice(&hashed);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0x36u8; BLOCK_SIZE];
+    let mut opad = [0x5cu8; BLOCK_SIZE];
+    for i in 0..BLOCK_SIZE {
+        ipad[i] ^= key_block[i];
+        opad[i] ^= key_block[i];
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(data);
+    let inner_digest = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_digest);
+    let outer_digest = outer.finalize();
+
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&outer_digest);
+    out
+}
+
+/// Known insecure default salts that MUST be rejected in production deployments.
+pub const INSECURE_DEFAULT_SALTS: &[&str] = &[
+    "",
+    "medical-server-hospital-salt-v1",
+    "dev-patient-id-salt",
+    "e2e-patient-salt",
+    "default",
+    "dev",
+];
+
+/// Returns `true` if the salt is empty, too short (< 16 bytes), or matches a known public default.
+pub fn is_weak_or_default_salt(salt: &str) -> bool {
+    let trimmed = salt.trim();
+    trimmed.len() < 16
+        || INSECURE_DEFAULT_SALTS
+            .iter()
+            .any(|bad| bad.eq_ignore_ascii_case(trimmed))
+}
+
+/// Computes an anonymized HMAC-SHA256 patient identifier (`pat_sha256_<hex>`).
+/// Using HMAC-SHA256 prevents length-extension and strengthens keyed pseudonymization.
 pub fn hash_patient_id(raw_id: &str, salt: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(salt);
-    hasher.update(b":");
-    hasher.update(raw_id.trim().as_bytes());
-    let digest = hasher.finalize();
+    let digest = hmac_sha256(salt, raw_id.trim().as_bytes());
+    format!("pat_sha256_{}", hex::encode(digest))
+}
+
+/// Computes a cross-institution re-hashed patient identifier with a separate exchange domain key.
+pub fn rehash_patient_id_for_exchange(patient_id: &str, exchange_key: &[u8]) -> String {
+    let digest = hmac_sha256(exchange_key, patient_id.trim().as_bytes());
     format!("pat_sha256_{}", hex::encode(digest))
 }
 

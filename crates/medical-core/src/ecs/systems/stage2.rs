@@ -1,10 +1,11 @@
 use bevy_ecs::prelude::{Query, Res};
 use chrono::Utc;
 
-use crate::models::{ActiveEpidemicSummary, ConversationTurn};
+use crate::models::{ActiveEpidemicSummary, ConversationTurn, Gender, TargetPopulation};
 
 use super::super::components::{
-    ExtractedSymptoms, MemoryRecall, PatientProfile, RawUtterance, SessionMemory, TriageSlots,
+    ExtractedSymptoms, MemoryRecall, PatientIdentity, PatientProfile, RawUtterance, SessionMemory,
+    TriageSlots,
 };
 use super::super::resources::SharedTriageResources;
 use super::super::schedules::Stage2FetchedData;
@@ -13,6 +14,7 @@ pub fn memory_recall_inject_system(
     res: Res<SharedTriageResources>,
     fetched: Res<Stage2FetchedData>,
     mut query: Query<(
+        &mut PatientIdentity,
         &RawUtterance,
         &mut PatientProfile,
         &mut SessionMemory,
@@ -21,7 +23,7 @@ pub fn memory_recall_inject_system(
         &mut TriageSlots,
     )>,
 ) {
-    let Ok((raw, mut profile, mut session_mem, mut recall, mut symptoms, mut slots)) =
+    let Ok((mut identity, raw, mut profile, mut session_mem, mut recall, mut symptoms, mut slots)) =
         query.get_single_mut()
     else {
         return;
@@ -30,6 +32,55 @@ pub fn memory_recall_inject_system(
     if let Some(l2) = &fetched.l2_record {
         profile.loaded = true;
         profile.l2_profile = Some(l2.l2_profile.clone());
+
+        // Link L2 high-risk population attributes into PatientIdentity.target_population
+        if l2.l2_profile.is_pregnant
+            && !identity.target_population.contains(&TargetPopulation::Pregnant)
+        {
+            identity.target_population.push(TargetPopulation::Pregnant);
+        }
+        let age = l2.l2_profile.age_group.trim();
+        let is_child = age.starts_with("0-")
+            || age.starts_with("1-")
+            || age.starts_with("3-")
+            || age.starts_with("6-")
+            || age.starts_with("7-")
+            || age.contains("儿")
+            || age.contains("婴")
+            || age.contains("幼");
+        if is_child {
+            if !identity.target_population.contains(&TargetPopulation::Child) {
+                identity.target_population.push(TargetPopulation::Child);
+            }
+            // If only default Adult was set, replace with Child so pediatric guidelines aren't masked
+            if identity.target_population.len() == 2
+                && identity.target_population.contains(&TargetPopulation::Adult)
+            {
+                identity.target_population.retain(|p| *p != TargetPopulation::Adult);
+            }
+        }
+        let is_elderly = age.starts_with("60")
+            || age.starts_with("65")
+            || age.starts_with("70")
+            || age.starts_with("75")
+            || age.starts_with("80")
+            || age.contains("老");
+        if is_elderly && !identity.target_population.contains(&TargetPopulation::Elderly) {
+            identity.target_population.push(TargetPopulation::Elderly);
+        }
+        match l2.l2_profile.gender {
+            Gender::Female => {
+                if !identity.target_population.contains(&TargetPopulation::Female) {
+                    identity.target_population.push(TargetPopulation::Female);
+                }
+            }
+            Gender::Male => {
+                if !identity.target_population.contains(&TargetPopulation::Male) {
+                    identity.target_population.push(TargetPopulation::Male);
+                }
+            }
+            _ => {}
+        }
     } else {
         profile.loaded = false;
         profile.l2_profile = None;
@@ -93,12 +144,21 @@ pub fn memory_recall_inject_system(
         } else {
             raw.scrubbed_text.as_str()
         };
+        let has_family_epi_context = (current_text.contains("家人") || current_text.contains("同事"))
+            && (current_text.contains("发烧")
+                || current_text.contains("发热")
+                || current_text.contains("咳嗽")
+                || current_text.contains("感冒")
+                || current_text.contains("确诊")
+                || current_text.contains("阳性")
+                || current_text.contains("传染")
+                || current_text.contains("不适"));
         if slots.contact_history.is_none()
             && (current_text.contains("接触")
-                || current_text.contains("家人")
-                || current_text.contains("同事")
+                || has_family_epi_context
                 || current_text.contains("疫苗")
-                || current_text.contains("没有明确"))
+                || current_text.contains("没有明确")
+                || current_text.contains("无明确接触"))
         {
             slots.contact_history = Some(current_text.to_string());
         }

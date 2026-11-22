@@ -18,9 +18,56 @@ static RE_DURATION: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid duration regex")
 });
 static RE_TEMPERATURE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:3[5-9]|4[0-2])(?:\.\d)?\s*(?:℃|°C|度)|(?:高热|低热|发热|发烧)")
+    Regex::new(r"(?:3[5-9]|4[0-2])(?:\.\d)?\s*(?:℃|°C|度)|(?:体温\s*(?:3[5-9]|4[0-2])(?:\.\d)?)|(?:血压\s*\d{2,3}/\d{2,3})|(?:血氧\s*\d{2,3}%?)")
         .expect("valid temperature regex")
 });
+
+/// Returns `true` if `term` appears in `haystack` in at least one non-negated clause context.
+pub fn has_positive_term_occurrence(haystack: &str, term: &str) -> bool {
+    let t = term.trim();
+    if t.is_empty() || !haystack.contains(t) {
+        return false;
+    }
+    const NEGATION_CUES: &[&str] = &[
+        "没有", "也没有", "也没", "无", "未见", "未出现", "未", "否认", "不伴", "并非", "排除",
+        "不是", "不觉得", "并未", "没觉得", "不存在",
+    ];
+    const ADVERSATIVE_CUES: &[&str] = &["但是", "但", "而是", "却", "反而", "不过", "只是"];
+
+    for clause in haystack.split(|c: char| {
+        matches!(
+            c,
+            '，' | ',' | '。' | '；' | ';' | '！' | '!' | '？' | '?' | '\n' | '\r'
+        )
+    }) {
+        for (idx, _) in clause.match_indices(t) {
+            let prefix = &clause[..idx];
+            // Only examine up to 16 chars before the match inside the same clause,
+            // resetting after any adversative cue ("但是/但/而是/却").
+            let effective_prefix = ADVERSATIVE_CUES
+                .iter()
+                .filter_map(|adv| prefix.rfind(adv).map(|pos| pos + adv.len()))
+                .max()
+                .map(|cut| &prefix[cut..])
+                .unwrap_or(prefix);
+
+            let window: String = effective_prefix
+                .chars()
+                .rev()
+                .take(16)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+
+            let is_negated = NEGATION_CUES.iter().any(|neg| window.contains(neg));
+            if !is_negated {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 pub fn keyword_extraction_system(
     res: Res<SharedTriageResources>,
@@ -69,7 +116,8 @@ pub fn keyword_extraction_system(
             colloquial: matched_slice.to_string(),
             standard: standard.clone(),
         });
-        if seen_terms.insert(standard.clone()) {
+        if has_positive_term_occurrence(text, matched_slice) && seen_terms.insert(standard.clone())
+        {
             normalized_terms.push(standard);
         }
         last_end = mat.end();
@@ -78,9 +126,10 @@ pub fn keyword_extraction_system(
         normalized_utterance.push_str(&text[last_end..]);
     }
 
-    // Add standard terms directly present in raw or normalized utterance
+    // Add standard terms directly present in raw or normalized utterance (excluding negated terms)
     for syn in &dict.raw.symptom_synonyms {
-        if (text.contains(&syn.standard_term) || normalized_utterance.contains(&syn.standard_term))
+        if (has_positive_term_occurrence(text, &syn.standard_term)
+            || has_positive_term_occurrence(&normalized_utterance, &syn.standard_term))
             && seen_terms.insert(syn.standard_term.clone())
         {
             normalized_terms.push(syn.standard_term.clone());
@@ -88,13 +137,13 @@ pub fn keyword_extraction_system(
     }
 
     // Scan BOTH scrubbed and normalized utterances with Standard overlapping automaton,
-    // and resolve matched colloquial hits through synonym mappings so LeftmostLongest
-    // cannot shadow shorter red-flag synonyms.
+    // filtering out negated occurrences (e.g., "没有胸痛，也没有大汗和呼吸困难").
     let mut rf_hits = Vec::new();
     let mut rf_seen = HashSet::new();
     for haystack in [text, normalized_utterance.as_str()] {
         for mat in dict.red_flag_automaton.find_overlapping_iter(haystack) {
             if let Some(term) = dict.red_flag_terms.get(mat.pattern().as_usize())
+                && has_positive_term_occurrence(haystack, term)
                 && rf_seen.insert(term.clone())
             {
                 rf_hits.push(term.clone());
@@ -169,9 +218,6 @@ pub fn red_flag_guard_system(
             }
         }
     }
-    for t in &symptoms.tokens {
-        term_set.insert(t.as_str());
-    }
     for t in &slots.accompanying_symptoms {
         term_set.insert(t.as_str());
     }
@@ -186,12 +232,12 @@ pub fn red_flag_guard_system(
         let t = term.trim();
         !t.is_empty()
             && (term_set.contains(t)
-                || raw_text.contains(t)
-                || symptoms.normalized_utterance.contains(t)
+                || has_positive_term_occurrence(raw_text, t)
+                || has_positive_term_occurrence(&symptoms.normalized_utterance, t)
                 || slots
                     .chief_complaint
                     .as_deref()
-                    .map(|c| c.contains(t))
+                    .map(|c| has_positive_term_occurrence(c, t))
                     .unwrap_or(false))
     };
 

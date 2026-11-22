@@ -403,6 +403,44 @@ impl InMemoryDictionaryStore {
                 standard_term: "水样便".to_string(),
                 colloquial_terms: vec!["拉水".to_string(), "拉稀".to_string()],
             },
+            SymptomSynonym {
+                standard_term: "发热".to_string(),
+                colloquial_terms: vec![
+                    "发烧".to_string(),
+                    "高烧".to_string(),
+                    "低烧".to_string(),
+                    "烧起来".to_string(),
+                ],
+            },
+            SymptomSynonym {
+                standard_term: "咳嗽".to_string(),
+                colloquial_terms: vec![
+                    "干咳".to_string(),
+                    "咳痰".to_string(),
+                    "老咳".to_string(),
+                ],
+            },
+            SymptomSynonym {
+                standard_term: "腹痛".to_string(),
+                colloquial_terms: vec![
+                    "肚子疼".to_string(),
+                    "肚子痛".to_string(),
+                    "胃痛".to_string(),
+                    "胃疼".to_string(),
+                ],
+            },
+            SymptomSynonym {
+                standard_term: "头痛".to_string(),
+                colloquial_terms: vec!["头疼".to_string(), "偏头痛".to_string()],
+            },
+            SymptomSynonym {
+                standard_term: "腹泻".to_string(),
+                colloquial_terms: vec!["拉肚子".to_string()],
+            },
+            SymptomSynonym {
+                standard_term: "呕吐".to_string(),
+                colloquial_terms: vec!["吐了".to_string(), "干呕".to_string()],
+            },
         ];
         for s in default_synonyms {
             store.synonyms.insert(s.standard_term.clone(), s);
@@ -433,6 +471,91 @@ impl InMemoryDictionaryStore {
                     "口唇发绀".to_string(),
                 ],
                 alert_message: "检测到危急重症预警信号，请立即拨打 120 急救电话或就近急诊抢救！".to_string(),
+            },
+            RedFlagRule {
+                rule_id: "rf_acute_stroke".to_string(),
+                level: RedFlagLevel::Emergency120,
+                trigger_all_of: vec![],
+                trigger_any_of: vec![
+                    "偏瘫".to_string(),
+                    "口角歪斜".to_string(),
+                    "言语不清".to_string(),
+                    "说话不清".to_string(),
+                    "一侧肢体麻木".to_string(),
+                    "一侧肢体无力".to_string(),
+                    "半身不遂".to_string(),
+                    "突发失语".to_string(),
+                ],
+                alert_message: "您描述的症状高度提示急性脑卒中（中风）风险，黄金溶栓时间窗极其宝贵，请立即拨打 120 急救电话或火速前往具备卒中中心的医院急诊科！".to_string(),
+            },
+            RedFlagRule {
+                rule_id: "rf_suicide_self_harm".to_string(),
+                level: RedFlagLevel::Emergency120,
+                trigger_all_of: vec![],
+                trigger_any_of: vec![
+                    "自杀".to_string(),
+                    "轻生".to_string(),
+                    "割腕".to_string(),
+                    "服毒".to_string(),
+                    "过量服药".to_string(),
+                    "跳楼".to_string(),
+                    "吞安眠药".to_string(),
+                    "吞服安眠药".to_string(),
+                ],
+                alert_message: "检测到严重自伤/服毒危急风险！如已服药或受伤请立即拨打 120 急救并告知身边亲友；如需紧急心理危机干预，请立即拨打全国心理援助热线 12356 或 400-161-9995。".to_string(),
+            },
+            RedFlagRule {
+                rule_id: "rf_acute_gi_bleed".to_string(),
+                level: RedFlagLevel::Emergency120,
+                trigger_all_of: vec![],
+                trigger_any_of: vec![
+                    "大量呕血".to_string(),
+                    "呕血".to_string(),
+                    "大量便血".to_string(),
+                    "呕血黑便".to_string(),
+                    "失血性休克".to_string(),
+                    "休克".to_string(),
+                    "大出血".to_string(),
+                ],
+                alert_message: "您描述的症状高度提示急性消化道大出血或失血性休克风险，请立即禁食禁水并拨打 120 急救电话或就近急诊抢救！".to_string(),
+            },
+            RedFlagRule {
+                rule_id: "rf_anaphylaxis_dyspnea".to_string(),
+                level: RedFlagLevel::Emergency120,
+                trigger_all_of: vec![],
+                trigger_any_of: vec![
+                    "过敏性休克".to_string(),
+                    "喉头水肿".to_string(),
+                    "严重呼吸困难".to_string(),
+                    "喘不上气".to_string(),
+                    "窒息感".to_string(),
+                    "呼吸窘迫".to_string(),
+                ],
+                alert_message: "检测到急性气道梗阻、严重呼吸困难或过敏性休克风险，请立即保持气道通畅并拨打 120 急救电话！".to_string(),
+            },
+            RedFlagRule {
+                rule_id: "rf_obstetric_pediatric_emergency".to_string(),
+                level: RedFlagLevel::Emergency120,
+                trigger_all_of: vec![],
+                trigger_any_of: vec![
+                    "孕妇大出血".to_string(),
+                    "胎动消失".to_string(),
+                    "高热惊厥".to_string(),
+                    "全身抽搐".to_string(),
+                    "持续抽搐".to_string(),
+                ],
+                alert_message: "检测到产科或儿科危急重症信号，请立即拨打 120 急救电话或立即前往医院急诊抢救！".to_string(),
+            },
+            RedFlagRule {
+                rule_id: "rf_urgent_high_risk".to_string(),
+                level: RedFlagLevel::Urgent,
+                trigger_all_of: vec![],
+                trigger_any_of: vec![
+                    "持续高热不退".to_string(),
+                    "妊娠期阴道出血".to_string(),
+                    "孕妇腹痛出血".to_string(),
+                ],
+                alert_message: "您描述的症状属于高危紧急情况，建议立即前往医院急诊科或对应专科急诊评估，切勿拖延等待！".to_string(),
             },
         ];
         for r in default_rules {
@@ -901,7 +1024,10 @@ impl InMemoryKnowledgeStore {
             } else {
                 ns_trimmed
             };
-            if chunk.tenant_namespace != effective_ns && chunk.tenant_namespace != "default" {
+            if chunk.tenant_namespace != effective_ns
+                && chunk.tenant_namespace != "default"
+                && chunk.tenant_namespace != "public"
+            {
                 return false;
             }
         }
@@ -1015,7 +1141,7 @@ impl KnowledgeVectorStore for InMemoryKnowledgeStore {
                 let vscore = if !c.vector.is_empty() && !vector.is_empty() {
                     cosine_similarity(vector, &c.vector).max(0.0)
                 } else {
-                    0.5
+                    0.0
                 };
                 Self::to_hit(
                     &c.document,

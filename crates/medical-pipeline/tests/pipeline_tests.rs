@@ -111,7 +111,7 @@ fn test_medical_book_markdown_txt_docx_and_pdf_ocr_hook() {
     assert!(md_docs.iter().any(|d| d.disease_name == "流行性感冒" && d.department == "呼吸内科"));
     assert!(md_docs.iter().any(|d| d.disease_name == "急性心肌梗死" && d.department == "急诊科"));
     assert!(md_docs.iter().any(|d| d.section_type == SectionType::RedFlag));
-    assert!(md_docs.iter().any(|d| d.seasonal_tags.contains(&"influenza".to_string())));
+    assert!(md_docs.iter().any(|d| d.seasonal_tags.contains(&"influenza_season".to_string())));
 
     // 2. Plain text with custom markers
     let txt_path = root.join("e2e/fixtures/knowledge/custom_markers.txt");

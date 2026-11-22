@@ -124,7 +124,7 @@ function defaultDateRange(): { from: string; to: string } {
 
 const contexts = ref<EpidemicContextItem[]>([]);
 const serverUrl = ref('http://127.0.0.1:8080');
-const adminToken = ref('e2e-admin-secret');
+const adminToken = ref('');
 const showAdminToken = ref(false);
 const showServerSettings = ref(false);
 

@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use chrono::Utc;
-use docx_rs::{DocumentChild, ParagraphChild, RunChild};
+use docx_rs::{DocumentChild, ParagraphChild, RunChild, TableCellContent, TableChild, TableRowChild};
 use medical_core::crypto::hash_api_key;
+use medical_core::ecs::systems::stage1::has_positive_term_occurrence;
 use medical_core::models::{KnowledgeDocument, SectionType, SourceType, TargetPopulation};
 use medical_core::validation::Validate;
-use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -120,7 +121,27 @@ pub fn parse_markdown_book(
     defaults: &BookMetadataDefaults,
 ) -> PipelineResult<Vec<KnowledgeDocument>> {
     let cleaned = markdown.strip_prefix('\u{feff}').unwrap_or(markdown);
-    let parser = Parser::new(cleaned);
+    let mut md_opts = Options::empty();
+    md_opts.insert(Options::ENABLE_TABLES);
+
+    // Detect whether the document has any H1 headings; if it only uses H2 headings,
+    // promote H2 to disease-level trees instead of collapsing everything under source_title.
+    let has_h1 = Parser::new_ext(cleaned, md_opts).any(|ev| {
+        matches!(
+            ev,
+            Event::Start(Tag::Heading {
+                level: HeadingLevel::H1,
+                ..
+            })
+        )
+    });
+    let disease_heading_level = if has_h1 {
+        HeadingLevel::H1
+    } else {
+        HeadingLevel::H2
+    };
+
+    let parser = Parser::new_ext(cleaned, md_opts);
 
     let mut trees: Vec<ParsedDiseaseTree> = Vec::new();
     let mut current_disease: Option<ParsedDiseaseTree> = None;
@@ -129,6 +150,9 @@ pub fn parse_markdown_book(
 
     let mut in_heading: Option<HeadingLevel> = None;
     let mut heading_buf = String::new();
+    let mut in_table_cell = false;
+    let mut table_row_cells: Vec<String> = Vec::new();
+    let mut current_cell_buf = String::new();
 
     let flush_section = |disease: &mut Option<ParsedDiseaseTree>,
                          sec_title: &mut Option<String>,
@@ -151,7 +175,7 @@ pub fn parse_markdown_book(
             Event::End(TagEnd::Heading(_)) => {
                 let title = heading_buf.trim().to_string();
                 match in_heading.take() {
-                    Some(HeadingLevel::H1) => {
+                    Some(lvl) if lvl == disease_heading_level => {
                         flush_section(
                             &mut current_disease,
                             &mut current_section_title,
@@ -187,9 +211,39 @@ pub fn parse_markdown_book(
                 }
                 heading_buf.clear();
             }
+            Event::Start(Tag::TableRow) | Event::Start(Tag::TableHead) => {
+                table_row_cells.clear();
+            }
+            Event::Start(Tag::TableCell) => {
+                in_table_cell = true;
+                current_cell_buf.clear();
+            }
+            Event::End(TagEnd::TableCell) => {
+                in_table_cell = false;
+                table_row_cells.push(current_cell_buf.trim().to_string());
+                current_cell_buf.clear();
+            }
+            Event::End(TagEnd::TableRow) | Event::End(TagEnd::TableHead) => {
+                if !table_row_cells.is_empty() {
+                    if current_disease.is_none() {
+                        current_disease = Some(ParsedDiseaseTree {
+                            disease_name: defaults.source_title.clone(),
+                            sections: Vec::new(),
+                        });
+                    }
+                    if current_section_title.is_none() {
+                        current_section_title = Some("临床表现".to_string());
+                    }
+                    current_section_body.push_str(&table_row_cells.join(" | "));
+                    current_section_body.push('\n');
+                    table_row_cells.clear();
+                }
+            }
             Event::Text(text) | Event::Code(text) => {
                 if in_heading.is_some() {
                     heading_buf.push_str(&text);
+                } else if in_table_cell {
+                    current_cell_buf.push_str(&text);
                 } else {
                     if current_disease.is_none() {
                         current_disease = Some(ParsedDiseaseTree {
@@ -206,12 +260,17 @@ pub fn parse_markdown_book(
             Event::SoftBreak | Event::HardBreak => {
                 if in_heading.is_some() {
                     heading_buf.push(' ');
+                } else if in_table_cell {
+                    current_cell_buf.push(' ');
                 } else {
                     current_section_body.push('\n');
                 }
             }
             Event::End(TagEnd::Paragraph) | Event::End(TagEnd::Item) => {
-                if in_heading.is_none() && !current_section_body.ends_with('\n') {
+                if in_heading.is_none()
+                    && !in_table_cell
+                    && !current_section_body.ends_with('\n')
+                {
                     current_section_body.push('\n');
                 }
             }
@@ -343,40 +402,88 @@ pub fn parse_plain_text_book(
     build_chunks_from_trees(trees, defaults)
 }
 
-/// Extracts plain text (preserving Word Heading1/Heading2 as Markdown `#`/`##`) from `.docx` bytes.
+fn extract_paragraph_text(para: &docx_rs::Paragraph) -> String {
+    let mut para_text = String::new();
+    for pchild in &para.children {
+        match pchild {
+            ParagraphChild::Run(run) => {
+                for rchild in &run.children {
+                    match rchild {
+                        RunChild::Text(t) => para_text.push_str(&t.text),
+                        RunChild::Break(_) => para_text.push('\n'),
+                        RunChild::Tab(_) => para_text.push(' '),
+                        _ => {}
+                    }
+                }
+            }
+            ParagraphChild::Hyperlink(link) => {
+                for lchild in &link.children {
+                    if let ParagraphChild::Run(run) = lchild {
+                        for rchild in &run.children {
+                            if let RunChild::Text(t) = rchild {
+                                para_text.push_str(&t.text);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    para_text
+}
+
+/// Extracts plain text (preserving Word Heading1/Heading2 as Markdown `#`/`##` and parsing Word tables) from `.docx` bytes.
 pub fn extract_docx_text(bytes: &[u8]) -> PipelineResult<String> {
     let docx = docx_rs::read_docx(bytes)
         .map_err(|e| PipelineError::Parse(format!("docx-rs parse error: {e}")))?;
 
     let mut lines: Vec<String> = Vec::new();
     for child in &docx.document.children {
-        if let DocumentChild::Paragraph(para) = child {
-            let mut para_text = String::new();
-            for pchild in &para.children {
-                if let ParagraphChild::Run(run) = pchild {
-                    for rchild in &run.children {
-                        if let RunChild::Text(t) = rchild {
-                            para_text.push_str(&t.text);
+        match child {
+            DocumentChild::Paragraph(para) => {
+                let para_text = extract_paragraph_text(para);
+                let trimmed = para_text.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Some(style) = &para.property.style {
+                    let val = style.val.to_ascii_lowercase();
+                    if val.contains("heading1") || val == "1" {
+                        lines.push(format!("# {trimmed}"));
+                        continue;
+                    } else if val.contains("heading2") || val == "2" {
+                        lines.push(format!("## {trimmed}"));
+                        continue;
+                    }
+                }
+                lines.push(trimmed.to_string());
+            }
+            DocumentChild::Table(table) => {
+                for row_child in &table.rows {
+                    let TableChild::TableRow(row) = row_child;
+                    let mut cells = Vec::new();
+                    for cell_child in &row.cells {
+                        let TableRowChild::TableCell(cell) = cell_child;
+                        let mut cell_parts = Vec::new();
+                        for content in &cell.children {
+                            if let TableCellContent::Paragraph(para) = content {
+                                let t = extract_paragraph_text(para);
+                                let trimmed = t.trim();
+                                if !trimmed.is_empty() {
+                                    cell_parts.push(trimmed.to_string());
+                                }
+                            }
                         }
+                        cells.push(cell_parts.join(" "));
+                    }
+                    let row_line = cells.join(" | ");
+                    if !row_line.trim().is_empty() {
+                        lines.push(row_line);
                     }
                 }
             }
-            let trimmed = para_text.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            // Convert Word heading styles to Markdown headings when present
-            if let Some(style) = &para.property.style {
-                let val = style.val.to_ascii_lowercase();
-                if val.contains("heading1") || val == "1" {
-                    lines.push(format!("# {trimmed}"));
-                    continue;
-                } else if val.contains("heading2") || val == "2" {
-                    lines.push(format!("## {trimmed}"));
-                    continue;
-                }
-            }
-            lines.push(trimmed.to_string());
+            _ => {}
         }
     }
     Ok(lines.join("\n"))
@@ -437,12 +544,28 @@ pub fn extract_pdf_text(
         }
     }
 
-    // Scanned / image-only PDF fallback -> OCR plugin
-    if extracted.is_empty() {
+    // Detect mixed scanned PDFs (e.g. text-only cover page + scanned body pages):
+    // if multi-page PDF has very low average text density (< 30 chars/page), try OCR plugin.
+    let page_count = lopdf::Document::load_mem(bytes)
+        .map(|doc| doc.get_pages().len())
+        .unwrap_or(1);
+    let low_density_mixed_scan =
+        page_count > 1 && extracted.chars().count() < page_count.saturating_mul(30);
+
+    // Scanned / image-only / low-density mixed PDF fallback -> OCR plugin
+    if extracted.is_empty() || (low_density_mixed_scan && ocr.is_some()) {
         let plugin: &dyn OcrPlugin = ocr.unwrap_or(&NoopOcrPlugin);
-        extracted = plugin.extract_text(bytes)?;
-        if extracted.trim().is_empty() {
-            return Err(PipelineError::ScannedPdfNeedsOcr);
+        match plugin.extract_text(bytes) {
+            Ok(ocr_text) if !ocr_text.trim().is_empty() => {
+                extracted = ocr_text;
+            }
+            Ok(_) if extracted.is_empty() => {
+                return Err(PipelineError::ScannedPdfNeedsOcr);
+            }
+            Err(e) if extracted.is_empty() => {
+                return Err(e);
+            }
+            _ => {}
         }
     }
     Ok(extracted)
@@ -599,28 +722,49 @@ fn deterministic_chunk_id(source: &str, disease: &str, section: &str, seq: usize
 }
 
 fn extract_departments(text: &str) -> Vec<String> {
-    const KNOWN_DEPTS: &[&str] = &[
-        "急诊科",
-        "呼吸内科",
-        "发热门诊",
-        "心血管内科",
-        "消化内科",
-        "神经内科",
-        "内分泌科",
-        "儿科",
-        "妇产科",
-        "骨科",
-        "皮肤科",
-        "耳鼻咽喉科",
-        "眼科",
-        "感染科",
-        "肠道门诊",
-        "全科医学科",
+    const DEPT_ALIASES: &[(&str, &str)] = &[
+        ("急诊科", "急诊科"),
+        ("呼吸内科", "呼吸内科"),
+        ("呼吸科", "呼吸内科"),
+        ("发热门诊", "发热门诊"),
+        ("心血管内科", "心血管内科"),
+        ("心内科", "心血管内科"),
+        ("消化内科", "消化内科"),
+        ("神经内科", "神经内科"),
+        ("神内科", "神经内科"),
+        ("神经外科", "神经外科"),
+        ("内分泌科", "内分泌科"),
+        ("肾内科", "肾内科"),
+        ("风湿免疫科", "风湿免疫科"),
+        ("血液内科", "血液内科"),
+        ("肿瘤科", "肿瘤科"),
+        ("普通外科", "普外科"),
+        ("普外科", "普外科"),
+        ("胸外科", "胸外科"),
+        ("泌尿外科", "泌尿外科"),
+        ("儿科", "儿科"),
+        ("妇产科", "妇产科"),
+        ("妇科", "妇科"),
+        ("产科", "产科"),
+        ("骨科", "骨科"),
+        ("皮肤科", "皮肤科"),
+        ("耳鼻咽喉科", "耳鼻咽喉科"),
+        ("眼科", "眼科"),
+        ("口腔科", "口腔科"),
+        ("感染科", "感染科"),
+        ("肠道门诊", "肠道门诊"),
+        ("精神心理科", "精神心理科"),
+        ("康复医学科", "康复医学科"),
+        ("重症医学科", "重症医学科"),
+        ("全科医学科", "全科医学科"),
     ];
     let mut found: Vec<(usize, String)> = Vec::new();
-    for dept in KNOWN_DEPTS {
-        if let Some(pos) = text.find(dept) {
-            found.push((pos, (*dept).to_string()));
+    for (alias, canonical) in DEPT_ALIASES {
+        if let Some(pos) = text.find(alias)
+            && has_positive_term_occurrence(text, alias)
+            && !found.iter().any(|(_, d)| d == canonical)
+        {
+            found.push((pos, (*canonical).to_string()));
         }
     }
     found.sort_by_key(|(pos, _)| *pos);
@@ -635,6 +779,7 @@ fn extract_symptoms(disease_name: &str, text: &str) -> Vec<String> {
         "畏寒",
         "寒战",
         "头痛",
+        "头晕",
         "肌肉酸痛",
         "全身肌肉关节酸痛",
         "乏力",
@@ -647,17 +792,22 @@ fn extract_symptoms(disease_name: &str, text: &str) -> Vec<String> {
         "呼吸困难",
         "胸闷",
         "胸痛",
+        "心悸",
         "大汗",
         "左臂放射痛",
         "晕厥",
         "恶心",
         "呕吐",
         "腹痛",
+        "右下腹痛",
         "腹泻",
         "水样便",
         "脱水",
         "畏光",
         "血便",
+        "呕血",
+        "黑便",
+        "皮疹",
         "意识模糊",
         "口唇发绀",
         "Fever",
@@ -666,7 +816,7 @@ fn extract_symptoms(disease_name: &str, text: &str) -> Vec<String> {
     ];
     let mut found = Vec::new();
     for sym in COMMON_SYMPTOMS {
-        if text.contains(sym) && !found.iter().any(|s: &String| s == sym) {
+        if has_positive_term_occurrence(text, sym) && !found.iter().any(|s: &String| s == sym) {
             found.push((*sym).to_string());
         }
     }
@@ -684,37 +834,52 @@ fn extract_phrases(text: &str) -> Vec<String> {
             (2..=24).contains(&n)
         })
         .map(ToString::to_string)
-        .take(8)
+        .take(24)
         .collect()
 }
 
 fn infer_seasonal_tags(disease_name: &str, text: &str) -> Vec<String> {
     let mut tags = Vec::new();
     let combined = format!("{disease_name} {text}");
-    if combined.contains("流感") || combined.contains("Influenza") {
-        tags.push("influenza".to_string());
-        tags.push("winter".to_string());
+    if combined.contains("流感") || combined.contains("流行性感冒") || combined.contains("Influenza")
+    {
+        tags.push("influenza_season".to_string());
     }
     if combined.contains("支原体") {
-        tags.push("mycoplasma".to_string());
-        tags.push("autumn_winter".to_string());
+        tags.push("mycoplasma_season".to_string());
     }
     if combined.contains("胃肠炎") || combined.contains("诺如") {
-        tags.push("gastroenteritis".to_string());
+        tags.push("norovirus_season".to_string());
     }
     tags
 }
 
 fn infer_populations(text: &str, defaults: &[TargetPopulation]) -> Vec<TargetPopulation> {
-    let mut pops = defaults.to_vec();
-    if (text.contains("儿童") || text.contains("婴幼儿")) && !pops.contains(&TargetPopulation::Child) {
+    let mut pops = Vec::new();
+    let has_child = text.contains("儿童") || text.contains("婴幼儿") || text.contains("小儿");
+    let has_adult = text.contains("成人") || text.contains("成年");
+    let has_elderly = text.contains("老人") || text.contains("高龄") || text.contains("老年");
+    let has_pregnant_positive = text.contains("孕妇")
+        && !text.contains("孕妇禁用")
+        && !text.contains("孕妇忌用")
+        && !text.contains("孕妇慎用")
+        && !text.contains("妊娠期禁用");
+
+    if has_child {
         pops.push(TargetPopulation::Child);
     }
-    if (text.contains("老人") || text.contains("高龄")) && !pops.contains(&TargetPopulation::Elderly) {
+    if has_elderly {
         pops.push(TargetPopulation::Elderly);
     }
-    if text.contains("孕妇") && !pops.contains(&TargetPopulation::Pregnant) {
+    if has_pregnant_positive {
         pops.push(TargetPopulation::Pregnant);
+    }
+    if has_adult || pops.is_empty() {
+        for p in defaults {
+            if !pops.contains(p) {
+                pops.push(*p);
+            }
+        }
     }
     if pops.is_empty() {
         pops.push(TargetPopulation::Adult);

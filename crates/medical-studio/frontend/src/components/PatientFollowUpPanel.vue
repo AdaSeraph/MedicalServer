@@ -17,7 +17,7 @@ interface PatientSummary {
 }
 
 const mode = ref<'revisit' | 'new_patient'>('revisit');
-const salt = ref('medical-server-hospital-salt-v1');
+const salt = ref('');
 
 // Patient lookup & serial state
 const patientSummaries = ref<PatientSummary[]>([]);

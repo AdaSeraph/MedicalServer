@@ -898,7 +898,32 @@ pub async fn notify_server_hot_reload_impl(
         });
     };
 
-    let url = format!("{}/v1/admin/reload", base.trim_end_matches('/'));
+    let base_trimmed = base.trim_end_matches('/');
+    // Push local epidemic contexts to remote medical-server BEFORE triggering reload
+    // so remote production nodes actually receive Studio changes (no fake hot-reload).
+    let local_epidemics = state
+        .stores
+        .epidemics
+        .list_all()
+        .await
+        .unwrap_or_default();
+    let mut synced_epidemics = 0usize;
+    let epi_url = format!("{base_trimmed}/v1/admin/epidemics");
+    for ctx in &local_epidemics {
+        let mut epi_req = state.http_client.post(&epi_url).json(ctx);
+        if let Some(ref tok) = admin_token
+            && !tok.trim().is_empty()
+        {
+            epi_req = epi_req.bearer_auth(tok.trim());
+        }
+        if let Ok(resp) = epi_req.send().await
+            && resp.status().is_success()
+        {
+            synced_epidemics += 1;
+        }
+    }
+
+    let url = format!("{base_trimmed}/v1/admin/reload");
     let mut req = state.http_client.post(&url).json(&serde_json::json!({
         "reload_epidemics": true,
         "reload_dictionaries": true,
@@ -915,14 +940,17 @@ pub async fn notify_server_hot_reload_impl(
                 local_reloaded: true,
                 remote_notified: resp.status().is_success(),
                 remote_status: Some(status),
-                message: format!("已通知远程服务 {url}，HTTP {status}"),
+                message: format!(
+                    "已同步 {synced_epidemics}/{} 条流行病规则并通知远程服务 {url}，HTTP {status}",
+                    local_epidemics.len()
+                ),
             })
         }
         Err(e) => Ok(HotReloadNotifyResult {
             local_reloaded: true,
             remote_notified: false,
             remote_status: None,
-            message: format!("本地已热更新，远程通知失败: {e}"),
+            message: format!("本地已热更新，远程同步/通知失败: {e}"),
         }),
     }
 }
@@ -1216,13 +1244,31 @@ pub async fn list_debug_patients(state: State<'_, StudioState>) -> Result<Vec<St
 // Module 6: AI 大模型与开放 API 网关配置中心
 // ===========================================================================
 
+fn mask_api_key_for_ui(raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = t.chars().collect();
+    if chars.len() <= 8 {
+        return "****".to_string();
+    }
+    let prefix: String = chars[..3].iter().collect();
+    let suffix: String = chars[chars.len() - 4..].iter().collect();
+    format!("{prefix}****{suffix}")
+}
+
 pub async fn list_llm_providers_impl(state: &StudioState) -> Result<Vec<ProviderConfig>, String> {
-    state
+    let mut list = state
         .stores
         .llm_providers
         .list_providers()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    for p in &mut list {
+        p.api_key = mask_api_key_for_ui(&p.api_key);
+    }
+    Ok(list)
 }
 
 #[tauri::command]
@@ -1241,6 +1287,14 @@ pub async fn upsert_llm_provider_impl(
     config.base_url = config.base_url.trim().trim_end_matches('/').to_string();
     config.api_key = config.api_key.trim().to_string();
     config.model = config.model.trim().to_string();
+
+    // Preserve existing secret if frontend submitted the masked placeholder back unchanged
+    if config.api_key.contains("****")
+        && let Ok(existing_list) = state.stores.llm_providers.list_providers().await
+        && let Some(existing) = existing_list.into_iter().find(|p| p.id == config.id)
+    {
+        config.api_key = existing.api_key;
+    }
 
     if config.id.is_empty() {
         return Err("Provider ID 不能为空".to_string());
@@ -2307,12 +2361,26 @@ pub async fn lookup_patient_by_serial_impl(
         });
     }
 
-    // 2. Prefix match on stored patient_ids (convenient when user enters short suffix/prefix of pat_sha256_)
-    if trimmed.len() >= 8 {
-        if let Ok(all_ids) = state.stores.patient_memory.list_patient_ids(500, 0).await {
-            if let Some(matched_id) = all_ids
+    // 2. Safe prefix/suffix match on stored patient_ids:
+    // Strip "pat_sha256_" prefix first and require >= 12 hex chars so short prefixes like
+    // "pat_sha256_" can NEVER collide with a random patient. Reject ambiguous multiple hits.
+    let hex_part = trimmed.strip_prefix("pat_sha256_").unwrap_or(&trimmed);
+    if hex_part.len() >= 12 && hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+        if let Ok(all_ids) = state.stores.patient_memory.list_patient_ids(5000, 0).await {
+            let matches: Vec<String> = all_ids
                 .into_iter()
-                .find(|id| id.starts_with(&trimmed) || id.ends_with(&trimmed))
+                .filter(|id| {
+                    let id_hex = id.strip_prefix("pat_sha256_").unwrap_or(id);
+                    id_hex.starts_with(hex_part) || id_hex.ends_with(hex_part)
+                })
+                .collect();
+            if matches.len() > 1 {
+                return Err(format!(
+                    "临床串档拦截：序列号片段「{trimmed}」命中了 {} 位患者，请输入更完整的序列号以精确定位。",
+                    matches.len()
+                ));
+            }
+            if let Some(matched_id) = matches.into_iter().next()
                 && let Ok(Some(rec)) = state
                     .stores
                     .patient_memory
@@ -2627,6 +2695,8 @@ pub async fn run_consultation_triage_impl(
 ) -> Result<ConsultationTriageResponse, String> {
     let patient_id = resolve_canonical_patient_id(&req.serial_or_id, req.salt.as_deref())?;
 
+    // Guard against clinical record collision: if clinician selected "新病人初诊建档",
+    // block execution when a patient archive already exists for this ID (unless continuing same session).
     let prior_session = state
         .stores
         .session_cache
@@ -2634,6 +2704,27 @@ pub async fn run_consultation_triage_impl(
         .await
         .ok()
         .flatten();
+    if let Some(ref ps) = prior_session
+        && ps.patient_id != patient_id
+    {
+        return Err("会话归属校验失败：当前 session_id 属于其他患者，请开启新会话。".to_string());
+    }
+    if req.is_new_patient
+        && prior_session.is_none()
+        && state
+            .stores
+            .patient_memory
+            .get_l2_profile(&patient_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        return Err(
+            "临床串档拦截：该序列号在库中已存在既有患者档案！请切换至「老病人复诊」模式，或更换全新的患者序列号。"
+                .to_string(),
+        );
+    }
 
     // If this is a brand-new patient on turn 1, ensure no stale prior memory is recalled
     // (we only create their fresh L2 record once they fill live_l2_update or when triage completes)
@@ -2701,4 +2792,101 @@ pub async fn run_consultation_triage(
     req: ConsultationTriageRequest,
 ) -> Result<ConsultationTriageResponse, String> {
     run_consultation_triage_impl(&state, req).await
+}
+
+// ===========================================================================
+// Module 9: 临床治理、审计日志与安全删除闭环 (STD-02)
+// ===========================================================================
+
+pub async fn list_triage_audit_logs_impl(
+    state: &StudioState,
+    limit: Option<usize>,
+    tenant_id: Option<String>,
+) -> Result<Vec<medical_core::storage::TriageAuditLog>, String> {
+    state
+        .stores
+        .audit_logs
+        .query_recent(limit.unwrap_or(100).clamp(1, 500), tenant_id.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn list_triage_audit_logs(
+    state: State<'_, StudioState>,
+    limit: Option<usize>,
+    tenant_id: Option<String>,
+) -> Result<Vec<medical_core::storage::TriageAuditLog>, String> {
+    list_triage_audit_logs_impl(&state, limit, tenant_id).await
+}
+
+pub async fn delete_knowledge_documents_impl(
+    state: &StudioState,
+    doc_ids: Vec<String>,
+    tenant_namespace: Option<String>,
+) -> Result<u64, String> {
+    if doc_ids.is_empty() {
+        return Err("请至少指定一条要删除的知识库文档 ID".to_string());
+    }
+    let ns = tenant_namespace
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default");
+    let deleted_bm25 = state
+        .tantivy
+        .delete_by_doc_ids_in_namespace(&doc_ids, ns)
+        .map_err(|e| e.to_string())?;
+    let _ = state
+        .stores
+        .knowledge_vectors
+        .delete_by_doc_ids(&doc_ids)
+        .await;
+    Ok(deleted_bm25)
+}
+
+#[tauri::command]
+pub async fn delete_knowledge_documents(
+    state: State<'_, StudioState>,
+    doc_ids: Vec<String>,
+    tenant_namespace: Option<String>,
+) -> Result<u64, String> {
+    delete_knowledge_documents_impl(&state, doc_ids, tenant_namespace).await
+}
+
+pub async fn delete_patient_record_impl(
+    state: &StudioState,
+    patient_id: String,
+) -> Result<medical_core::storage::WipedMemoryStats, String> {
+    let pid = patient_id.trim();
+    if pid.is_empty() {
+        return Err("patient_id 不能为空".to_string());
+    }
+    let mut stats = state
+        .stores
+        .patient_memory
+        .delete_patient_memory(pid)
+        .await
+        .map_err(|e| e.to_string())?;
+    stats.qdrant_points_deleted = state
+        .stores
+        .patient_l3_vectors
+        .delete_patient_events(pid)
+        .await
+        .map_err(|e| e.to_string())?;
+    stats.l1_sessions_deleted = state
+        .stores
+        .session_cache
+        .delete_patient_sessions(pid)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(stats)
+}
+
+#[tauri::command]
+pub async fn delete_patient_record(
+    state: State<'_, StudioState>,
+    patient_id: String,
+) -> Result<medical_core::storage::WipedMemoryStats, String> {
+    delete_patient_record_impl(&state, patient_id).await
 }

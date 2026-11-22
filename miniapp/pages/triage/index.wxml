@@ -5,7 +5,41 @@
       <text class="title-main">智能分诊导诊助手</text>
       <text class="title-sub">急诊红线实时守护 · 医学知识库循证</text>
     </view>
-    <button class="memory-entry-btn" bindtap="goToMemoryPage">健康档案</button>
+    <view class="top-actions">
+      <button wx:if="{{sessionCompleted}}" class="new-triage-btn" bindtap="onStartNewTriage">开启新导诊</button>
+      <button class="memory-entry-btn" bindtap="goToMemoryPage">健康档案</button>
+    </view>
+  </view>
+
+  <!-- Persistent Emergency 120 Banner (remains after closing modal) -->
+  <view wx:if="{{showEmergencyBanner}}" class="emergency-top-banner" bindtap="onCall120">
+    <text class="emergency-banner-text">⚠️ 急危重症警示：请立即一键拨打 120 急救电话</text>
+  </view>
+
+  <!-- Urgent High-Risk Banner -->
+  <view wx:if="{{showUrgentBanner && !showEmergencyBanner}}" class="urgent-top-banner">
+    <text class="urgent-banner-text">🟠 紧急就诊提示：您当前症状风险较高，请立即前往医院急诊科评估，切勿拖延等待。</text>
+  </view>
+
+  <!-- Population & Region Selector Bar -->
+  <view class="context-bar">
+    <view class="pop-chips">
+      <block wx:for="{{populationOptions}}" wx:key="key">
+        <text
+          class="pop-chip {{selectedPopulation === item.key ? 'pop-chip-active' : ''}}"
+          bindtap="onSelectPopulation"
+          data-pop="{{item.key}}"
+        >{{item.label}}</text>
+      </block>
+    </view>
+    <picker mode="selector" range="{{regionOptions}}" range-key="name" value="{{regionIndex}}" bindchange="onRegionChange">
+      <view class="region-picker">📍 {{regionOptions[regionIndex].name}} ▾</view>
+    </picker>
+  </view>
+
+  <!-- Local Epidemic Gentle Notice -->
+  <view wx:if="{{epidemicBanner}}" class="epidemic-banner">
+    <text>{{epidemicBanner}}</text>
   </view>
 
   <!-- Chat messages scroll area -->
@@ -14,13 +48,23 @@
       <view id="msg_{{item.id}}" class="msg-row {{item.role === 'user' ? 'msg-right' : 'msg-left'}}">
         <view class="bubble {{item.role === 'user' ? 'bubble-user' : 'bubble-bot'}}">
           <text class="bubble-text">{{item.content}}</text>
+          <text wx:if="{{item.turnInfo}}" class="turn-hint">{{item.turnInfo}}</text>
+          <button
+            wx:if="{{item.failedUtterance}}"
+            class="retry-inline-btn"
+            bindtap="onRetryUtterance"
+            data-utterance="{{item.failedUtterance}}"
+          >点击重试</button>
         </view>
 
         <!-- Structured Department Recommendation Card -->
         <view wx:if="{{item.triage_result}}" class="triage-card card">
           <view class="card-header">
             <text class="dept-name">推荐科室：{{item.triage_result.primary_department}}</text>
-            <text class="urgency-tag urgency-l{{item.triage_result.urgency_level}}">紧急度 {{item.triage_result.urgency_level}} 级</text>
+            <text class="urgency-tag urgency-l{{item.triage_result.urgency_level}}">{{item.triage_result.urgency_label}}</text>
+          </view>
+          <view wx:if="{{item.is_fallback}}" class="fallback-notice">
+            <text>注：当前为本地医学规则快速导诊模式，如需更详尽评估请结合现场医生意见。</text>
           </view>
           <view wx:if="{{item.triage_result.secondary_departments.length > 0}}" class="secondary-depts">
             <text class="secondary-label">备选科室：</text>
@@ -31,12 +75,21 @@
           <view class="card-summary">
             <text>{{item.triage_result.summary}}</text>
           </view>
+          <view wx:if="{{item.citations && item.citations.length > 0}}" class="citations-box">
+            <text class="citations-title">循证医学参考：</text>
+            <block wx:for="{{item.citations}}" wx:for-item="cite" wx:key="doc_id">
+              <text class="citation-item">· {{cite.source_title}}（{{cite.disease_name}}）</text>
+            </block>
+          </view>
           <view class="disclaimer-box">
             <text>{{item.triage_result.disclaimer || disclaimerText}}</text>
           </view>
-          <button class="btn-primary reg-btn" bindtap="onGuideRegistration" data-dept="{{item.triage_result.primary_department}}">
-            前往预约挂号（{{item.triage_result.primary_department}}）
-          </button>
+          <view class="card-actions">
+            <button class="btn-primary reg-btn" bindtap="onGuideRegistration" data-dept="{{item.triage_result.primary_department}}">
+              挂号指引（{{item.triage_result.primary_department}}）
+            </button>
+            <button class="new-session-inline-btn" bindtap="onStartNewTriage">开启新导诊</button>
+          </view>
         </view>
       </view>
     </block>
@@ -45,25 +98,32 @@
   <!-- Quick Options Bar (2~4 one-tap reply buttons) -->
   <view wx:if="{{quickOptions.length > 0}}" class="quick-options-bar">
     <block wx:for="{{quickOptions}}" wx:key="*this">
-      <button class="quick-opt-btn" bindtap="onTapQuickOption" data-option="{{item}}">
+      <button class="quick-opt-btn" disabled="{{loading}}" bindtap="onTapQuickOption" data-option="{{item}}">
         {{item}}
       </button>
     </block>
   </view>
 
-  <!-- Bottom Input Bar -->
+  <!-- Bottom Input Bar (upgraded to auto-height textarea for elderly/detailed symptoms) -->
   <view class="input-bar">
-    <input
+    <textarea
       class="chat-input"
       value="{{inputText}}"
-      placeholder="请描述您的不适症状（如发烧、咳嗽）"
+      placeholder="请详细描述您的不适症状、持续时间或体温（最多500字）"
+      auto-height="true"
+      maxlength="500"
       confirm-type="send"
       bindinput="onInputChange"
       bindconfirm="onSendMessage"
     />
     <button class="send-btn" disabled="{{loading}}" bindtap="onSendMessage">
-      {{loading ? '思考中' : '发送'}}
+      {{loading ? '分析中' : '发送'}}
     </button>
+  </view>
+
+  <!-- Declined Consent Notice Banner -->
+  <view wx:if="{{consentDeclined}}" class="declined-bar" bindtap="onReopenConsent">
+    <text>您暂未同意服务说明，点击此处重新查看知情同意书以开始导诊</text>
   </view>
 
   <!-- First-Entry Privacy Consent & AI Disclaimer Modal -->
@@ -72,20 +132,35 @@
       <view class="modal-title">隐私知情同意与 AI 导诊免责声明</view>
       <view class="modal-body">
         <text>{{disclaimerText}}</text>
-        <text class="consent-desc">开启“长期健康档案记忆”后，系统将以匿名加密方式留存您的慢病、过敏史与既往分诊摘要，便于复诊时更精准导诊；您可随时在“健康档案”页一键物理清空注销。</text>
+        <text class="consent-desc">开启“长期健康档案记忆”后，系统将以匿名加密方式留存您的慢病、过敏史与既往分诊摘要，便于复诊时更精准导诊；您可随时在“健康档案”页一键清空注销。</text>
+        <text class="privacy-link" bindtap="onOpenPrivacyDetail">查看完整《隐私保护与数据使用说明》▸</text>
       </view>
       <view class="consent-check-row" bindtap="toggleConsentChoice">
         <checkbox checked="{{consentLongTermMemory}}" />
-        <text class="consent-label">我同意授权匿名长期健康记忆（可随时一键清空）</text>
+        <text class="consent-label">我同意授权匿名长期健康记忆（非必选，可随时清空）</text>
       </view>
       <button class="btn-primary modal-confirm-btn" bindtap="onAcceptDisclaimer">我已知晓并开始导诊</button>
+      <button class="modal-decline-btn" bindtap="onDeclineDisclaimer">暂不同意 / 仅浏览</button>
     </view>
   </view>
 
-  <!-- Emergency120 Red Alert Modal -->
+  <!-- Privacy Policy Detail Modal -->
+  <view wx:if="{{showPrivacyDetail}}" class="modal-mask">
+    <view class="modal-box card">
+      <view class="modal-title">隐私保护与数据使用说明</view>
+      <view class="modal-body">
+        <text>1. 匿名化处理：您的身份标识经不可逆加密哈希生成匿名编号，不以明文身份证号或手机号存储。</text>
+        <text>2. 撤回与删除权：您可随时在“健康档案”页关闭长期记忆开关，或点击一键清空永久删除所有记录。</text>
+        <text>3. 临床边界：本工具仅用于就医前分诊引导，不提供确诊或处方服务，急危重症请直接拨打 120。</text>
+      </view>
+      <button class="btn-primary modal-confirm-btn" bindtap="onClosePrivacyDetail">返回</button>
+    </view>
+  </view>
+
+  <!-- Emergency 120 Red Alert Modal (technical code removed) -->
   <view wx:if="{{showEmergencyModal}}" class="modal-mask">
     <view class="modal-box emergency-box">
-      <view class="emergency-title">急危重症红色警示（Emergency120）</view>
+      <view class="emergency-title">急危重症红色警示</view>
       <view class="emergency-body">
         <text>{{emergencyAlertMessage}}</text>
       </view>
@@ -93,7 +168,7 @@
         <text>{{disclaimerText}}</text>
       </view>
       <button class="btn-danger dial-120-btn" bindtap="onCall120">一键拨打 120 急救电话</button>
-      <button class="close-emergency-btn" bindtap="onCloseEmergencyModal">我已联系急救 / 关闭提示</button>
+      <button class="close-emergency-btn" bindtap="onCloseEmergencyModal">我已联系急救 / 收起弹窗</button>
     </view>
   </view>
 </view>

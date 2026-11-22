@@ -12,10 +12,29 @@ import ToastContainer from './components/ToastContainer.vue';
 import { initTheme, useTheme } from './composables/useTheme';
 
 type TabId = 'knowledge' | 'patients' | 'followup' | 'epidemic' | 'dictionary' | 'ecs' | 'gateway' | 'exchange';
+type OperatorRole = 'admin' | 'editor' | 'clinician';
 
 const activeTab = ref<TabId>('knowledge');
+const operatorRole = ref<OperatorRole>('admin');
 const sidebarCollapsed = ref(false);
 const { theme, toggleTheme } = useTheme();
+
+const roleAllowedTabs: Record<OperatorRole, TabId[]> = {
+  admin: ['knowledge', 'patients', 'followup', 'epidemic', 'dictionary', 'ecs', 'gateway', 'exchange'],
+  editor: ['knowledge', 'epidemic', 'dictionary', 'ecs', 'exchange'],
+  clinician: ['followup', 'patients', 'ecs'],
+};
+
+const visibleNavItems = computed(() =>
+  navItems.filter((item) => roleAllowedTabs[operatorRole.value].includes(item.id)),
+);
+
+function setOperatorRole(role: OperatorRole) {
+  operatorRole.value = role;
+  if (!roleAllowedTabs[role].includes(activeTab.value)) {
+    activeTab.value = roleAllowedTabs[role][0];
+  }
+}
 
 const navItems: Array<{
   id: TabId;
@@ -160,7 +179,7 @@ onBeforeUnmount(() => {
       <!-- Navigation -->
       <nav class="p-2.5 space-y-1 flex-1 overflow-y-auto">
         <button
-          v-for="item in navItems"
+          v-for="item in visibleNavItems"
           :key="item.id"
           @click="activeTab = item.id"
           :title="sidebarCollapsed ? `${item.label} (Ctrl+${item.shortcut})` : item.desc"
@@ -205,6 +224,19 @@ onBeforeUnmount(() => {
           <span v-if="!sidebarCollapsed">{{ theme === 'dark' ? '切换医疗浅色模式' : '切换深色运维模式' }}</span>
         </button>
 
+        <div v-if="!sidebarCollapsed" class="space-y-1">
+          <label class="block text-[11px] text-slate-400 px-1">当前工作角色 (RBAC)</label>
+          <select
+            :value="operatorRole"
+            @change="setOperatorRole(($event.target as HTMLSelectElement).value as OperatorRole)"
+            class="w-full px-2.5 py-1.5 rounded-lg bg-slate-800 border border-slate-700 text-xs text-slate-200"
+          >
+            <option value="clinician">临床医生（复诊/脱敏/调试）</option>
+            <option value="editor">知识库编辑（知识/词典/流行病）</option>
+            <option value="admin">运维管理员（全部权限）</option>
+          </select>
+        </div>
+
         <div v-if="!sidebarCollapsed" class="flex items-center justify-between text-[11px] text-slate-500 px-1 pt-0.5">
           <span>Tauri 2.0 · Rust</span>
           <span>Ctrl+1~8 切换</span>
@@ -214,6 +246,9 @@ onBeforeUnmount(() => {
 
     <!-- Main Workspace (KeepAlive preserves queue, preview & debug state across tab switches) -->
     <main class="flex-1 p-6 overflow-y-auto min-w-0">
+      <div class="mb-4 px-3.5 py-2 rounded-lg border border-amber-500/40 bg-amber-950/30 text-amber-200 text-xs flex items-center justify-between gap-2">
+        <span>⚠️ 当前运行于【离线内存沙盒模式】：本地录入数据在软件重启后会清空，检索/重排组件为 Mock；请通过“数据导出”或配置远端 medical-server 同步持久化。</span>
+      </div>
       <KeepAlive>
         <component :is="currentComponent" />
       </KeepAlive>

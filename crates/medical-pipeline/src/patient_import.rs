@@ -3,7 +3,7 @@ use std::io::Cursor;
 use std::path::Path;
 
 use calamine::{Data, Reader, open_workbook_auto, open_workbook_auto_from_rs};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use medical_core::crypto::{hash_api_key, hash_patient_id};
 use medical_core::models::{Gender, L2Profile, L3VisitEvent, PatientRecord};
 use medical_core::privacy::scrub_pii;
@@ -26,7 +26,7 @@ impl Default for PatientMaskingConfig {
     fn default() -> Self {
         Self {
             salt: b"medical-server-hospital-salt-v1".to_vec(),
-            default_consent: true,
+            default_consent: false,
         }
     }
 }
@@ -137,7 +137,17 @@ pub fn detect_pii_columns(headers: &[String]) -> PiiColumnDetection {
             || lower.contains("mobile")
             || lower.contains("住址")
             || lower.contains("地址")
-            || lower.contains("address");
+            || lower.contains("address")
+            || lower.contains("住院号")
+            || lower.contains("病案号")
+            || lower.contains("门诊号")
+            || lower.contains("医保")
+            || lower.contains("床号")
+            || lower.contains("邮箱")
+            || lower.contains("email")
+            || lower.contains("联系人")
+            || lower.contains("微信")
+            || lower.contains("出生日期");
         if is_pii {
             detected.push(h.clone());
         }
@@ -400,13 +410,57 @@ fn mask_raw_rows_parallel(
         .map(|row| mask_single_row(row, config))
         .collect();
 
-    let mut records = Vec::with_capacity(results.len());
+    let mut merged: HashMap<String, PatientRecord> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
     for res in results {
         match res {
-            Ok(rec) => records.push(rec),
+            Ok(rec) => {
+                if let Some(existing) = merged.get_mut(&rec.patient_id) {
+                    // Merge L2 lists safely (union) instead of overwriting allergies/chronic history
+                    existing.consent_long_term_memory =
+                        existing.consent_long_term_memory && rec.consent_long_term_memory;
+                    existing.l2_profile.is_pregnant |= rec.l2_profile.is_pregnant;
+                    for item in rec.l2_profile.chronic_diseases {
+                        if !existing.l2_profile.chronic_diseases.contains(&item) {
+                            existing.l2_profile.chronic_diseases.push(item);
+                        }
+                    }
+                    for item in rec.l2_profile.allergies {
+                        if !existing.l2_profile.allergies.contains(&item) {
+                            existing.l2_profile.allergies.push(item);
+                        }
+                    }
+                    for item in rec.l2_profile.surgical_history {
+                        if !existing.l2_profile.surgical_history.contains(&item) {
+                            existing.l2_profile.surgical_history.push(item);
+                        }
+                    }
+                    for item in rec.l2_profile.long_term_medications {
+                        if !existing.l2_profile.long_term_medications.contains(&item) {
+                            existing.l2_profile.long_term_medications.push(item);
+                        }
+                    }
+                    for ev in rec.l3_visit_events {
+                        if !existing
+                            .l3_visit_events
+                            .iter()
+                            .any(|e| e.event_id == ev.event_id)
+                        {
+                            existing.l3_visit_events.push(ev);
+                        }
+                    }
+                } else {
+                    order.push(rec.patient_id.clone());
+                    merged.insert(rec.patient_id.clone(), rec);
+                }
+            }
             Err(err) => failed_rows.push(err),
         }
     }
+    let records: Vec<PatientRecord> = order
+        .into_iter()
+        .filter_map(|id| merged.remove(&id))
+        .collect();
 
     Ok(PatientImportReport {
         records,
@@ -417,7 +471,8 @@ fn mask_raw_rows_parallel(
 }
 
 fn mask_single_row(row: &RawPatientRow, config: &PatientMaskingConfig) -> Result<PatientRecord, String> {
-    // Derive deterministic salted SHA-256 patient_id from id_card (preferred) or phone+name
+    // Derive deterministic HMAC-SHA256 patient_id from id_card (preferred) or name+phone.
+    // Never derive an ID from a bare phone number with empty name to avoid family phone collisions.
     let id_source = row
         .id_card
         .as_deref()
@@ -427,7 +482,7 @@ fn mask_single_row(row: &RawPatientRow, config: &PatientMaskingConfig) -> Result
         .or_else(|| {
             let phone = row.phone.as_deref().map(str::trim).unwrap_or("");
             let name = row.name.as_deref().map(str::trim).unwrap_or("");
-            if !phone.is_empty() || !name.is_empty() {
+            if !name.is_empty() {
                 Some(format!("{name}|{phone}"))
             } else {
                 None
@@ -435,7 +490,7 @@ fn mask_single_row(row: &RawPatientRow, config: &PatientMaskingConfig) -> Result
         })
         .ok_or_else(|| {
             format!(
-                "row {}: missing identifier (id_card/phone/name) to derive anonymized patient_id",
+                "row {}: missing identifier (require id_card, or non-empty name with optional phone)",
                 row.row_index
             )
         })?;
@@ -479,12 +534,15 @@ fn mask_single_row(row: &RawPatientRow, config: &PatientMaskingConfig) -> Result
 
     let mut l3_visit_events = Vec::new();
     if let Some(raw_cc) = row.chief_complaint.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        let occurred_at = row
-            .occurred_at
-            .as_deref()
-            .and_then(|s| DateTime::parse_from_rfc3339(s.trim()).ok())
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(Utc::now);
+        let occurred_at = match row.occurred_at.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw_dt) => parse_clinical_datetime(raw_dt).ok_or_else(|| {
+                format!(
+                    "row {}: invalid occurred_at datetime format '{}'",
+                    row.row_index, raw_dt
+                )
+            })?,
+            None => Utc::now(),
+        };
 
         let chief_complaint = scrub_row_text(raw_cc, row);
         let summary = row
@@ -548,19 +606,62 @@ fn mask_single_row(row: &RawPatientRow, config: &PatientMaskingConfig) -> Result
     Ok(record)
 }
 
-/// Scrubs general PII via `medical_core::privacy::scrub_pii` and explicitly strips
-/// the row's own name/id_card/phone/address from free-text clinical notes.
+fn parse_clinical_datetime(raw: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y/%m/%d %H:%M",
+    ] {
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(raw, fmt) {
+            return Some(DateTime::from_naive_utc_and_offset(ndt, Utc));
+        }
+    }
+    for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"] {
+        if let Ok(nd) = NaiveDate::parse_from_str(raw, fmt) {
+            if let Some(ndt) = nd.and_hms_opt(0, 0, 0) {
+                return Some(DateTime::from_naive_utc_and_offset(ndt, Utc));
+            }
+        }
+    }
+    None
+}
+
+/// Protected clinical vocabulary that MUST NEVER be destroyed by blind `name`/`address` string replacement.
+const PROTECTED_CLINICAL_TERMS: &[&str] = &[
+    "高热", "低热", "发热", "发烧", "胸痛", "腹痛", "头痛", "咳嗽", "呼吸困难", "心悸", "大汗",
+    "医院", "急诊", "门诊", "病房", "内科", "外科", "儿科", "妇产科", "高血压", "糖尿病",
+    "冠心病", "青霉素", "阿司匹林", "华法林", "二甲双胍", "头孢", "胰岛素",
+];
+
+/// Scrubs general PII via `medical_core::privacy::scrub_pii` and safely strips
+/// the row's own name/id_card/phone/address from free-text clinical notes without corrupting
+/// clinical terminology or single-character drug prefixes (e.g. "华法林" / "高热").
 fn scrub_row_text(input: &str, row: &RawPatientRow) -> String {
     let mut text = scrub_pii(input).scrubbed_text;
-    for (opt, placeholder) in [
-        (&row.id_card, "[ID_REDACTED]"),
-        (&row.phone, "[PHONE_REDACTED]"),
-        (&row.address, "[ADDRESS_REDACTED]"),
-        (&row.name, "[NAME_REDACTED]"),
+    for (opt, placeholder, min_chars, check_clinical) in [
+        (&row.id_card, "[ID_REDACTED]", 6usize, false),
+        (&row.phone, "[PHONE_REDACTED]", 7usize, false),
+        (&row.address, "[ADDRESS_REDACTED]", 4usize, true),
+        (&row.name, "[NAME_REDACTED]", 2usize, true),
     ] {
-        if let Some(val) = opt.as_deref().map(str::trim).filter(|s| !s.is_empty())
-            && text.contains(val)
+        let Some(val) = opt.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if val.chars().count() < min_chars {
+            continue;
+        }
+        if check_clinical
+            && PROTECTED_CLINICAL_TERMS
+                .iter()
+                .any(|term| *term == val || term.contains(val))
         {
+            continue;
+        }
+        if text.contains(val) {
             text = text.replace(val, placeholder);
         }
     }
@@ -639,15 +740,50 @@ pub fn bucket_age_group(raw: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    // Already bucketed (e.g. "30-39" or "70+")
-    if trimmed.contains('-') || trimmed.ends_with('+') {
-        return Some(trimmed.to_string());
+    // Validate pre-bucketed forms strictly: "<lo>-<hi>" (0 <= lo <= hi <= 130) or "<n>+" (0 <= n <= 120)
+    if let Some((lo_s, hi_s)) = trimmed.split_once('-') {
+        if !lo_s.is_empty()
+            && !hi_s.is_empty()
+            && lo_s.chars().all(|c| c.is_ascii_digit())
+            && hi_s.chars().all(|c| c.is_ascii_digit())
+            && let (Ok(lo), Ok(hi)) = (lo_s.parse::<u32>(), hi_s.parse::<u32>())
+            && lo <= hi
+            && hi <= 130
+        {
+            return Some(format!("{lo}-{hi}"));
+        }
+        return None;
     }
-    let age_num: u32 = trimmed
-        .trim_end_matches('岁')
-        .parse::<f64>()
-        .ok()
-        .map(|v| v.round() as u32)?;
+    if let Some(num_s) = trimmed.strip_suffix('+') {
+        if !num_s.is_empty()
+            && num_s.chars().all(|c| c.is_ascii_digit())
+            && let Ok(n) = num_s.parse::<u32>()
+            && n <= 120
+        {
+            return Some(format!("{n}+"));
+        }
+        return None;
+    }
+    // Infant age in months/days (e.g. "6个月", "10月", "28天")
+    if trimmed.contains("个月") || trimmed.ends_with('月') || trimmed.ends_with('天') {
+        let digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() && digits.parse::<u32>().is_ok() {
+            return Some("0-17".to_string());
+        }
+    }
+    // Extract leading numeric age (supports "40", "40岁", "40岁男性", "1岁3个月")
+    let num_part: String = trimmed
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    if num_part.is_empty() {
+        return None;
+    }
+    let val = num_part.parse::<f64>().ok()?;
+    if !val.is_finite() || val < 0.0 || val > 130.0 {
+        return None;
+    }
+    let age_num = val.round() as u32;
     let bucket = match age_num {
         0..=17 => "0-17",
         18..=29 => "18-29",

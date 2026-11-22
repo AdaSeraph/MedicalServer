@@ -823,21 +823,14 @@ async function handleExportErrors() {
             @click="handleAiNormalizePreview"
             class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-sm font-medium text-white"
           >
-            {{ isBusy ? '处理中...' : 'AI 批量规范化预览' }}
-          </button>
-          <button
-            :disabled="isBusy"
-            @click="handleOneClickAiImport"
-            class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-sm font-medium text-white"
-          >
-            一键 AI 规范化并入库
+            {{ isBusy ? '处理中...' : 'AI 批量规范化预览（需人工核对后入库）' }}
           </button>
           <button
             :disabled="isBusy || normalizedDocs.length === 0"
             @click="handleCommitNormalizedDocs"
             class="px-4 py-2 rounded-lg bg-teal-600 hover:bg-teal-500 disabled:opacity-40 text-sm font-medium text-white"
           >
-            确认写入数据库 ({{ normalizedDocs.length }})
+            人工核对无误 · 写入数据库 ({{ normalizedDocs.length }})
           </button>
           <button
             :disabled="isBusy"

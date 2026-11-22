@@ -2,27 +2,76 @@
   <view class="card section">
     <view class="section-title">隐私授权状态</view>
     <view class="consent-row">
-      <text>允许长期健康档案记忆（L2/L3 加密存储）</text>
+      <text>允许保存个人健康档案（便于复诊精准导诊）</text>
       <switch checked="{{consentLongTermMemory}}" bindchange="onToggleConsent" color="#0f766e" />
     </view>
-    <view class="pid-label">匿名档案号：{{patientId}}</view>
+    <view class="pid-label">匿名档案编号：{{maskedPatientId}}</view>
   </view>
 
-  <view wx:if="{{record}}" class="card section">
-    <view class="section-title">L2 长期健康画像（AES-256-GCM 加密）</view>
-    <view class="field-row"><text class="label">年龄段：</text><text>{{record.l2_profile.age_group || '未设置'}}</text></view>
-    <view class="field-row"><text class="label">慢病史：</text><text>{{chronicText}}</text></view>
-    <view class="field-row"><text class="label">过敏史：</text><text class="allergy-text">{{allergyText}}</text></view>
-    <view class="field-row"><text class="label">长期用药：</text><text>{{medicationText}}</text></view>
+  <view wx:if="{{loadError}}" class="card section error-box">
+    <text>{{loadError}}</text>
+    <button class="retry-btn" bindtap="onRetryLoad">重新加载</button>
   </view>
 
-  <view wx:if="{{record && record.l3_visit_events.length > 0}}" class="card section">
-    <view class="section-title">L3 历次分诊记录</view>
-    <block wx:for="{{record.l3_visit_events}}" wx:key="event_id">
+  <!-- Health Profile Display / Edit (MINI-07 & MINI-10) -->
+  <view wx:if="{{!loading}}" class="card section">
+    <view class="section-head-row">
+      <view class="section-title">基础健康信息</view>
+      <button wx:if="{{!editing}}" class="edit-btn" bindtap="onStartEdit">编辑信息</button>
+    </view>
+
+    <view wx:if="{{!editing}}">
+      <view class="field-row"><text class="label">年龄段：</text><text>{{(record && record.l2_profile.age_group) || ageGroups[ageGroupIndex]}}</text></view>
+      <view class="field-row"><text class="label">性别：</text><text>{{genderOptions[genderIndex].label}}</text></view>
+      <view class="field-row"><text class="label">孕产状态：</text><text>{{isPregnant ? '孕期 / 产褥期' : '否'}}</text></view>
+      <view class="field-row"><text class="label">慢病史：</text><text>{{chronicText}}</text></view>
+      <view class="field-row"><text class="label">过敏史：</text><text class="allergy-text">{{allergyText}}</text></view>
+      <view class="field-row"><text class="label">长期用药：</text><text>{{medicationText}}</text></view>
+    </view>
+
+    <view wx:else class="edit-form">
+      <view class="form-row">
+        <text class="label">年龄段：</text>
+        <picker mode="selector" range="{{ageGroups}}" value="{{ageGroupIndex}}" bindchange="onAgeGroupChange">
+          <view class="picker-val">{{ageGroups[ageGroupIndex]}} ▾</view>
+        </picker>
+      </view>
+      <view class="form-row">
+        <text class="label">性别：</text>
+        <picker mode="selector" range="{{genderOptions}}" range-key="label" value="{{genderIndex}}" bindchange="onGenderChange">
+          <view class="picker-val">{{genderOptions[genderIndex].label}} ▾</view>
+        </picker>
+      </view>
+      <view class="form-row">
+        <text class="label">是否孕期：</text>
+        <switch checked="{{isPregnant}}" bindchange="onPregnantChange" color="#0f766e" />
+      </view>
+      <view class="form-row-col">
+        <text class="label">慢病史（顿号或空格分隔，如：高血压、糖尿病）</text>
+        <input class="form-input" value="{{editChronic}}" placeholder="无则留空" bindinput="onEditChronicInput" />
+      </view>
+      <view class="form-row-col">
+        <text class="label">药物/食物过敏史（如：青霉素、头孢）</text>
+        <input class="form-input" value="{{editAllergy}}" placeholder="无则留空" bindinput="onEditAllergyInput" />
+      </view>
+      <view class="form-row-col">
+        <text class="label">长期用药（如：二甲双胍）</text>
+        <input class="form-input" value="{{editMedication}}" placeholder="无则留空" bindinput="onEditMedicationInput" />
+      </view>
+      <view class="edit-actions">
+        <button class="btn-primary" disabled="{{saving}}" bindtap="onSaveProfile">{{saving ? '保存中...' : '保存修改'}}</button>
+        <button class="cancel-btn" bindtap="onCancelEdit">取消</button>
+      </view>
+    </view>
+  </view>
+
+  <view wx:if="{{formattedEvents.length > 0}}" class="card section">
+    <view class="section-title">历次分诊记录</view>
+    <block wx:for="{{formattedEvents}}" wx:key="event_id">
       <view class="event-item">
         <view class="event-head">
           <text class="event-dept">{{item.recommended_department}}</text>
-          <text class="event-date">{{item.occurred_at}}</text>
+          <text class="event-date">{{item.formatted_time}}</text>
         </view>
         <view class="event-cc">主诉：{{item.chief_complaint}}</view>
         <view class="event-summary">{{item.summary}}</view>
@@ -30,12 +79,12 @@
     </block>
   </view>
 
-  <view wx:if="{{!record && !loading}}" class="card section empty-box">
-    <text>当前暂无长期健康记忆记录。</text>
+  <view wx:if="{{!record && !loading && !loadError}}" class="card section empty-box">
+    <text>当前暂无历史分诊记录，您可点击上方“编辑信息”预先维护过敏史与慢病史。</text>
   </view>
 
   <view class="section">
-    <button class="btn-danger" bindtap="onWipeMemory">一键清空并注销全部长期记忆</button>
-    <view class="wipe-hint">点击后将物理清除数据库 L2 画像、L3 历史事件、向量索引及当前会话缓存，不可恢复。</view>
+    <button class="btn-danger" bindtap="onWipeMemory">一键清空并注销全部健康记录</button>
+    <view class="wipe-hint">点击后将永久清除您的健康画像、历次分诊记录及当前对话缓存，不可恢复。</view>
   </view>
 </view>

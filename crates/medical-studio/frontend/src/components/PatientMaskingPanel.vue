@@ -34,8 +34,8 @@ const defaultPrompt = ref('');
 const showPromptEditor = ref(false);
 const preScrubPii = ref(true);
 
-const salt = ref('medical-server-hospital-salt-v1');
-const filePath = ref('e2e/fixtures/patients/raw_pii_patients.csv');
+const salt = ref('');
+const filePath = ref('');
 
 const isBusy = ref(false);
 const isInspecting = ref(false);
@@ -549,21 +549,14 @@ async function handleCommitLocalPath() {
             @click="handleAiNormalizePreview"
             class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-sm font-medium text-white"
           >
-            {{ isBusy ? '处理中...' : 'AI 批量规范化 + 脱敏预检' }}
-          </button>
-          <button
-            :disabled="isBusy"
-            @click="handleOneClickAiImport"
-            class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-sm font-medium text-white"
-          >
-            一键 AI 规范化并入库
+            {{ isBusy ? '处理中...' : 'AI 批量规范化 + 脱敏预检（需人工核对）' }}
           </button>
           <button
             :disabled="isBusy || normalizedRecords.length === 0"
             @click="handleCommitNormalizedRecords"
             class="px-4 py-2 rounded-lg bg-teal-600 hover:bg-teal-500 disabled:opacity-40 text-sm font-medium text-white"
           >
-            确认无明文 PII 并批量写入数据库 ({{ normalizedRecords.length }})
+            人工核对无明文 PII · 批量写入数据库 ({{ normalizedRecords.length }})
           </button>
           <button
             :disabled="isBusy"

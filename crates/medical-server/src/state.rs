@@ -9,8 +9,9 @@ use medical_core::ecs::{
     CompiledMedicalDictionary, InfraClients, TriageEngine, TriageEngineConfig, TriageResources,
 };
 use medical_core::llm::{
-    EmbeddingProvider, LlmProvider, MockEmbeddingProvider, MockLlmProvider, MockRerankProvider,
-    ModelRouter, ModelTier, ProviderConfig, ProviderKind, RerankProvider, RouterConfig,
+    EmbeddingProvider, HttpRerankProvider, LlmProvider, MockEmbeddingProvider, MockLlmProvider,
+    MockRerankProvider, ModelRouter, ModelTier, OpenAiCompatibleEmbeddingProvider, ProviderConfig,
+    ProviderKind, RerankProvider, RouterConfig,
 };
 use medical_core::models::{
     EpidemicContext, KnowledgeDocument, Season, SectionType, SourceType, TargetPopulation,
@@ -83,10 +84,20 @@ pub struct AppState {
 impl AppState {
     /// Builds `AppState` from `ServerConfig`, supporting both production clients and R5 offline mode.
     pub async fn build(config: ServerConfig) -> Result<Arc<Self>, String> {
-        let cipher = Arc::new(
-            FieldCipher::from_hex_or_base64(1, &config.field_encryption_key)
-                .unwrap_or_else(|_| FieldCipher::from_passphrase_for_dev(&config.field_encryption_key)),
-        );
+        config.validate_production_security()?;
+
+        let cipher = Arc::new(match FieldCipher::from_hex_or_base64(1, &config.field_encryption_key) {
+            Ok(c) => c,
+            Err(err) => {
+                if !config.offline_mode {
+                    return Err(format!(
+                        "invalid FIELD_ENCRYPTION_KEY in production mode (refusing silent dev fallback): {err}"
+                    ));
+                }
+                warn!(error = %err, "offline mode: deriving dev FieldCipher from passphrase");
+                FieldCipher::from_passphrase_for_dev(&config.field_encryption_key)
+            }
+        });
 
         let mut stores = CoreStores::in_memory(cipher.clone());
 
@@ -117,13 +128,56 @@ impl AppState {
                 stores.patient_l3_vectors = Arc::new(QdrantPatientL3Store::new(qclient));
             }
         }
-        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbeddingProvider::new(1024));
-        let reranker: Arc<dyn RerankProvider> = Arc::new(MockRerankProvider::new());
 
-        let tantivy = Arc::new(
+        let embedder: Arc<dyn EmbeddingProvider> = if !config.offline_mode
+            && let Some(ref emb_url) = config.embedding_base_url
+        {
+            Arc::new(
+                OpenAiCompatibleEmbeddingProvider::new(
+                    "prod_embedding",
+                    emb_url,
+                    &config.openai_api_key,
+                    &config.embedding_model,
+                    1024,
+                    8_000,
+                )
+                .map_err(|e| format!("failed to init embedding provider: {e}"))?,
+            )
+        } else {
+            Arc::new(MockEmbeddingProvider::new(1024))
+        };
+
+        let reranker: Arc<dyn RerankProvider> = if !config.offline_mode
+            && let Some(ref rerank_url) = config.rerank_base_url
+        {
+            Arc::new(
+                HttpRerankProvider::new(
+                    "prod_rerank",
+                    rerank_url,
+                    &config.openai_api_key,
+                    &config.rerank_model,
+                    6_000,
+                )
+                .map_err(|e| format!("failed to init rerank provider: {e}"))?,
+            )
+        } else {
+            Arc::new(MockRerankProvider::new())
+        };
+
+        let tantivy = Arc::new(if !config.offline_mode {
+            let dir = config
+                .tantivy_index_dir
+                .clone()
+                .unwrap_or_else(|| Path::new("data/tantivy_index").to_path_buf());
+            TantivyKnowledgeIndex::open_or_create(&dir)
+                .map_err(|e| format!("failed to init persistent tantivy index: {e}"))?
+        } else if let Some(ref dir) = config.tantivy_index_dir {
+            TantivyKnowledgeIndex::open_or_create(dir)
+                .map_err(|e| format!("failed to init persistent tantivy index: {e}"))?
+        } else {
             TantivyKnowledgeIndex::in_memory()
-                .map_err(|e| format!("failed to init tantivy index: {e}"))?,
-        );
+                .map_err(|e| format!("failed to init tantivy index: {e}"))?
+        });
         let indexer = Arc::new(
             DualWriteIndexer::new(
                 embedder.clone(),
@@ -145,31 +199,43 @@ impl AppState {
         // Build LLM ModelRouter
         let model_router = Arc::new(build_model_router(&config, &stores).await?);
 
-        // Seed default epidemic context + default medical knowledge
-        seed_default_epidemics(&stores).await;
-        seed_default_knowledge(&indexer).await;
+        // Seed default epidemic context + default medical knowledge in offline mode
+        // (in production mode, only seed explicitly configured seed_corpus_file / tenant_keys_file).
+        if config.offline_mode {
+            seed_default_epidemics(&stores).await;
+            seed_default_knowledge(&indexer).await;
 
-        // Seed from doc/schemas/data-collection-schema.json & e2e fixtures if available
-        let candidate_bundles = [
-            config.seed_corpus_file.clone(),
-            Some(Path::new("doc/schemas/data-collection-schema.json").to_path_buf()),
-            Some(Path::new("e2e/fixtures/knowledge/rag_corpus.json").to_path_buf()),
-        ];
-        for path in candidate_bundles.into_iter().flatten() {
-            if path.is_file() {
-                seed_from_json_file(&path, &indexer, &stores).await;
+            let candidate_bundles = [
+                config.seed_corpus_file.clone(),
+                Some(Path::new("doc/schemas/data-collection-schema.json").to_path_buf()),
+                Some(Path::new("e2e/fixtures/knowledge/rag_corpus.json").to_path_buf()),
+            ];
+            for path in candidate_bundles.into_iter().flatten() {
+                if path.is_file() {
+                    seed_from_json_file(&path, &indexer, &stores).await;
+                }
             }
-        }
 
-        // Seed multi-tenant API keys & tenant-scoped knowledge from MEDICAL_TENANT_KEYS_FILE
-        let tenant_file = config.tenant_keys_file.clone().or_else(|| {
-            let fallback = Path::new("e2e/fixtures/payloads/tenant_keys.json");
-            fallback.is_file().then(|| fallback.to_path_buf())
-        });
-        if let Some(tf) = tenant_file
-            && tf.is_file()
-        {
-            seed_tenants_file(&tf, &stores, &indexer).await;
+            let tenant_file = config.tenant_keys_file.clone().or_else(|| {
+                let fallback = Path::new("e2e/fixtures/payloads/tenant_keys.json");
+                fallback.is_file().then(|| fallback.to_path_buf())
+            });
+            if let Some(tf) = tenant_file
+                && tf.is_file()
+            {
+                seed_tenants_file(&tf, &stores, &indexer).await;
+            }
+        } else {
+            if let Some(ref path) = config.seed_corpus_file
+                && path.is_file()
+            {
+                seed_from_json_file(path, &indexer, &stores).await;
+            }
+            if let Some(ref tf) = config.tenant_keys_file
+                && tf.is_file()
+            {
+                seed_tenants_file(tf, &stores, &indexer).await;
+            }
         }
 
         // Compile initial ECS TriageResources

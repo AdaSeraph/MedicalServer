@@ -8,6 +8,32 @@ use super::super::components::{MemoryRecall, RagEvidence, RagEvidenceItem};
 use super::super::resources::SharedTriageResources;
 use super::super::schedules::Stage3RawCandidates;
 
+fn normalize_seasonal_tag(tag: &str) -> String {
+    let lower = tag.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "influenza" | "flu" | "influenza_season" => "influenza_season".to_string(),
+        "norovirus" | "norovirus_season" => "norovirus_season".to_string(),
+        "dengue" | "dengue_season" => "dengue_season".to_string(),
+        "mycoplasma" | "mycoplasma_season" => "mycoplasma_season".to_string(),
+        "rsv" | "rsv_season" => "rsv_season".to_string(),
+        "hfmd" | "hand_foot_mouth" => "hfmd_season".to_string(),
+        _ => lower,
+    }
+}
+
+fn diseases_match(doc_disease: &str, epi_disease: &str) -> bool {
+    let a = doc_disease.trim().to_ascii_lowercase();
+    let b = epi_disease.trim().to_ascii_lowercase();
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    a == b
+        || a.contains(&b)
+        || b.contains(&a)
+        || ((a.contains("流感") || a.contains("流行性感冒"))
+            && (b.contains("流感") || b.contains("流行性感冒")))
+}
+
 pub fn hybrid_rag_scoring_system(
     res: Res<SharedTriageResources>,
     raw: Res<Stage3RawCandidates>,
@@ -32,8 +58,12 @@ pub fn hybrid_rag_scoring_system(
             if epi.intensity <= 0.0 {
                 continue;
             }
-            let tag_match = hit.seasonal_tags.iter().any(|t| t == &epi.seasonal_tag);
-            let disease_match = hit.disease_name == epi.disease_name;
+            let epi_tag_norm = normalize_seasonal_tag(&epi.seasonal_tag);
+            let tag_match = hit
+                .seasonal_tags
+                .iter()
+                .any(|t| normalize_seasonal_tag(t) == epi_tag_norm);
+            let disease_match = diseases_match(&hit.disease_name, &epi.disease_name);
             if tag_match || disease_match {
                 if epi.intensity > max_intensity {
                     max_intensity = epi.intensity;

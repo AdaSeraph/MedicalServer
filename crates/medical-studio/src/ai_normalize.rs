@@ -536,6 +536,12 @@ pub async fn ai_normalize_patient_batch_with_state(
     pre_scrub_pii: bool,
 ) -> Result<AiPatientNormalizeResponse, String> {
     let cfg = resolve_llm_provider_config(state, provider_id).await?;
+    if !cfg.is_intranet && !pre_scrub_pii {
+        return Err(
+            "安全拦截：公网/非院内大模型禁止关闭「发送前强制隐私脱敏 (pre_scrub_pii)」，请开启预脱敏或切换为院内内网模型。"
+                .to_string(),
+        );
+    }
     let provider = OpenAiCompatibleLlmProvider::new(cfg.clone())
         .map_err(|e| format!("初始化 AI 客户端失败: {e}"))?;
     let timeout_ms = cfg.timeout_ms.max(60_000);
@@ -1450,19 +1456,15 @@ pub async fn ai_inspect_knowledge_with_provider(
                 KnowledgeInspectionItem {
                     doc_id: doc.doc_id.clone(),
                     disease_name: doc.disease_name.clone(),
-                    status: if local_dup.is_some() {
-                        InspectionStatus::Warning
-                    } else {
-                        InspectionStatus::Pass
-                    },
+                    status: InspectionStatus::Warning,
                     original_department: doc.department.clone(),
                     suggested_department: doc.department.clone(),
                     suggested_section_type: doc.section_type,
                     category_tags: doc.seasonal_tags.clone(),
                     is_duplicate: local_dup.is_some(),
                     duplicate_of: local_dup.clone(),
-                    issues: Vec::new(),
-                    recommendation: "已完成本地规则复核".to_string(),
+                    issues: vec!["AI 巡查未返回该条目评估结果，已降级为人工复核".to_string()],
+                    recommendation: "请人工核对临床准确性与科室归属后再入库".to_string(),
                 }
             };
 
@@ -1695,13 +1697,13 @@ pub async fn ai_inspect_patient_with_provider(
             } else {
                 PatientInspectionItem {
                     patient_id: rec.patient_id.clone(),
-                    status: InspectionStatus::Pass,
+                    status: InspectionStatus::Warning,
                     suggested_department: fallback_dept,
-                    risk_level: "low".to_string(),
+                    risk_level: "medium".to_string(),
                     category_tags: rec.l2_profile.chronic_diseases.clone(),
                     pii_risk: false,
-                    issues: Vec::new(),
-                    recommendation: "已完成本地隐私合规校验".to_string(),
+                    issues: vec!["AI 巡查未返回该病例评估结果，已降级为人工复核".to_string()],
+                    recommendation: "请人工确认脱敏完整性与既往史准确后再入库".to_string(),
                 }
             };
 

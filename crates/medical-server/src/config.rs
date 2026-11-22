@@ -21,7 +21,12 @@ pub struct ServerConfig {
     pub openai_fast_model: String,
     pub openai_reasoning_model: String,
     pub embedding_base_url: Option<String>,
+    pub embedding_model: String,
     pub rerank_base_url: Option<String>,
+    pub rerank_model: String,
+    pub tantivy_index_dir: Option<PathBuf>,
+    pub cors_allowed_origins: Vec<String>,
+    pub protect_metrics: bool,
     pub tenant_keys_file: Option<PathBuf>,
     pub seed_corpus_file: Option<PathBuf>,
 }
@@ -47,7 +52,12 @@ impl Default for ServerConfig {
             openai_fast_model: "medical-fast".to_string(),
             openai_reasoning_model: "medical-reasoning".to_string(),
             embedding_base_url: None,
+            embedding_model: "BAAI/bge-m3".to_string(),
             rerank_base_url: None,
+            rerank_model: "BAAI/bge-reranker-v2-m3".to_string(),
+            tantivy_index_dir: None,
+            cors_allowed_origins: Vec::new(),
+            protect_metrics: false,
             tenant_keys_file: None,
             seed_corpus_file: None,
         }
@@ -138,9 +148,36 @@ impl ServerConfig {
         cfg.embedding_base_url = env::var("EMBEDDING_BASE_URL")
             .ok()
             .filter(|s| !s.trim().is_empty());
+        if let Ok(m) = env::var("EMBEDDING_MODEL")
+            && !m.trim().is_empty()
+        {
+            cfg.embedding_model = m;
+        }
         cfg.rerank_base_url = env::var("RERANK_BASE_URL")
             .ok()
             .filter(|s| !s.trim().is_empty());
+        if let Ok(m) = env::var("RERANK_MODEL")
+            && !m.trim().is_empty()
+        {
+            cfg.rerank_model = m;
+        }
+        cfg.tantivy_index_dir = env::var("TANTIVY_INDEX_DIR")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from);
+        cfg.cors_allowed_origins = env::var("CORS_ALLOWED_ORIGINS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        cfg.protect_metrics = env::var("PROTECT_METRICS")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(!cfg.offline_mode);
 
         cfg.tenant_keys_file = env::var("MEDICAL_TENANT_KEYS_FILE")
             .ok()
@@ -152,5 +189,40 @@ impl ServerConfig {
             .map(PathBuf::from);
 
         cfg
+    }
+
+    /// Rejects insecure public default secrets when running in non-offline production mode.
+    pub fn validate_production_security(&self) -> Result<(), String> {
+        if self.offline_mode {
+            return Ok(());
+        }
+        if self.jwt_secret.trim().len() < 32
+            || self.jwt_secret == "medical-server-dev-jwt-secret-change-in-prod"
+        {
+            return Err(
+                "production security check failed: JWT_SECRET must be a non-default secret (>= 32 chars)"
+                    .to_string(),
+            );
+        }
+        if self.admin_token.trim().len() < 16 || self.admin_token == "e2e-admin-secret" {
+            return Err(
+                "production security check failed: MEDICAL_ADMIN_TOKEN must be a non-default token (>= 16 chars)"
+                    .to_string(),
+            );
+        }
+        let salt_str = String::from_utf8_lossy(&self.patient_id_salt);
+        if medical_core::crypto::is_weak_or_default_salt(&salt_str) {
+            return Err(
+                "production security check failed: PATIENT_ID_SALT must be a non-default high-entropy salt (>= 16 bytes)"
+                    .to_string(),
+            );
+        }
+        if self.field_encryption_key == "medical-server-dev-field-key-v1" {
+            return Err(
+                "production security check failed: FIELD_ENCRYPTION_KEY must be a non-default 32-byte hex/base64 key"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }

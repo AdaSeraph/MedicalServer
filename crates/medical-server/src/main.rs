@@ -13,20 +13,31 @@ async fn main() {
     let config = ServerConfig::from_env();
     let bind_addr = config.bind_addr.clone();
 
-    let state = AppState::build(config)
-        .await
-        .expect("failed to initialize medical-server AppState");
+    let state = match AppState::build(config).await {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to initialize medical-server AppState");
+            std::process::exit(1);
+        }
+    };
     let app = build_router(state);
 
-    let listener = tokio::net::TcpListener::bind(&bind_addr)
-        .await
-        .unwrap_or_else(|e| panic!("failed to bind {bind_addr}: {e}"));
+    let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
+        Ok(l) => l,
+        Err(err) => {
+            tracing::error!(addr = %bind_addr, error = %err, "failed to bind medical-server listener");
+            std::process::exit(1);
+        }
+    };
     info!("medical-server listening on http://{bind_addr}");
 
-    axum::serve(listener, app)
+    if let Err(err) = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .expect("medical-server exited with error");
+    {
+        tracing::error!(error = %err, "medical-server exited with error");
+        std::process::exit(1);
+    }
 }
 
 async fn shutdown_signal() {

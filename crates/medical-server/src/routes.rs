@@ -2,6 +2,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Instant;
 
+use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -18,7 +19,7 @@ use medical_core::models::{
 };
 use medical_core::privacy::{MEDICAL_DISCLAIMER, sanitize_medical_output, scrub_pii};
 use medical_core::storage::KnowledgeSearchQuery;
-use medical_core::validation::Validate;
+use medical_core::validation::{Validate, validate_patient_id};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -31,10 +32,23 @@ use crate::auth::{AuthContext, AuthError, authenticate_request, issue_wechat_jwt
 use crate::state::AppState;
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = if !state.config.cors_allowed_origins.is_empty() {
+        let origins: Vec<HeaderValue> = state
+            .config
+            .cors_allowed_origins
+            .iter()
+            .filter_map(|o| HeaderValue::from_str(o).ok())
+            .collect();
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    } else {
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    };
 
     Router::new()
         .route("/health", get(health_handler))
@@ -98,19 +112,33 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         .with_label_values(&["/health", "GET", "200"])
         .inc();
 
+    let router_status = state.model_router.router_health_summary();
+    let overall_status = if router_status == "circuit_open" {
+        "degraded"
+    } else {
+        "ok"
+    };
+
     Json(serde_json::json!({
-        "status": "ok",
+        "status": overall_status,
         "version": env!("CARGO_PKG_VERSION"),
         "checks": {
             "storage": if state.config.offline_mode { "in_memory_ok" } else { "pg_ok" },
             "knowledge_index": format!("tantivy_docs:{}", state.tantivy.num_docs()),
-            "llm_router": "ready",
+            "llm_router": router_status,
             "offline_mode": state.config.offline_mode
         }
     }))
 }
 
-async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn metrics_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if state.config.protect_metrics {
+        match authenticate_request(&state, &headers, 1).await {
+            Ok(auth) if auth.is_admin => {}
+            Ok(_) => return auth_err_response(AuthError::forbidden("admin authorization required")),
+            Err(e) => return auth_err_response(e),
+        }
+    }
     let body = state.metrics.render_text();
     (
         [(
@@ -119,6 +147,7 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
         )],
         body,
     )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +220,11 @@ async fn wechat_auth_handler(
                 );
             }
         }
+    } else if !state.config.offline_mode {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "WeChat authentication is not configured for production (missing WECHAT_APP_ID / WECHAT_APP_SECRET)",
+        );
     } else {
         // Offline deterministic openid derived from code (never echoes raw code in patient_id)
         format!("wx_openid_{}", medical_core::crypto::hash_api_key(code))
@@ -264,6 +298,10 @@ async fn triage_chat_handler(
     }
 
     let patient_id = resolve_patient_id(&auth, req.patient_id.as_deref());
+    if let Err(verr) = validate_patient_id(&patient_id) {
+        return json_error(StatusCode::BAD_REQUEST, verr.message);
+    }
+
     let prior_session = state
         .stores
         .session_cache
@@ -271,6 +309,13 @@ async fn triage_chat_handler(
         .await
         .ok()
         .flatten();
+    if let Some(ref prior) = prior_session
+        && prior.patient_id != patient_id
+    {
+        return auth_err_response(AuthError::forbidden(
+            "session_id belongs to a different patient",
+        ));
+    }
 
     let mut triage_req = TriageRequest {
         session_id: req.session_id.clone(),
@@ -309,13 +354,26 @@ async fn triage_chat_handler(
                                 state_bg.metrics.llm_errors_total.inc();
                             }
                             if let Some(ref k) = api_key_rec {
+                                let est_out = exec
+                                    .response
+                                    .question
+                                    .as_deref()
+                                    .map(|s| s.chars().count() as u32)
+                                    .or_else(|| {
+                                        exec.response
+                                            .triage_result
+                                            .as_ref()
+                                            .map(|c| c.summary.chars().count() as u32)
+                                    })
+                                    .unwrap_or(64);
                                 state_bg.rate_limiter.record_actual_tokens(
                                     &k.key_id,
                                     k.tpm_limit,
-                                    exec.trace.llm_calls_made.saturating_mul(128),
+                                    est_tokens.saturating_add(est_out.saturating_mul(2)),
                                 );
                             }
-                            let _ = tx.send(TriageStreamEvent::Result(exec.response)).await;
+                            // Note: `TriageEngine::run_triage` already emitted `TriageStreamEvent::Result`
+                            // once on `tx`; do NOT re-send a duplicate `event: result`.
                         }
                         Err(e) => {
                             state_bg.metrics.llm_errors_total.inc();
@@ -481,11 +539,13 @@ async fn knowledge_search_handler(
     }
 
     let cache_key = format!(
-        "ksearch:{}:{}:{}:{}:{}:{}:{}",
+        "ksearch:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         auth.namespace,
         req.query.trim(),
+        req.keywords.join(","),
         req.department.as_deref().unwrap_or(""),
         req.region_code.as_deref().unwrap_or(""),
+        req.season.as_deref().unwrap_or(""),
         req.seasonal_boost,
         req.top_k,
         serde_json::to_string(&req.target_population).unwrap_or_default()
@@ -627,16 +687,23 @@ async fn openai_proxy_handler(
         return json_error(StatusCode::BAD_REQUEST, "messages must not be empty");
     }
 
-    let last_user_text = req
+    let combined_user_text: String = req
         .messages
         .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.content.as_str())
-        .unwrap_or(&req.messages.last().unwrap().content);
+        .filter(|m| m.role == "user")
+        .map(|m| m.content.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if combined_user_text.is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "at least one non-empty user message is required",
+        );
+    }
 
-    // 1. Run lightweight Stage-1-only CPU red-flag check (< 1ms, zero I/O / LLM overhead)
-    let red_flag_alert = state.triage_engine.check_red_flag_fast(last_user_text);
+    // 1. Run lightweight Stage-1-only CPU red-flag check across ALL user turns (< 1ms)
+    let red_flag_alert = state.triage_engine.check_red_flag_fast(&combined_user_text);
 
     let completion_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
     let created = Utc::now().timestamp();
@@ -704,22 +771,23 @@ async fn openai_proxy_handler(
         .into_response();
     }
 
-    // 2. Scrubbed outbound LLM call
-    let scrubbed_msgs: Vec<LlmMessage> = req
-        .messages
-        .iter()
-        .map(|m| {
-            let role = match m.role.as_str() {
-                "system" => MessageRole::System,
-                "assistant" => MessageRole::Assistant,
-                _ => MessageRole::User,
-            };
-            LlmMessage {
-                role,
-                content: scrub_pii(&m.content).scrubbed_text,
-            }
-        })
-        .collect();
+    // 2. Prepend unoverridable medical safety system prompt + scrub outbound PII
+    let mut scrubbed_msgs: Vec<LlmMessage> = Vec::with_capacity(req.messages.len() + 1);
+    scrubbed_msgs.push(LlmMessage {
+        role: MessageRole::System,
+        content: "你是医院智能导诊与健康咨询助手。严禁下达确诊结论，严禁开具具体处方药物剂量或指导患者自行停药/购药；若识别到胸痛大汗、脑卒中、大出血、呼吸困难或自伤等急危重症，必须首要提示立即拨打120急诊就医。".to_string(),
+    });
+    for m in &req.messages {
+        let role = match m.role.as_str() {
+            "system" => MessageRole::System,
+            "assistant" => MessageRole::Assistant,
+            _ => MessageRole::User,
+        };
+        scrubbed_msgs.push(LlmMessage {
+            role,
+            content: scrub_pii(&m.content).scrubbed_text,
+        });
+    }
 
     let llm_req = LlmRequest {
         messages: scrubbed_msgs,
@@ -753,8 +821,20 @@ async fn openai_proxy_handler(
 
             let fwd_handle = tokio::spawn(async move {
                 let mut sent_any = false;
+                let mut sentence_buf = String::new();
                 while let Some(chunk) = llm_rx.recv().await {
                     if chunk.delta.is_empty() {
+                        continue;
+                    }
+                    sentence_buf.push_str(&chunk.delta);
+                    let should_flush = sentence_buf.ends_with(['。', '！', '？', '\n', '.', '!', '?'])
+                        || sentence_buf.chars().count() >= 64;
+                    if !should_flush {
+                        continue;
+                    }
+                    let safe_delta = sanitize_medical_output(&sentence_buf, false).sanitized_text;
+                    sentence_buf.clear();
+                    if safe_delta.is_empty() {
                         continue;
                     }
                     sent_any = true;
@@ -765,7 +845,7 @@ async fn openai_proxy_handler(
                         "model": mdl_fwd,
                         "choices": [{
                             "index": 0,
-                            "delta": { "role": "assistant", "content": chunk.delta },
+                            "delta": { "role": "assistant", "content": safe_delta },
                             "finish_reason": serde_json::Value::Null
                         }]
                     });
@@ -775,6 +855,26 @@ async fn openai_proxy_handler(
                         .is_err()
                     {
                         break;
+                    }
+                }
+                if !sentence_buf.is_empty() {
+                    let safe_delta = sanitize_medical_output(&sentence_buf, false).sanitized_text;
+                    if !safe_delta.is_empty() {
+                        sent_any = true;
+                        let payload = serde_json::json!({
+                            "id": cid_fwd,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": mdl_fwd,
+                            "choices": [{
+                                "index": 0,
+                                "delta": { "role": "assistant", "content": safe_delta },
+                                "finish_reason": serde_json::Value::Null
+                            }]
+                        });
+                        let _ = fwd_tx
+                            .send(Ok(Event::default().data(payload.to_string())))
+                            .await;
                     }
                 }
                 sent_any
@@ -950,18 +1050,22 @@ async fn epidemic_current_handler(
 // ---------------------------------------------------------------------------
 
 fn check_patient_access(
-    state: &AppState,
+    _state: &AppState,
     auth: &AuthContext,
     target_patient_id: &str,
 ) -> Result<(), AuthError> {
-    if auth.is_admin || auth.api_key.is_some() {
+    if auth.is_admin {
         return Ok(());
+    }
+    if let Some(ref key) = auth.api_key {
+        // Tenant API keys are only allowed when explicitly scoped (non-empty tenant_id)
+        if !key.tenant_id.trim().is_empty() {
+            return Ok(());
+        }
+        return Err(AuthError::forbidden("API key lacks valid tenant scope"));
     }
     if let Some(bound) = &auth.patient_id {
         if bound == target_patient_id {
-            return Ok(());
-        }
-        if state.config.offline_mode && target_patient_id.starts_with("pat_sha256_") {
             return Ok(());
         }
     }
@@ -1043,21 +1147,36 @@ async fn put_patient_memory_handler(
     }
 
     for event in &record.l3_visit_events {
-        let _ = state
+        if let Err(e) = state
             .stores
             .patient_memory
             .insert_l3_event(&patient_id, event)
-            .await;
+            .await
+        {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to persist L3 visit event {}: {e}", event.event_id),
+            );
+        }
         if let Ok(vec) = state
             .embedder
             .embed_one(&format!("{} {}", event.chief_complaint, event.summary))
             .await
         {
-            let _ = state
+            if let Err(e) = state
                 .stores
                 .patient_l3_vectors
                 .upsert_event_vector(&patient_id, event, vec)
-                .await;
+                .await
+            {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "failed to index L3 vector for event {}: {e}",
+                        event.event_id
+                    ),
+                );
+            }
         }
     }
 
@@ -1093,21 +1212,33 @@ async fn delete_patient_memory_handler(
         Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 
-    if let Ok(q_del) = state
+    match state
         .stores
         .patient_l3_vectors
         .delete_patient_events(&patient_id)
         .await
     {
-        stats.qdrant_points_deleted = q_del;
+        Ok(q_del) => stats.qdrant_points_deleted = q_del,
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to delete patient vector memory: {e}"),
+            );
+        }
     }
-    if let Ok(l1_del) = state
+    match state
         .stores
         .session_cache
         .delete_patient_sessions(&patient_id)
         .await
     {
-        stats.l1_sessions_deleted = l1_del;
+        Ok(l1_del) => stats.l1_sessions_deleted = l1_del,
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to delete patient L1 sessions: {e}"),
+            );
+        }
     }
 
     state
@@ -1141,15 +1272,19 @@ struct AdminReloadRequest {
 async fn admin_reload_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<AdminReloadRequest>,
+    body: Bytes,
 ) -> Response {
     let auth = match authenticate_request(&state, &headers, 1).await {
         Ok(a) => a,
         Err(e) => return auth_err_response(e),
     };
-    if !auth.is_admin && auth.api_key.is_none() {
+    if !auth.is_admin {
         return auth_err_response(AuthError::forbidden("admin authorization required"));
     }
+    let req: AdminReloadRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")),
+    };
 
     match state
         .reload_hot_resources(
@@ -1180,15 +1315,19 @@ async fn admin_reload_handler(
 async fn admin_upsert_epidemic_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(ctx): Json<EpidemicContext>,
+    body: Bytes,
 ) -> Response {
     let auth = match authenticate_request(&state, &headers, 1).await {
         Ok(a) => a,
         Err(e) => return auth_err_response(e),
     };
-    if !auth.is_admin && auth.api_key.is_none() {
+    if !auth.is_admin {
         return auth_err_response(AuthError::forbidden("admin authorization required"));
     }
+    let ctx: EpidemicContext = match serde_json::from_slice(&body) {
+        Ok(c) => c,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")),
+    };
     if let Err(verr) = ctx.validate() {
         return json_error(StatusCode::BAD_REQUEST, verr.to_string());
     }

@@ -76,6 +76,10 @@ pub fn run() {
             commands::create_or_update_patient_profile,
             commands::submit_patient_revisit_feedback,
             commands::run_consultation_triage,
+            // Module 9: Clinical Governance, Audit Logs & Safe Deletion
+            commands::list_triage_audit_logs,
+            commands::delete_knowledge_documents,
+            commands::delete_patient_record,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MedicalStudio Tauri application");

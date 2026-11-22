@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::llm::{
-    LlmMessage, LlmRequest, LlmStreamChunk, ModelTier, RerankCandidate,
+    LlmMessage, LlmRequest, ModelTier, RerankCandidate,
 };
 use crate::models::{RedFlagLevel, TargetPopulation, TriageStatus};
 use crate::privacy::scrub_pii;
@@ -323,10 +323,20 @@ impl TriageEngine {
 
         let prior_session = prior_res.ok().flatten();
         let raw_l2 = l2_res.ok().flatten();
-        let effective_consent = req
-            .consent_long_term_memory
-            .or_else(|| raw_l2.as_ref().map(|r| r.consent_long_term_memory))
-            .unwrap_or(false);
+        // Respect explicit stored opt-out: if an existing L2 record explicitly revoked consent,
+        // a triage request flag cannot silently re-enable long-term memory persistence.
+        let effective_consent = match (&raw_l2, req.consent_long_term_memory) {
+            (Some(l2), _) if !l2.consent_long_term_memory => false,
+            (_, Some(explicit)) => explicit,
+            (Some(l2), None) => l2.consent_long_term_memory,
+            (None, None) => false,
+        };
+        {
+            let world = guard.world_mut();
+            if let Some(mut id) = world.get_mut::<PatientIdentity>(entity) {
+                id.consent_long_term_memory = effective_consent;
+            }
+        }
 
         let stage2_q_vec = q_vec_res.ok();
         let l2_record = if effective_consent { raw_l2 } else { None };
@@ -620,27 +630,9 @@ impl TriageEngine {
         let mut prompt_tokens = 0_u32;
         let mut completion_tokens = 0_u32;
 
-        let llm_res = if let Some(outer_tx) = &req.stream_tx {
-            let (llm_tx, mut llm_rx) = mpsc::channel::<LlmStreamChunk>(64);
-            let fwd_tx = outer_tx.clone();
-            let fwd_handle = tokio::spawn(async move {
-                while let Some(chunk) = llm_rx.recv().await {
-                    if !chunk.delta.is_empty() {
-                        let _ = fwd_tx
-                            .send(TriageStreamEvent::Delta {
-                                delta: chunk.delta,
-                                provider_id: chunk.provider_id,
-                            })
-                            .await;
-                    }
-                }
-            });
-            let out = res.model_router.chat_stream(&reasoning_req, llm_tx).await;
-            let _ = fwd_handle.await;
-            out
-        } else {
-            res.model_router.complete_json(&reasoning_req).await
-        };
+        // Always use JSON-structured completion so strict schema enforcement stays active even for
+        // SSE callers, preventing raw unparsed JSON syntax or un-sanitized text from leaking to patients.
+        let llm_res = res.model_router.complete_json(&reasoning_req).await;
 
         let outcome = match llm_res {
             Ok(resp) => {
@@ -700,7 +692,7 @@ impl TriageEngine {
         if !assistant_text.is_empty() {
             session_turns.push(SessionTurn {
                 role: "assistant".to_string(),
-                content: assistant_text,
+                content: assistant_text.clone(),
                 timestamp: Utc::now(),
             });
         }
@@ -719,14 +711,31 @@ impl TriageEngine {
             },
             updated_at: Utc::now(),
         };
-        let _ = res
+        if let Err(err) = res
             .clients
             .stores
             .session_cache
             .save_session(&session_state, res.config.session_ttl_secs)
-            .await;
+            .await
+        {
+            tracing::warn!(
+                session_id = %req.session_id,
+                error = %err,
+                "failed to persist L1 triage session state"
+            );
+        }
 
         if let Some(tx) = &req.stream_tx {
+            if !assistant_text.is_empty() {
+                let _ = tx
+                    .send(TriageStreamEvent::Delta {
+                        delta: assistant_text.clone(),
+                        provider_id: used_provider_id
+                            .clone()
+                            .unwrap_or_else(|| "rule_fallback".to_string()),
+                    })
+                    .await;
+            }
             let _ = tx
                 .send(TriageStreamEvent::Result(final_response.clone()))
                 .await;

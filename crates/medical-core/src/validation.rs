@@ -227,9 +227,37 @@ impl Validate for PatientRecord {
         if let Err(l2_errs) = self.l2_profile.validate() {
             errs.extend_with_prefix("l2_profile", l2_errs);
         }
+        let l2_fields = self
+            .l2_profile
+            .chronic_diseases
+            .iter()
+            .chain(self.l2_profile.allergies.iter())
+            .chain(self.l2_profile.long_term_medications.iter())
+            .chain(self.l2_profile.surgical_history.iter());
+        for text in l2_fields {
+            if crate::privacy::contains_high_risk_pii(text) {
+                errs.push(
+                    "l2_profile",
+                    "l2_profile contains unredacted high-risk PII (phone/ID/email/record_no)",
+                );
+                break;
+            }
+        }
         for (idx, event) in self.l3_visit_events.iter().enumerate() {
             if let Err(l3_errs) = event.validate() {
                 errs.extend_with_prefix(&format!("l3_visit_events[{idx}]"), l3_errs);
+            }
+            if crate::privacy::contains_high_risk_pii(&event.chief_complaint)
+                || crate::privacy::contains_high_risk_pii(&event.summary)
+                || event
+                    .extracted_symptoms
+                    .iter()
+                    .any(|s| crate::privacy::contains_high_risk_pii(s))
+            {
+                errs.push(
+                    format!("l3_visit_events[{idx}]"),
+                    "l3 visit event contains unredacted high-risk PII (phone/ID/email/record_no)",
+                );
             }
         }
         errs.into_result()

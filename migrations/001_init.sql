@@ -176,7 +176,7 @@ CREATE TABLE IF NOT EXISTS ingestion_checkpoints (
     job_id                   VARCHAR(128) PRIMARY KEY,
     tenant_id                VARCHAR(64) NOT NULL DEFAULT 'default',
     source_path              TEXT NOT NULL,
-    job_type                 VARCHAR(32) NOT NULL CHECK (job_type IN ('knowledge', 'patient', 'patient_records')),
+    job_type                 VARCHAR(32) NOT NULL CHECK (job_type IN ('knowledge', 'knowledge_jsonl', 'knowledge_book', 'knowledge_batch', 'patient', 'patient_records')),
     status                   VARCHAR(32) NOT NULL CHECK (status IN ('pending', 'running', 'paused', 'completed', 'failed')),
     total_items              BIGINT NOT NULL DEFAULT 0,
     processed_items          BIGINT NOT NULL DEFAULT 0,

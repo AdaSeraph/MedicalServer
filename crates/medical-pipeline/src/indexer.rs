@@ -99,19 +99,31 @@ impl TantivyKnowledgeIndex {
 
         let mut count = 0u64;
         for d in docs {
-            let term = Term::from_field_text(self.fields.doc_id, &d.doc_id);
+            let scoped_key = format!("{tenant_namespace}:{}", d.doc_id);
+            let term = Term::from_field_text(self.fields.doc_id, &scoped_key);
             writer.delete_term(term);
 
             let payload_json = serde_json::to_string(d)
                 .map_err(|e| PipelineError::Index(format!("serialize doc payload: {e}")))?;
 
+            let disease_with_aliases = if d.aliases.is_empty() {
+                d.disease_name.clone()
+            } else {
+                format!("{} {}", d.disease_name, d.aliases.join(" "))
+            };
+            let content_with_diff = if d.differential_points.is_empty() {
+                d.content.clone()
+            } else {
+                format!("{} {}", d.content, d.differential_points.join(" "))
+            };
+
             let mut tdoc = doc!(
-                self.fields.doc_id => d.doc_id.as_str(),
-                self.fields.disease_name => d.disease_name.as_str(),
+                self.fields.doc_id => scoped_key.as_str(),
+                self.fields.disease_name => disease_with_aliases.as_str(),
                 self.fields.department => d.department.as_str(),
                 self.fields.tenant_namespace => tenant_namespace,
                 self.fields.key_symptoms => d.key_symptoms.join(" "),
-                self.fields.content => d.content.as_str(),
+                self.fields.content => content_with_diff.as_str(),
                 self.fields.payload_json => payload_json.as_str()
             );
             for pop in &d.target_population {
@@ -136,11 +148,21 @@ impl TantivyKnowledgeIndex {
     }
 
     pub fn delete_by_doc_ids(&self, doc_ids: &[String]) -> PipelineResult<u64> {
+        self.delete_by_doc_ids_in_namespace(doc_ids, "default")
+    }
+
+    pub fn delete_by_doc_ids_in_namespace(
+        &self,
+        doc_ids: &[String],
+        tenant_namespace: &str,
+    ) -> PipelineResult<u64> {
         let mut writer = self
             .writer
             .lock()
             .map_err(|_| PipelineError::Index("tantivy writer lock poisoned".to_string()))?;
         for id in doc_ids {
+            let scoped_key = format!("{tenant_namespace}:{id}");
+            writer.delete_term(Term::from_field_text(self.fields.doc_id, &scoped_key));
             writer.delete_term(Term::from_field_text(self.fields.doc_id, id));
         }
         writer
@@ -230,8 +252,8 @@ impl TantivyKnowledgeIndex {
         parser.set_field_boost(self.fields.content, 1.0);
 
         let (parsed_query, _errors) = parser.parse_query_lenient(cleaned);
-        // Fetch extra candidates so hard metadata filtering still yields `top_k`
-        let fetch_limit = (query.top_k.max(1) * 5).max(20);
+        // Fetch sufficient candidates so hard metadata filtering for niche populations still yields `top_k`
+        let fetch_limit = (query.top_k.max(1) * 20).max(100);
         let top_docs = searcher
             .search(
                 &parsed_query,
@@ -333,6 +355,7 @@ fn matches_hard_filters(
 ) -> bool {
     if let Some(dept) = &query.department
         && doc.department != *dept
+        && !doc.secondary_departments.contains(dept)
     {
         return false;
     }
