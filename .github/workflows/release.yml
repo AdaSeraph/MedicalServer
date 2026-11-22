@@ -13,6 +13,11 @@ on:
         description: "Release tag (e.g. v0.1.0 or latest)"
         required: true
         default: "latest"
+      offline_webview2:
+        description: "Embed full offline WebView2 installer (~127MB) in Windows setup for air-gapped PCs"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -26,33 +31,38 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # 1. Linux Cloud Server Standalone Release (bare-metal / VM / systemd + Docker Compose kit)
+  # 1. Linux Cloud Server Standalone Release (fully static musl binary — runs on any Linux distro)
   build-cloud-server:
-    name: Cloud Server Release (linux-x86_64)
+    name: Cloud Server Release (linux-x86_64-musl static)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install native build dependencies
+      - name: Install musl static build toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev
+          sudo apt-get install -y musl-tools pkg-config
 
-      - name: Setup Rust toolchain
+      - name: Setup Rust toolchain (with musl target)
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          key: cloud-musl
 
-      - name: Build medical-server (release)
-        run: cargo build --release --bin medical-server
+      - name: Build static medical-server (release, musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl --bin medical-server
 
       - name: Package Cloud Server Deployment Bundle
         run: |
           mkdir -p cloud_pkg
-          cp target/release/medical-server cloud_pkg/
+          cp target/x86_64-unknown-linux-musl/release/medical-server cloud_pkg/
           chmod +x cloud_pkg/medical-server
+          file cloud_pkg/medical-server
           cp -r migrations config deploy k6 cloud_pkg/
           chmod +x cloud_pkg/deploy/install-linux.sh
           tar -czf medical-server-cloud-linux-x86_64.tar.gz -C cloud_pkg .
@@ -102,9 +112,105 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # 3. Desktop & Full Suite Release Binaries (Linux + Windows)
+  # 3. MedicalStudio Desktop Installers (Windows NSIS/MSI with WebView2 + Static CRT; Linux .deb/.rpm/.AppImage)
+  build-desktop-installers:
+    name: Desktop Installer (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x64
+          - os: ubuntu-latest
+            label: linux-x86_64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux Tauri & packaging dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            pkg-config \
+            libssl-dev \
+            rpm
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: installer-${{ matrix.label }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: crates/medical-studio/frontend/package-lock.json
+
+      - name: Build MedicalStudio Frontend
+        working-directory: crates/medical-studio/frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build Windows Installers (NSIS & MSI, static CRT + WebView2 bootstrapper)
+        if: runner.os == 'Windows'
+        working-directory: crates/medical-studio
+        shell: pwsh
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: |
+          $argsList = @("--yes", "@tauri-apps/cli@^2", "build")
+          if ("${{ inputs.offline_webview2 }}" -eq "true") {
+            Write-Host "Using offlineInstaller mode for WebView2"
+            $argsList += @("--config", '{"bundle":{"windows":{"webviewInstallMode":{"type":"offlineInstaller","silent":true}}}}')
+          }
+          npx @argsList
+
+      - name: Collect Windows Installer Artifacts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path installers_out | Out-Null
+          Get-ChildItem -Path "target/release/bundle" -Recurse -Include "*.exe", "*.msi" | ForEach-Object {
+            Copy-Item $_.FullName installers_out/
+          }
+          Get-ChildItem installers_out
+
+      - name: Build Linux Installers (.deb, .rpm, .AppImage)
+        if: runner.os == 'Linux'
+        working-directory: crates/medical-studio
+        env:
+          NO_STRIP: "true"
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: npx --yes @tauri-apps/cli@^2 build
+
+      - name: Collect Linux Installer Artifacts
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p installers_out
+          find target/release/bundle -maxdepth 2 -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.AppImage" \) -exec cp {} installers_out/ \;
+          ls -lh installers_out
+
+      - name: Upload Desktop Installer Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-installer-${{ matrix.label }}
+          path: installers_out/*
+
+  # 4. Portable Full Suite Archives (Linux + Windows with static CRT & runtime helper)
   build-suite-binaries:
-    name: Suite Release (${{ matrix.target }})
+    name: Portable Suite (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -138,6 +244,8 @@ jobs:
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          key: suite-${{ matrix.target }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -152,7 +260,14 @@ jobs:
           npm ci
           npm run build
 
-      - name: Build Release Binaries (medical-server & medical-studio)
+      - name: Build Release Binaries (Linux)
+        if: runner.os == 'Linux'
+        run: cargo build --release --bin medical-server --bin medical-studio
+
+      - name: Build Release Binaries (Windows, static CRT — no VCRUNTIME140.dll needed)
+        if: runner.os == 'Windows'
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
         run: cargo build --release --bin medical-server --bin medical-studio
 
       - name: Package Release Archive (Linux)
@@ -162,6 +277,7 @@ jobs:
           cp target/release/medical-server dist_pkg/
           cp target/release/medical-studio dist_pkg/
           cp -r migrations config deploy k6 dist_pkg/
+          chmod +x dist_pkg/deploy/install-linux.sh dist_pkg/deploy/linux/install-studio-deps.sh
           tar -czf medical-suite-${{ matrix.target }}.tar.gz -C dist_pkg .
 
       - name: Package Release Archive (Windows)
@@ -171,6 +287,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist_pkg | Out-Null
           Copy-Item "target/release/medical-server.exe" dist_pkg/
           Copy-Item "target/release/medical-studio.exe" dist_pkg/
+          Copy-Item "deploy/windows/start-medical-studio.bat" dist_pkg/
           Copy-Item -Recurse migrations, config, deploy, k6 dist_pkg/
           Compress-Archive -Path dist_pkg\* -DestinationPath "medical-suite-${{ matrix.target }}.zip" -Force
 
@@ -180,10 +297,10 @@ jobs:
           name: release-suite-${{ matrix.target }}
           path: medical-suite-${{ matrix.target }}.${{ matrix.archive }}
 
-  # 4. Publish GitHub Release (auto on push to master/main, v* tag, or manual dispatch)
+  # 5. Publish GitHub Release (auto on push to master/main, v* tag, or manual dispatch)
   publish-release:
     name: Publish GitHub Release
-    needs: [build-cloud-server, build-docker-image, build-suite-binaries]
+    needs: [build-cloud-server, build-docker-image, build-desktop-installers, build-suite-binaries]
     runs-on: ubuntu-latest
     steps:
       - name: Download all release artifacts
@@ -222,9 +339,20 @@ jobs:
           make_latest: true
           generate_release_notes: true
           body: |
-            ### 云端服务器部署产物
-            - **Linux 云服务器独立部署包**: `medical-server-cloud-linux-x86_64.tar.gz`（内含 `medical-server` Release 二进制、`migrations/`、`config/`、`deploy/docker-compose.yml`、`deploy/medical-server.service`、`deploy/install-linux.sh` 与监控告警配置）
-            - **Docker 镜像（GHCR）**: `docker pull ghcr.io/${{ github.repository }}/medical-server:latest`
-            - **全套桌面与服务端产物**: `medical-suite-x86_64-unknown-linux-gnu.tar.gz` / `medical-suite-x86_64-pc-windows-msvc.zip`
-            - **完整性校验**: `SHA256SUMS.txt`
+            ### 桌面端安装包（推荐新电脑直接下载，自动处理运行库依赖）
+            - **Windows 安装向导（推荐）**：`MedicalStudio_*_x64-setup.exe`（NSIS 中文安装向导）或 `MedicalStudio_*_x64_*.msi`
+              - 已静态链接 MSVC CRT（`+crt-static`），**无需安装 VC++ Redistributable**；
+              - 已内嵌微软官方 **WebView2 Runtime 引导程序**，新电脑缺少 WebView2 时安装过程会自动下载安装。
+            - **Linux 桌面安装包**：
+              - Debian/Ubuntu：`MedicalStudio_*_amd64.deb`（执行 `sudo apt install ./MedicalStudio_*_amd64.deb` 自动补齐系统库）
+              - Fedora/RHEL/CentOS：`MedicalStudio-*.x86_64.rpm`
+              - 通用便携版：`MedicalStudio_*_amd64.AppImage`
+
+            ### 云端服务器与便携套件
+            - **Linux 云服务器独立部署包（静态 musl 编译，不依赖宿主 glibc）**：`medical-server-cloud-linux-x86_64.tar.gz`
+            - **Docker 镜像（GHCR）**：`docker pull ghcr.io/${{ github.repository }}/medical-server:latest`
+            - **全套便携压缩包**：
+              - Windows：`medical-suite-x86_64-pc-windows-msvc.zip`（静态 CRT，双击 `start-medical-studio.bat` 自动检测并引导下载 WebView2 后启动）
+              - Linux：`medical-suite-x86_64-unknown-linux-gnu.tar.gz`（附带 `deploy/linux/install-studio-deps.sh` 一键补齐桌面依赖）
+            - **完整性校验**：`SHA256SUMS.txt`
           files: artifacts/*

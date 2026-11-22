@@ -177,14 +177,26 @@ curl http://127.0.0.1:8080/health
 
 ---
 
-## CI/CD 工作流
+## CI/CD 工作流与桌面安装包
 
 - **[CI](file:///e:/RustP/MedicalServer/.github/workflows/ci.yml)**：每次 `push` / `PR` 自动在 `ubuntu-latest` 与 `windows-latest` 双平台执行 Vue 3 前端构建、`cargo check/build/test --workspace` 及 123 项 Tier 1 E2E 测试。
 - **[Release](file:///e:/RustP/MedicalServer/.github/workflows/release.yml)**：推送至 `master`/`main`、打 `v*` 标签或手动触发时，自动编译并发布：
-  - `medical-server-cloud-linux-x86_64.tar.gz`（Linux 云服务器独立部署包）
-  - `ghcr.io/adaseraph/medicalserver/medical-server:latest`（云端 Docker 镜像）
-  - `medical-suite-x86_64-unknown-linux-gnu.tar.gz` / `medical-suite-x86_64-pc-windows-msvc.zip`（含 `medical-studio` 桌面端）
-  - `SHA256SUMS.txt`
+  - **Windows 桌面安装包（推荐新电脑直接下载）**：`MedicalStudio_*_x64-setup.exe`（NSIS 中文安装向导）与 `.msi` —— 已启用 `+crt-static` 静态链接（**无需 VC++ 运行库**），并内嵌微软官方 **WebView2 Bootstrapper**，新电脑缺少 WebView2 时安装过程会自动下载安装（手动触发 `workflow_dispatch` 时还可勾选 `offline_webview2: true` 生成离线全量安装包）。
+  - **Linux 桌面安装包**：`MedicalStudio_*_amd64.deb`（`sudo apt install ./MedicalStudio_*.deb` 自动补齐系统库）、`.rpm` 与 `.AppImage`。
+  - **Linux 云服务器静态部署包**：`medical-server-cloud-linux-x86_64.tar.gz`（`x86_64-unknown-linux-musl` 全静态编译，不依赖宿主 `glibc` 版本）。
+  - **云端 Docker 镜像**：`ghcr.io/adaseraph/medicalserver/medical-server:latest`。
+  - **全套便携压缩包**：`medical-suite-x86_64-pc-windows-msvc.zip`（内含 `start-medical-studio.bat` 自动检测并引导安装 WebView2）/ `medical-suite-x86_64-unknown-linux-gnu.tar.gz`（内含 `deploy/linux/install-studio-deps.sh`）。
+  - **完整性校验**：`SHA256SUMS.txt`。
+
+### 本地一键打包 Windows 安装包
+
+```powershell
+# 默认生成带 WebView2 引导程序的 NSIS / MSI 安装包与便携 zip（新电脑安装时自动补齐 WebView2）
+.\deploy\package-windows.ps1
+
+# 如目标电脑为纯内网/离线环境，可追加 -OfflineWebView2 嵌入完整离线 WebView2 安装包
+.\deploy\package-windows.ps1 -OfflineWebView2
+```
 
 ---
 
