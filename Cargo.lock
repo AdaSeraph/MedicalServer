@@ -3958,6 +3958,7 @@ dependencies = [
  "arc-swap",
  "base64 0.22.1",
  "chrono",
+ "futures",
  "medical-core",
  "medical-pipeline",
  "reqwest 0.12.28",

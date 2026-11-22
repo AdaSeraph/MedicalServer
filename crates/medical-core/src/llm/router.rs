@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
@@ -28,6 +29,7 @@ pub struct ProbeResult {
 struct ProviderHealthRecord {
     state: CircuitBreakerState,
     opened_at: Option<Instant>,
+    half_open_in_flight: u32,
     consecutive_failures: u32,
     total_calls: u64,
     total_failures: u64,
@@ -44,6 +46,7 @@ impl Default for ProviderHealthRecord {
                 consecutive_failures: 0,
             },
             opened_at: None,
+            half_open_in_flight: 0,
             consecutive_failures: 0,
             total_calls: 0,
             total_failures: 0,
@@ -59,6 +62,7 @@ pub struct ModelRouter {
     providers: RwLock<HashMap<String, Arc<dyn LlmProvider>>>,
     router_config: RwLock<RouterConfig>,
     health: DashMap<String, ProviderHealthRecord>,
+    total_failures_counter: AtomicU64,
 }
 
 impl ModelRouter {
@@ -77,6 +81,7 @@ impl ModelRouter {
             providers: RwLock::new(map),
             router_config: RwLock::new(router_config),
             health,
+            total_failures_counter: AtomicU64::new(0),
         }
     }
 
@@ -120,6 +125,11 @@ impl ModelRouter {
 
     pub fn router_config(&self) -> RouterConfig {
         self.router_config.read().clone()
+    }
+
+    /// Lock-free total failure counter across all providers for zero-allocation hot-path metrics.
+    pub fn total_failures(&self) -> u64 {
+        self.total_failures_counter.load(Ordering::Relaxed)
     }
 
     pub fn health_metrics(&self) -> Vec<ProviderHealthMetrics> {
@@ -182,7 +192,17 @@ impl ModelRouter {
         let mut entry = self.health.entry(provider_id.to_string()).or_default();
         match entry.state {
             CircuitBreakerState::Closed { .. } => Ok(false),
-            CircuitBreakerState::HalfOpen => Ok(true),
+            CircuitBreakerState::HalfOpen => {
+                // Prevent Half-Open thundering herd: allow only 1 probe in-flight at a time
+                if entry.half_open_in_flight >= 1 {
+                    Err(LlmError::CircuitOpen {
+                        provider: provider_id.to_string(),
+                    })
+                } else {
+                    entry.half_open_in_flight += 1;
+                    Ok(true)
+                }
+            }
             CircuitBreakerState::Open { .. } => {
                 let elapsed_ok = entry
                     .opened_at
@@ -190,6 +210,7 @@ impl ModelRouter {
                     .unwrap_or(true);
                 if elapsed_ok {
                     entry.state = CircuitBreakerState::HalfOpen;
+                    entry.half_open_in_flight = 1;
                     Ok(true)
                 } else {
                     Err(LlmError::CircuitOpen {
@@ -204,6 +225,7 @@ impl ModelRouter {
         let mut entry = self.health.entry(provider_id.to_string()).or_default();
         entry.total_calls += 1;
         entry.consecutive_failures = 0;
+        entry.half_open_in_flight = 0;
         entry.opened_at = None;
         entry.state = CircuitBreakerState::Closed {
             consecutive_failures: 0,
@@ -222,9 +244,13 @@ impl ModelRouter {
         was_half_open: bool,
         failure_threshold: u32,
     ) {
+        self.total_failures_counter.fetch_add(1, Ordering::Relaxed);
         let mut entry = self.health.entry(provider_id.to_string()).or_default();
         entry.total_calls += 1;
         entry.total_failures += 1;
+        if was_half_open {
+            entry.half_open_in_flight = entry.half_open_in_flight.saturating_sub(1);
+        }
         if matches!(err, LlmError::RateLimited { .. }) {
             entry.rate_limited_count += 1;
         }
@@ -238,6 +264,7 @@ impl ModelRouter {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             entry.opened_at = Some(Instant::now());
+            entry.half_open_in_flight = 0;
             entry.state = CircuitBreakerState::Open {
                 opened_at_epoch_ms: now_ms,
             };

@@ -1,6 +1,13 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue';
 import { invokeStudio } from '../api/tauri';
+import { useToast } from '../composables/useToast';
+
+const toast = useToast();
+const activeSubTab = ref<'providers' | 'routing' | 'apikeys'>('providers');
+const confirmingDeleteProvider = ref<string | null>(null);
+const confirmingRevokeKey = ref<string | null>(null);
+const copiedKey = ref(false);
 
 interface ProviderConfig {
   id: string;
@@ -132,6 +139,41 @@ const newTpm = ref(100000);
 function setNotice(message: string, type: 'info' | 'success' | 'error' = 'info') {
   notice.value = message;
   noticeType.value = type;
+  toast.push(message, type);
+}
+
+async function copyIssuedKey() {
+  if (!newlyIssuedKey.value) return;
+  try {
+    await navigator.clipboard.writeText(newlyIssuedKey.value);
+    copiedKey.value = true;
+    toast.success('已复制新签发的 API Key 到剪贴板');
+    window.setTimeout(() => (copiedKey.value = false), 2000);
+  } catch {
+    toast.error('复制失败，请手动选中复制');
+  }
+}
+
+function toggleProviderInChain(tier: 'fast' | 'reasoning', providerId: string) {
+  const chain = tier === 'fast' ? routerConfig.value.fast_chain : routerConfig.value.reasoning_chain;
+  const idx = chain.indexOf(providerId);
+  if (idx >= 0) {
+    chain.splice(idx, 1);
+  } else {
+    chain.push(providerId);
+  }
+  fastChainText.value = routerConfig.value.fast_chain.join(', ');
+  reasoningChainText.value = routerConfig.value.reasoning_chain.join(', ');
+}
+
+function moveInChain(tier: 'fast' | 'reasoning', idx: number, dir: -1 | 1) {
+  const chain = tier === 'fast' ? routerConfig.value.fast_chain : routerConfig.value.reasoning_chain;
+  const target = idx + dir;
+  if (target < 0 || target >= chain.length) return;
+  const [item] = chain.splice(idx, 1);
+  chain.splice(target, 0, item);
+  fastChainText.value = routerConfig.value.fast_chain.join(', ');
+  reasoningChainText.value = routerConfig.value.reasoning_chain.join(', ');
 }
 
 function applyPreset(preset: (typeof presets)[number]) {
@@ -214,6 +256,7 @@ async function removeProvider(id: string) {
   try {
     await invokeStudio('delete_llm_provider', { providerId: id });
     delete probeStatusMap[id];
+    confirmingDeleteProvider.value = null;
     setNotice(`已删除 Provider：${id}`, 'info');
     await loadAll();
   } catch (err) {
@@ -283,6 +326,7 @@ async function handleIssueKey() {
 async function handleRevokeKey(keyId: string) {
   try {
     await invokeStudio('revoke_api_key', { keyId });
+    confirmingRevokeKey.value = null;
     setNotice(`已吊销 API Key：${keyId}`, 'info');
     await loadAll();
   } catch (err) {
@@ -302,12 +346,38 @@ onMounted(loadAll);
           配置云端/院内私有化 LLM API 地址、API Key 与模型名称，支持一键连通性测速、Fast/Reasoning 故障转移路由与多租户 API Key 管理
         </p>
       </div>
-      <button
-        @click="showAddForm = !showAddForm"
-        class="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-sm font-medium text-white"
-      >
-        {{ showAddForm ? '收起新增表单' : '+ 新增 AI 模型 API' }}
-      </button>
+      <div class="flex flex-wrap items-center gap-2">
+        <div class="flex rounded-lg bg-slate-900 p-1 border border-slate-800 text-xs">
+          <button
+            @click="activeSubTab = 'providers'"
+            :class="activeSubTab === 'providers' ? 'bg-sky-600 text-white' : 'text-slate-400 hover:text-white'"
+            class="px-3 py-1.5 rounded-md font-medium transition-colors"
+          >
+            模型 Provider ({{ providers.length }})
+          </button>
+          <button
+            @click="activeSubTab = 'routing'"
+            :class="activeSubTab === 'routing' ? 'bg-sky-600 text-white' : 'text-slate-400 hover:text-white'"
+            class="px-3 py-1.5 rounded-md font-medium transition-colors"
+          >
+            路由链与熔断
+          </button>
+          <button
+            @click="activeSubTab = 'apikeys'"
+            :class="activeSubTab === 'apikeys' ? 'bg-sky-600 text-white' : 'text-slate-400 hover:text-white'"
+            class="px-3 py-1.5 rounded-md font-medium transition-colors"
+          >
+            多租户 API Key ({{ apiKeys.length }})
+          </button>
+        </div>
+        <button
+          v-if="activeSubTab === 'providers'"
+          @click="showAddForm = !showAddForm"
+          class="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-sm font-medium text-white"
+        >
+          {{ showAddForm ? '收起新增表单' : '+ 新增 AI 模型 API' }}
+        </button>
+      </div>
     </header>
 
     <div
@@ -323,7 +393,7 @@ onMounted(loadAll);
     </div>
 
     <!-- Add New AI Model Provider Form -->
-    <div v-if="showAddForm" class="p-4 rounded-xl bg-slate-900 border border-sky-700/60 space-y-4 text-xs">
+    <div v-if="activeSubTab === 'providers' && showAddForm" class="p-4 rounded-xl bg-slate-900 border border-sky-700/60 space-y-4 text-xs">
       <div class="flex flex-wrap items-center justify-between gap-2">
         <h3 class="font-semibold text-white text-sm">新增 AI 模型 API 配置</h3>
         <div class="flex flex-wrap items-center gap-1.5">
@@ -454,7 +524,7 @@ onMounted(loadAll);
     </div>
 
     <!-- Configured Providers -->
-    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+    <div v-if="activeSubTab === 'providers'" class="grid grid-cols-1 lg:grid-cols-2 gap-4">
       <div
         v-for="p in providers"
         :key="p.id"
@@ -586,8 +656,24 @@ onMounted(loadAll);
               保存配置
             </button>
           </div>
+          <div v-if="confirmingDeleteProvider === p.id" class="flex items-center gap-1.5">
+            <span class="text-rose-300">确认删除？</span>
+            <button
+              @click="removeProvider(p.id)"
+              class="px-2.5 py-1 rounded bg-rose-600 hover:bg-rose-500 text-white font-medium"
+            >
+              确定
+            </button>
+            <button
+              @click="confirmingDeleteProvider = null"
+              class="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300"
+            >
+              取消
+            </button>
+          </div>
           <button
-            @click="removeProvider(p.id)"
+            v-else
+            @click="confirmingDeleteProvider = p.id"
             class="px-2.5 py-1.5 rounded bg-slate-800 hover:bg-rose-900/70 text-rose-300 border border-slate-700"
           >
             删除
@@ -597,23 +683,79 @@ onMounted(loadAll);
     </div>
 
     <!-- Router Strategy -->
-    <div class="p-4 rounded-xl bg-slate-900 border border-slate-800 space-y-3 text-xs">
-      <h3 class="font-semibold text-white text-sm">Fast / Reasoning 路由链与熔断策略</h3>
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-        <div>
-          <label class="block text-slate-400 mb-1">Fast 路由链（逗号分隔 Provider ID）</label>
+    <div v-if="activeSubTab === 'routing'" class="p-5 rounded-xl bg-slate-900 border border-slate-800 space-y-4 text-xs">
+      <div>
+        <h3 class="font-semibold text-white text-sm">Fast / Reasoning 故障转移路由链与熔断策略</h3>
+        <p class="text-slate-400 mt-0.5">点击下方模型即可加入或移出路由链，使用 ← / → 调整故障转移优先级顺序</p>
+      </div>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-2.5">
+          <label class="block font-semibold text-sky-300">Fast 快思考路由链（Query 改写 / 轻量任务）</label>
+          <div class="flex flex-wrap gap-1.5 min-h-[32px]">
+            <span
+              v-for="(pid, idx) in routerConfig.fast_chain"
+              :key="pid"
+              class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-sky-900/70 text-sky-200 border border-sky-700/60 font-mono"
+            >
+              <span class="text-[10px] opacity-70">#{{ idx + 1 }}</span>
+              {{ pid }}
+              <button type="button" @click="moveInChain('fast', idx, -1)" class="hover:text-white px-0.5" title="前移">←</button>
+              <button type="button" @click="moveInChain('fast', idx, 1)" class="hover:text-white px-0.5" title="后移">→</button>
+              <button type="button" @click="toggleProviderInChain('fast', pid)" class="hover:text-rose-300 ml-0.5">✕</button>
+            </span>
+            <span v-if="routerConfig.fast_chain.length === 0" class="text-slate-500">未选择（请点击下方模型添加）</span>
+          </div>
+          <div class="flex flex-wrap gap-1.5 pt-1 border-t border-slate-800">
+            <button
+              v-for="p in providers"
+              :key="`fast-opt-${p.id}`"
+              type="button"
+              @click="toggleProviderInChain('fast', p.id)"
+              :class="routerConfig.fast_chain.includes(p.id) ? 'bg-sky-600/30 border-sky-500 text-sky-200' : 'bg-slate-900 border-slate-700 text-slate-400 hover:text-white'"
+              class="px-2 py-0.5 rounded border font-mono text-[11px]"
+            >
+              {{ routerConfig.fast_chain.includes(p.id) ? '✓ ' : '+ ' }}{{ p.id }}
+            </button>
+          </div>
           <input
             v-model="fastChainText"
             placeholder="deepseek_fast, ollama_local"
-            class="w-full px-3 py-1.5 rounded bg-slate-950 border border-slate-700 font-mono"
+            class="w-full px-3 py-1.5 rounded bg-slate-900 border border-slate-700 font-mono text-[11px]"
           />
         </div>
-        <div>
-          <label class="block text-slate-400 mb-1">Reasoning 路由链（逗号分隔 Provider ID）</label>
+
+        <div class="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-2.5">
+          <label class="block font-semibold text-indigo-300">Reasoning 慢思考路由链（主分诊决策 / 规范化）</label>
+          <div class="flex flex-wrap gap-1.5 min-h-[32px]">
+            <span
+              v-for="(pid, idx) in routerConfig.reasoning_chain"
+              :key="pid"
+              class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-indigo-900/70 text-indigo-200 border border-indigo-700/60 font-mono"
+            >
+              <span class="text-[10px] opacity-70">#{{ idx + 1 }}</span>
+              {{ pid }}
+              <button type="button" @click="moveInChain('reasoning', idx, -1)" class="hover:text-white px-0.5" title="前移">←</button>
+              <button type="button" @click="moveInChain('reasoning', idx, 1)" class="hover:text-white px-0.5" title="后移">→</button>
+              <button type="button" @click="toggleProviderInChain('reasoning', pid)" class="hover:text-rose-300 ml-0.5">✕</button>
+            </span>
+            <span v-if="routerConfig.reasoning_chain.length === 0" class="text-slate-500">未选择（请点击下方模型添加）</span>
+          </div>
+          <div class="flex flex-wrap gap-1.5 pt-1 border-t border-slate-800">
+            <button
+              v-for="p in providers"
+              :key="`reason-opt-${p.id}`"
+              type="button"
+              @click="toggleProviderInChain('reasoning', p.id)"
+              :class="routerConfig.reasoning_chain.includes(p.id) ? 'bg-indigo-600/30 border-indigo-500 text-indigo-200' : 'bg-slate-900 border-slate-700 text-slate-400 hover:text-white'"
+              class="px-2 py-0.5 rounded border font-mono text-[11px]"
+            >
+              {{ routerConfig.reasoning_chain.includes(p.id) ? '✓ ' : '+ ' }}{{ p.id }}
+            </button>
+          </div>
           <input
             v-model="reasoningChainText"
             placeholder="qwen_med_reasoning"
-            class="w-full px-3 py-1.5 rounded bg-slate-950 border border-slate-700 font-mono"
+            class="w-full px-3 py-1.5 rounded bg-slate-900 border border-slate-700 font-mono text-[11px]"
           />
         </div>
       </div>
@@ -652,7 +794,7 @@ onMounted(loadAll);
     </div>
 
     <!-- API Keys & Metrics -->
-    <div class="p-4 rounded-xl bg-slate-900 border border-slate-800 space-y-3 text-xs">
+    <div v-if="activeSubTab === 'apikeys'" class="p-5 rounded-xl bg-slate-900 border border-slate-800 space-y-4 text-xs">
       <div class="flex justify-between items-center">
         <h3 class="font-semibold text-white text-sm">对外多租户 API Key 管理</h3>
         <span v-if="metrics" class="text-slate-400">
@@ -660,23 +802,39 @@ onMounted(loadAll);
         </span>
       </div>
       <div class="grid grid-cols-2 md:grid-cols-5 gap-2">
-        <input v-model="newTenantId" placeholder="租户ID" class="px-2 py-1.5 rounded bg-slate-950 border border-slate-700" />
-        <input v-model="newKeyName" placeholder="应用名称" class="px-2 py-1.5 rounded bg-slate-950 border border-slate-700" />
-        <input type="number" v-model.number="newQpm" placeholder="QPM" class="px-2 py-1.5 rounded bg-slate-950 border border-slate-700" />
-        <input type="number" v-model.number="newTpm" placeholder="TPM" class="px-2 py-1.5 rounded bg-slate-950 border border-slate-700" />
-        <button @click="handleIssueKey" class="px-3 py-1.5 rounded bg-sky-600 hover:bg-sky-500 font-medium text-white">
+        <input v-model="newTenantId" placeholder="租户ID" class="px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-700" />
+        <input v-model="newKeyName" placeholder="应用名称" class="px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-700" />
+        <input type="number" v-model.number="newQpm" placeholder="QPM" class="px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-700" />
+        <input type="number" v-model.number="newTpm" placeholder="TPM" class="px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-700" />
+        <button @click="handleIssueKey" class="px-3 py-1.5 rounded-lg bg-sky-600 hover:bg-sky-500 font-medium text-white">
           签发新 Key
         </button>
       </div>
-      <div v-if="newlyIssuedKey" class="p-2 rounded bg-emerald-950 border border-emerald-700 font-mono text-emerald-300">
-        新签发 API Key（仅展示一次）：{{ newlyIssuedKey }}
+      <div
+        v-if="newlyIssuedKey"
+        class="p-3 rounded-lg bg-emerald-950 border border-emerald-700 font-mono text-emerald-300 flex flex-wrap items-center justify-between gap-2"
+      >
+        <span class="break-all">新签发 API Key（仅展示一次）：{{ newlyIssuedKey }}</span>
+        <button
+          @click="copyIssuedKey"
+          class="px-3 py-1 rounded bg-emerald-700 hover:bg-emerald-600 text-white font-sans text-xs shrink-0"
+        >
+          {{ copiedKey ? '✓ 已复制' : '一键复制' }}
+        </button>
       </div>
       <div class="space-y-1.5">
-        <div v-for="k in apiKeys" :key="k.key_id" class="flex justify-between items-center p-2 rounded bg-slate-950">
+        <div v-for="k in apiKeys" :key="k.key_id" class="flex justify-between items-center p-2.5 rounded-lg bg-slate-950 border border-slate-800/80">
           <span>
-            <strong>{{ k.name }}</strong> ({{ k.tenant_id }}) · {{ k.key_prefix }}*** · QPM {{ k.qpm_limit }} / TPM {{ k.tpm_limit }}
+            <strong>{{ k.name }}</strong> ({{ k.tenant_id }}) · <span class="font-mono text-sky-300">{{ k.key_prefix }}***</span> · QPM {{ k.qpm_limit }} / TPM {{ k.tpm_limit }}
           </span>
-          <button v-if="!k.revoked" @click="handleRevokeKey(k.key_id)" class="text-rose-400 hover:underline">吊销</button>
+          <div v-if="!k.revoked" class="flex items-center gap-2">
+            <template v-if="confirmingRevokeKey === k.key_id">
+              <span class="text-rose-300">确认吊销？</span>
+              <button @click="handleRevokeKey(k.key_id)" class="px-2 py-0.5 rounded bg-rose-600 text-white">确定</button>
+              <button @click="confirmingRevokeKey = null" class="text-slate-400">取消</button>
+            </template>
+            <button v-else @click="confirmingRevokeKey = k.key_id" class="text-rose-400 hover:underline">吊销</button>
+          </div>
           <span v-else class="text-slate-500">已吊销</span>
         </div>
       </div>

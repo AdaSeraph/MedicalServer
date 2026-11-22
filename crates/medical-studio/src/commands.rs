@@ -847,6 +847,28 @@ pub async fn upsert_epidemic_context(
     upsert_epidemic_context_impl(&state, ctx).await
 }
 
+pub async fn delete_epidemic_context_impl(
+    state: &StudioState,
+    context_id: String,
+) -> Result<bool, String> {
+    let deleted = state
+        .stores
+        .epidemics
+        .delete(&context_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    state.sync_ecs_resources().await?;
+    Ok(deleted)
+}
+
+#[tauri::command]
+pub async fn delete_epidemic_context(
+    state: State<'_, StudioState>,
+    context_id: String,
+) -> Result<bool, String> {
+    delete_epidemic_context_impl(&state, context_id).await
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HotReloadNotifyResult {
     pub local_reloaded: bool,

@@ -20,10 +20,13 @@
         <view wx:if="{{item.triage_result}}" class="triage-card card">
           <view class="card-header">
             <text class="dept-name">推荐科室：{{item.triage_result.primary_department}}</text>
-            <text class="urgency-tag">紧急度 {{item.triage_result.urgency_level}} 级</text>
+            <text class="urgency-tag urgency-l{{item.triage_result.urgency_level}}">紧急度 {{item.triage_result.urgency_level}} 级</text>
           </view>
           <view wx:if="{{item.triage_result.secondary_departments.length > 0}}" class="secondary-depts">
-            <text>备选科室：{{item.triage_result.secondary_departments}}</text>
+            <text class="secondary-label">备选科室：</text>
+            <block wx:for="{{item.triage_result.secondary_departments}}" wx:for-item="secDept" wx:key="*this">
+              <text class="secondary-pill">{{secDept}}</text>
+            </block>
           </view>
           <view class="card-summary">
             <text>{{item.triage_result.summary}}</text>

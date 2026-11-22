@@ -100,6 +100,8 @@ impl TenantRateLimiter {
         if estimated_tokens > 0
             && let Err(retry_after_secs) = entry.tpm.try_consume(estimated_tokens as f64)
         {
+            // Roll back QPM token so TPM-rejected requests do not burn QPM quota
+            entry.qpm.tokens = (entry.qpm.tokens + 1.0).min(entry.qpm.capacity);
             return Err(RateLimitRejection {
                 kind: "tpm",
                 retry_after_secs,

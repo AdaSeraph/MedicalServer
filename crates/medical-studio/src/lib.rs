@@ -37,6 +37,7 @@ pub fn run() {
             // Module 3: Seasonal & Epidemic Context Console
             commands::list_epidemic_contexts,
             commands::upsert_epidemic_context,
+            commands::delete_epidemic_context,
             commands::notify_server_hot_reload,
             // Module 4: Keyword & Red-Flag Dictionary Manager
             commands::get_medical_dictionaries,

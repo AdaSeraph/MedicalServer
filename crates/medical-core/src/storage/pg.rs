@@ -27,6 +27,9 @@ use super::{StorageError, StorageResult};
 pub fn connect_pg_lazy(database_url: &str, max_connections: u32) -> StorageResult<PgPool> {
     PgPoolOptions::new()
         .max_connections(max_connections.max(1))
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .idle_timeout(Some(std::time::Duration::from_secs(300)))
+        .max_lifetime(Some(std::time::Duration::from_secs(1800)))
         .connect_lazy(database_url)
         .map_err(StorageError::from)
 }

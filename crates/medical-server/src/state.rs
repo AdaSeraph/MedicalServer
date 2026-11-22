@@ -15,7 +15,12 @@ use medical_core::llm::{
 use medical_core::models::{
     EpidemicContext, KnowledgeDocument, Season, SectionType, SourceType, TargetPopulation,
 };
-use medical_core::storage::{CoreStores, IssueApiKeyRequest};
+use medical_core::storage::{
+    CoreStores, IssueApiKeyRequest, PgApiKeyStore, PgAuditLogStore, PgCheckpointStore,
+    PgDictionaryStore, PgEpidemicStore, PgLlmProviderStore, PgPatientMemoryStore,
+    QdrantKnowledgeStore, QdrantPatientL3Store, RedisSessionCache, connect_pg_lazy,
+    qdrant::connect_qdrant,
+};
 use medical_pipeline::{
     DualWriteIndexer, HybridKnowledgeSearchEngine, TantivyKnowledgeIndex,
     parse_collection_bundle_file,
@@ -84,6 +89,34 @@ impl AppState {
         );
 
         let mut stores = CoreStores::in_memory(cipher.clone());
+
+        // Wire production PG / Redis / Qdrant adapters when offline_mode is disabled
+        if !config.offline_mode {
+            if let Some(ref db_url) = config.database_url {
+                let pool = connect_pg_lazy(db_url, 32)
+                    .map_err(|e| format!("failed to init postgres pool: {e}"))?;
+                stores.patient_memory =
+                    Arc::new(PgPatientMemoryStore::new(pool.clone(), cipher.clone()));
+                stores.epidemics = Arc::new(PgEpidemicStore::new(pool.clone()));
+                stores.dictionaries = Arc::new(PgDictionaryStore::new(pool.clone()));
+                stores.audit_logs = Arc::new(PgAuditLogStore::new(pool.clone()));
+                stores.api_keys = Arc::new(PgApiKeyStore::new(pool.clone()));
+                stores.llm_providers =
+                    Arc::new(PgLlmProviderStore::new(pool.clone(), cipher.clone()));
+                stores.checkpoints = Arc::new(PgCheckpointStore::new(pool));
+            }
+            if let Some(ref redis_url) = config.redis_url {
+                let cache = RedisSessionCache::from_url(redis_url)
+                    .map_err(|e| format!("failed to init redis session cache: {e}"))?;
+                stores.session_cache = Arc::new(cache);
+            }
+            if let Some(ref qdrant_url) = config.qdrant_url {
+                let qclient = connect_qdrant(qdrant_url, None)
+                    .map_err(|e| format!("failed to init qdrant client: {e}"))?;
+                stores.knowledge_vectors = Arc::new(QdrantKnowledgeStore::new(qclient.clone()));
+                stores.patient_l3_vectors = Arc::new(QdrantPatientL3Store::new(qclient));
+            }
+        }
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbeddingProvider::new(1024));
         let reranker: Arc<dyn RerankProvider> = Arc::new(MockRerankProvider::new());
 

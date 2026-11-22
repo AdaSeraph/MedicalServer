@@ -94,7 +94,7 @@ impl TriageEngine {
     pub fn new(resources: Arc<ArcSwap<TriageResources>>) -> Self {
         Self {
             resources,
-            pool: WorldPool::new(64),
+            pool: WorldPool::new(256),
         }
     }
 
@@ -111,6 +111,65 @@ impl TriageEngine {
 
     pub fn reload_resources(&self, new_resources: TriageResources) {
         self.resources.store(Arc::new(new_resources));
+    }
+
+    /// Lightweight Stage-1-only CPU red-flag check (< 1ms, zero I/O, zero LLM calls).
+    /// Ideal for fast emergency interception on high-concurrency proxy endpoints.
+    pub fn check_red_flag_fast(&self, utterance: &str) -> RedFlagAlert {
+        if utterance.trim().is_empty() {
+            return RedFlagAlert::default();
+        }
+        let res = self.resources.load_full();
+        let scrubbed = scrub_pii(utterance).scrubbed_text;
+        let mut guard = self.pool.acquire();
+        let entity = {
+            let world = guard.world_mut();
+            world.insert_resource(SharedTriageResources(res));
+            world
+                .spawn((
+                    PatientIdentity {
+                        session_id: String::new(),
+                        patient_id: String::new(),
+                        tenant_id: "default".to_string(),
+                        region_code: None,
+                        target_population: vec![TargetPopulation::Adult],
+                        consent_long_term_memory: false,
+                    },
+                    RawUtterance {
+                        text: utterance.to_string(),
+                        scrubbed_text: scrubbed,
+                        received_at: Utc::now(),
+                    },
+                    PatientProfile::default(),
+                    SessionMemory::default(),
+                    MemoryRecall::default(),
+                    ExtractedSymptoms::default(),
+                    RedFlagAlert::default(),
+                    RagEvidence::default(),
+                    TriageSlots::default(),
+                    TriageResponse {
+                        status: TriageStatus::FollowUp,
+                        session_id: String::new(),
+                        red_flag: RedFlagLevel::None,
+                        turn: 1,
+                        max_turns: 4,
+                        question: None,
+                        quick_options: Vec::new(),
+                        seasonal_context_applied: Vec::new(),
+                        triage_result: None,
+                        citations: Vec::new(),
+                        is_fallback: false,
+                    },
+                    ConsolidationPlan::default(),
+                ))
+                .id()
+        };
+        guard.run_stage1();
+        guard
+            .world_mut()
+            .get::<RedFlagAlert>(entity)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub async fn run_triage(
@@ -269,13 +328,14 @@ impl TriageEngine {
             .or_else(|| raw_l2.as_ref().map(|r| r.consent_long_term_memory))
             .unwrap_or(false);
 
+        let stage2_q_vec = q_vec_res.ok();
         let l2_record = if effective_consent { raw_l2 } else { None };
         let l3_events = if effective_consent {
-            if let Ok(q_vec) = q_vec_res {
+            if let Some(ref q_vec) = stage2_q_vec {
                 res.clients
                     .stores
                     .patient_l3_vectors
-                    .recall_similar_events(&req.patient_id, &q_vec, 3)
+                    .recall_similar_events(&req.patient_id, q_vec, 3)
                     .await
                     .unwrap_or_default()
             } else {
@@ -419,7 +479,12 @@ impl TriageEngine {
             (id.target_population.clone(), sym.normalized_terms.clone())
         };
 
-        let q_vec = res.clients.embedding.embed_one(&final_query).await.ok();
+        // Reuse Stage 2 embedding when query did not change, avoiding duplicate embedding latency.
+        let q_vec = if final_query == scrubbed_utterance && stage2_q_vec.is_some() {
+            stage2_q_vec
+        } else {
+            res.clients.embedding.embed_one(&final_query).await.ok()
+        };
         let search_query = KnowledgeSearchQuery {
             query_text: final_query.clone(),
             query_vector: q_vec.clone(),
@@ -430,34 +495,42 @@ impl TriageEngine {
             top_k: res.config.rag_top_k.max(5),
         };
 
-        let (search_res, vec_res) = tokio::join!(
-            res.clients.stores.knowledge_search.search(&search_query),
-            async {
-                if let Some(ref v) = q_vec {
-                    res.clients
-                        .stores
-                        .knowledge_vectors
-                        .search_vectors(
-                            v,
-                            &KnowledgeVectorFilter {
-                                target_population: Some(target_pop),
-                                department: None,
-                                tenant_namespace: Some(req.tenant_id.clone()),
-                            },
-                            res.config.rag_top_k.max(5),
-                        )
-                        .await
-                } else {
-                    Ok(Vec::new())
-                }
-            }
-        );
+        let search_hits = res
+            .clients
+            .stores
+            .knowledge_search
+            .search(&search_query)
+            .await
+            .unwrap_or_default();
+
+        // Only query vector store separately if `knowledge_search` did not already perform hybrid vector search.
+        let already_has_vectors = search_hits.iter().any(|h| h.vector_score.is_some());
+        let vec_hits = if !already_has_vectors
+            && let Some(ref v) = q_vec
+        {
+            res.clients
+                .stores
+                .knowledge_vectors
+                .search_vectors(
+                    v,
+                    &KnowledgeVectorFilter {
+                        target_population: Some(target_pop),
+                        department: None,
+                        tenant_namespace: Some(req.tenant_id.clone()),
+                    },
+                    res.config.rag_top_k.max(5),
+                )
+                .await
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         let mut merged_hits: HashMap<String, KnowledgeSearchHit> = HashMap::new();
-        for hit in search_res.unwrap_or_default() {
+        for hit in search_hits {
             merged_hits.insert(hit.doc_id.clone(), hit);
         }
-        for hit in vec_res.unwrap_or_default() {
+        for hit in vec_hits {
             merged_hits
                 .entry(hit.doc_id.clone())
                 .and_modify(|existing| {

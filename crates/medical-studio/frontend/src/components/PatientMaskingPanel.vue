@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue';
 import { invokeStudio } from '../api/tauri';
+import { useToast } from '../composables/useToast';
 import {
   formatBytes,
   readBrowserFilesToQueue,
   type BatchImportItem,
   type QueuedImportFile,
 } from '../utils/batchFiles';
+
+const toast = useToast();
 
 interface LlmProviderItem {
   id: string;
@@ -48,6 +51,18 @@ const messageKind = ref<'info' | 'success' | 'error'>('info');
 function setStatus(msg: string, kind: 'info' | 'success' | 'error' = 'info') {
   message.value = msg;
   messageKind.value = kind;
+  if (kind !== 'info') {
+    toast.push(msg, kind);
+  }
+}
+
+async function copyPatientId(pid: string) {
+  try {
+    await navigator.clipboard.writeText(pid);
+    toast.success('已复制匿名 Patient ID');
+  } catch {
+    toast.error('复制失败');
+  }
 }
 
 async function loadInitialConfig() {
@@ -524,8 +539,8 @@ async function handleCommitLocalPath() {
         <input v-model="salt" class="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-sm" />
       </div>
       <div class="md:col-span-3 flex gap-2">
-        <button @click="handlePreviewLocalPath" class="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-sm font-medium">PII 脱敏防火墙预检</button>
-        <button @click="handleCommitLocalPath" class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium">确认无明文 PII 并批量入库</button>
+        <button :disabled="isBusy" @click="handlePreviewLocalPath" class="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-sm font-medium text-white">PII 脱敏防火墙预检</button>
+        <button :disabled="isBusy" @click="handleCommitLocalPath" class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-sm font-medium text-white">确认无明文 PII 并批量入库</button>
       </div>
     </div>
 
@@ -581,14 +596,14 @@ async function handleCommitLocalPath() {
         </span>
       </div>
 
-      <div class="flex items-center justify-between">
+      <div class="sticky top-0 z-10 flex items-center justify-between py-2.5 px-3 rounded-xl bg-slate-900/95 backdrop-blur border border-slate-700/80 shadow-md">
         <h3 class="text-sm font-semibold text-white">标准匿名病例预览（共 {{ normalizedRecords.length }} 位患者）</h3>
         <button
           :disabled="isBusy"
           @click="handleCommitNormalizedRecords"
-          class="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-medium text-white"
+          class="px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-xs font-medium text-white"
         >
-          确认全部写入数据库
+          确认全部写入数据库 ({{ normalizedRecords.length }})
         </button>
       </div>
 
@@ -608,7 +623,15 @@ async function handleCommitLocalPath() {
           </thead>
           <tbody class="divide-y divide-slate-800 bg-slate-950">
             <tr v-for="(rec, idx) in normalizedRecords" :key="`${rec.patient_id}-${idx}`">
-              <td class="p-3 font-mono text-sky-300">{{ rec.patient_id.slice(0, 26) }}...</td>
+              <td class="p-3 font-mono text-sky-300">
+                <button
+                  @click="copyPatientId(rec.patient_id)"
+                  :title="`点击复制完整 ID: ${rec.patient_id}`"
+                  class="hover:underline text-left"
+                >
+                  {{ rec.patient_id.slice(0, 24) }}...
+                </button>
+              </td>
               <td class="p-3">{{ rec.l2_profile.age_group }}</td>
               <td class="p-3">{{ rec.l2_profile.gender }}</td>
               <td class="p-3">{{ (rec.l2_profile.chronic_diseases || []).join('、') || '无' }}</td>

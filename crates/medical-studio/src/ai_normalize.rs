@@ -2,6 +2,7 @@ use std::path::Path;
 
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use futures::stream::{self, StreamExt};
 use medical_core::crypto::{hash_api_key, hash_patient_id};
 use medical_core::llm::{
     LlmMessage, LlmProvider, LlmRequest, ModelTier, OpenAiCompatibleLlmProvider, ProviderConfig,
@@ -394,29 +395,40 @@ pub async fn ai_normalize_knowledge_with_provider(
 
         let segments = split_text_for_llm(&raw_text, 5500);
         let seg_count = segments.len();
+        let item_name = item.name.as_str();
+
+        // Execute segments concurrently (up to 4 in-flight) to dramatically speed up multi-segment imports
+        let mut seg_outcomes: Vec<(usize, Result<medical_core::llm::LlmResponse, medical_core::llm::LlmError>)> =
+            stream::iter(segments.into_iter().enumerate().map(|(seg_idx, seg)| async move {
+                let user_msg = format!(
+                    "来源名称: {}\n分段: {}/{}\n默认来源标题: {}\n默认科室: {}\n\n原始待规范化数据:\n{}",
+                    item_name,
+                    seg_idx + 1,
+                    seg_count,
+                    defaults.source_title,
+                    defaults.default_department,
+                    seg
+                );
+                let mut req = LlmRequest::new(
+                    ModelTier::Reasoning,
+                    vec![LlmMessage::system(system_prompt), LlmMessage::user(user_msg)],
+                );
+                req.temperature = Some(0.1);
+                req.max_tokens = Some(4096);
+                req.response_format_json = true;
+                req.timeout_ms = Some(timeout_ms);
+                (seg_idx, provider.complete_json(&req).await)
+            }))
+            .buffer_unordered(4)
+            .collect()
+            .await;
+        seg_outcomes.sort_by_key(|(idx, _)| *idx);
+
         let mut item_docs = Vec::new();
         let mut item_err: Option<String> = None;
 
-        for (seg_idx, seg) in segments.into_iter().enumerate() {
-            let user_msg = format!(
-                "来源名称: {}\n分段: {}/{}\n默认来源标题: {}\n默认科室: {}\n\n原始待规范化数据:\n{}",
-                item.name,
-                seg_idx + 1,
-                seg_count,
-                defaults.source_title,
-                defaults.default_department,
-                seg
-            );
-            let mut req = LlmRequest::new(
-                ModelTier::Reasoning,
-                vec![LlmMessage::system(system_prompt), LlmMessage::user(user_msg)],
-            );
-            req.temperature = Some(0.1);
-            req.max_tokens = Some(4096);
-            req.response_format_json = true;
-            req.timeout_ms = Some(timeout_ms);
-
-            match provider.complete_json(&req).await {
+        for (seg_idx, outcome) in seg_outcomes {
+            match outcome {
                 Ok(resp) => {
                     total_tokens = total_tokens.saturating_add(resp.usage.total_tokens);
                     match parse_ai_knowledge_response(&resp.content, &item.name, defaults, seg_idx)
@@ -539,27 +551,38 @@ pub async fn ai_normalize_patient_with_provider(
 
         let segments = split_text_for_llm(&text_for_llm, 5500);
         let seg_count = segments.len();
+        let item_name = item.name.as_str();
+
+        // Execute segments concurrently (up to 4 in-flight) for high-throughput batch normalization
+        let mut seg_outcomes: Vec<(usize, Result<medical_core::llm::LlmResponse, medical_core::llm::LlmError>)> =
+            stream::iter(segments.into_iter().enumerate().map(|(seg_idx, seg)| async move {
+                let user_msg = format!(
+                    "来源名称: {}\n分段: {}/{}\n\n原始病例数据:\n{}",
+                    item_name,
+                    seg_idx + 1,
+                    seg_count,
+                    seg
+                );
+                let mut req = LlmRequest::new(
+                    ModelTier::Reasoning,
+                    vec![LlmMessage::system(system_prompt), LlmMessage::user(user_msg)],
+                );
+                req.temperature = Some(0.1);
+                req.max_tokens = Some(4096);
+                req.response_format_json = true;
+                req.timeout_ms = Some(timeout_ms);
+                (seg_idx, provider.complete_json(&req).await)
+            }))
+            .buffer_unordered(4)
+            .collect()
+            .await;
+        seg_outcomes.sort_by_key(|(idx, _)| *idx);
+
         let mut item_records = Vec::new();
         let mut item_err: Option<String> = None;
 
-        for (seg_idx, seg) in segments.into_iter().enumerate() {
-            let user_msg = format!(
-                "来源名称: {}\n分段: {}/{}\n\n原始病例数据:\n{}",
-                item.name,
-                seg_idx + 1,
-                seg_count,
-                seg
-            );
-            let mut req = LlmRequest::new(
-                ModelTier::Reasoning,
-                vec![LlmMessage::system(system_prompt), LlmMessage::user(user_msg)],
-            );
-            req.temperature = Some(0.1);
-            req.max_tokens = Some(4096);
-            req.response_format_json = true;
-            req.timeout_ms = Some(timeout_ms);
-
-            match provider.complete_json(&req).await {
+        for (seg_idx, outcome) in seg_outcomes {
+            match outcome {
                 Ok(resp) => {
                     total_tokens = total_tokens.saturating_add(resp.usage.total_tokens);
                     match parse_ai_patient_response(&resp.content, &item.name, salt, seg_idx) {

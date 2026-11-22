@@ -1,54 +1,205 @@
 <script setup lang="ts">
-import { ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import KnowledgeImportPanel from './components/KnowledgeImportPanel.vue';
 import PatientMaskingPanel from './components/PatientMaskingPanel.vue';
 import EpidemicConsolePanel from './components/EpidemicConsolePanel.vue';
 import DictionaryManagerPanel from './components/DictionaryManagerPanel.vue';
 import EcsDebuggerPanel from './components/EcsDebuggerPanel.vue';
 import LlmGatewayPanel from './components/LlmGatewayPanel.vue';
+import ToastContainer from './components/ToastContainer.vue';
+import { initTheme, useTheme } from './composables/useTheme';
 
-const activeTab = ref<'knowledge' | 'patients' | 'epidemic' | 'dictionary' | 'ecs' | 'gateway'>('knowledge');
+type TabId = 'knowledge' | 'patients' | 'epidemic' | 'dictionary' | 'ecs' | 'gateway';
 
-const navItems = [
-  { id: 'knowledge', label: '1. 知识库导入工坊' },
-  { id: 'patients', label: '2. 病人数据与脱敏中心' },
-  { id: 'epidemic', label: '3. 季节与流行病控制台' },
-  { id: 'dictionary', label: '4. 关键词与急诊红线词典' },
-  { id: 'ecs', label: '5. ECS 分诊白盒调试台' },
-  { id: 'gateway', label: '6. AI 大模型与网关配置' },
-] as const;
+const activeTab = ref<TabId>('knowledge');
+const sidebarCollapsed = ref(false);
+const { theme, toggleTheme } = useTheme();
+
+const navItems: Array<{
+  id: TabId;
+  short: string;
+  label: string;
+  desc: string;
+  shortcut: string;
+  icon: string;
+}> = [
+  {
+    id: 'knowledge',
+    short: '知识库',
+    label: '知识库导入工坊',
+    desc: '多格式批量解析与 AI 规范化',
+    shortcut: '1',
+    icon: 'M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253',
+  },
+  {
+    id: 'patients',
+    short: '脱敏',
+    label: '病人数据与脱敏中心',
+    desc: 'PII 防火墙与 L2/L3 匿名入库',
+    shortcut: '2',
+    icon: 'M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z',
+  },
+  {
+    id: 'epidemic',
+    short: '流行病',
+    label: '季节与流行病控制台',
+    desc: '自定义地区/季节高发病与热更新',
+    shortcut: '3',
+    icon: 'M13 10V3L4 14h7v7l9-11h-7z',
+  },
+  {
+    id: 'dictionary',
+    short: '词典',
+    label: '关键词与急诊红线词典',
+    desc: '同义词映射与 120 红线沙盒',
+    shortcut: '4',
+    icon: 'M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z',
+  },
+  {
+    id: 'ecs',
+    short: 'ECS',
+    label: 'ECS 分诊白盒调试台',
+    desc: '模拟问诊与阶段耗时透视',
+    shortcut: '5',
+    icon: 'M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z',
+  },
+  {
+    id: 'gateway',
+    short: '网关',
+    label: 'AI 大模型与网关配置',
+    desc: 'Provider 路由、熔断与 API Key',
+    shortcut: '6',
+    icon: 'M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z',
+  },
+];
+
+const componentMap = {
+  knowledge: KnowledgeImportPanel,
+  patients: PatientMaskingPanel,
+  epidemic: EpidemicConsolePanel,
+  dictionary: DictionaryManagerPanel,
+  ecs: EcsDebuggerPanel,
+  gateway: LlmGatewayPanel,
+} as const;
+
+const currentComponent = computed(() => componentMap[activeTab.value]);
+
+function handleGlobalKeydown(e: KeyboardEvent) {
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
+    const idx = Number(e.key) - 1;
+    if (idx >= 0 && idx < navItems.length) {
+      e.preventDefault();
+      activeTab.value = navItems[idx].id;
+    }
+  }
+}
+
+onMounted(() => {
+  initTheme();
+  window.addEventListener('keydown', handleGlobalKeydown);
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', handleGlobalKeydown);
+});
 </script>
 
 <template>
-  <div class="min-h-screen flex bg-slate-950 text-slate-100">
-    <aside class="w-64 bg-slate-900 border-r border-slate-800 p-4 flex flex-col">
-      <div class="mb-6">
-        <h1 class="text-lg font-bold text-sky-400">MedicalStudio</h1>
-        <p class="text-xs text-slate-400">智能医疗分诊与知识库工作台</p>
+  <div class="h-screen flex overflow-hidden bg-slate-950 text-slate-100">
+    <!-- Sidebar -->
+    <aside
+      :class="sidebarCollapsed ? 'w-[72px]' : 'w-64'"
+      class="bg-slate-900 border-r border-slate-800 flex flex-col shrink-0 transition-all duration-200"
+    >
+      <!-- Brand Header -->
+      <div class="p-4 border-b border-slate-800 flex items-center justify-between gap-2">
+        <div v-if="!sidebarCollapsed" class="flex items-center gap-2.5 min-w-0">
+          <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-teal-500 to-sky-600 flex items-center justify-center text-white font-bold text-sm shadow-md shadow-sky-900/40 shrink-0">
+            M
+          </div>
+          <div class="min-w-0">
+            <h1 class="text-base font-bold text-white truncate tracking-tight">MedicalStudio</h1>
+            <p class="text-[11px] text-slate-400 truncate">智能医疗分诊工作台</p>
+          </div>
+        </div>
+        <div v-else class="mx-auto w-8 h-8 rounded-lg bg-gradient-to-br from-teal-500 to-sky-600 flex items-center justify-center text-white font-bold text-sm">
+          M
+        </div>
+        <button
+          v-if="!sidebarCollapsed"
+          @click="sidebarCollapsed = true"
+          class="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+          title="收起侧边栏"
+        >
+          <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M11 19l-7-7 7-7m8 14l-7-7 7-7" />
+          </svg>
+        </button>
       </div>
-      <nav class="space-y-1.5 flex-1">
+
+      <!-- Navigation -->
+      <nav class="p-2.5 space-y-1 flex-1 overflow-y-auto">
         <button
           v-for="item in navItems"
           :key="item.id"
           @click="activeTab = item.id"
-          :class="activeTab === item.id ? 'bg-sky-600 text-white' : 'text-slate-300 hover:bg-slate-800'"
-          class="w-full text-left px-3 py-2.5 rounded-lg text-sm font-medium transition-colors"
+          :title="sidebarCollapsed ? `${item.label} (Ctrl+${item.shortcut})` : item.desc"
+          :class="
+            activeTab === item.id
+              ? 'bg-sky-600 text-white shadow-sm shadow-sky-900/40'
+              : 'text-slate-300 hover:bg-slate-800/90 hover:text-white'
+          "
+          class="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-medium transition-all group"
         >
-          {{ item.label }}
+          <svg class="w-4 h-4 shrink-0 opacity-90" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8">
+            <path stroke-linecap="round" stroke-linejoin="round" :d="item.icon" />
+          </svg>
+          <span v-if="!sidebarCollapsed" class="flex-1 text-left truncate">{{ item.label }}</span>
         </button>
       </nav>
-      <div class="text-[11px] text-slate-500 pt-4 border-t border-slate-800">
-        Tauri 2.0 · Rust Workspace
+
+      <!-- Footer Controls -->
+      <div class="p-3 border-t border-slate-800 space-y-2">
+        <button
+          v-if="sidebarCollapsed"
+          @click="sidebarCollapsed = false"
+          class="w-full flex justify-center p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300"
+          title="展开侧边栏"
+        >
+          <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M13 5l7 7-7 7M5 5l7 7-7 7" />
+          </svg>
+        </button>
+
+        <button
+          @click="toggleTheme"
+          class="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 transition-colors"
+          :title="theme === 'dark' ? '切换至医疗浅色主题' : '切换至深色运维主题'"
+        >
+          <svg v-if="theme === 'dark'" class="w-4 h-4 text-amber-300 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
+          </svg>
+          <svg v-else class="w-4 h-4 text-sky-600 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+          </svg>
+          <span v-if="!sidebarCollapsed">{{ theme === 'dark' ? '切换医疗浅色模式' : '切换深色运维模式' }}</span>
+        </button>
+
+        <div v-if="!sidebarCollapsed" class="flex items-center justify-between text-[11px] text-slate-500 px-1 pt-0.5">
+          <span>Tauri 2.0 · Rust</span>
+          <span>Ctrl+1~6 切换</span>
+        </div>
       </div>
     </aside>
 
-    <main class="flex-1 p-6 overflow-y-auto">
-      <KnowledgeImportPanel v-if="activeTab === 'knowledge'" />
-      <PatientMaskingPanel v-else-if="activeTab === 'patients'" />
-      <EpidemicConsolePanel v-else-if="activeTab === 'epidemic'" />
-      <DictionaryManagerPanel v-else-if="activeTab === 'dictionary'" />
-      <EcsDebuggerPanel v-else-if="activeTab === 'ecs'" />
-      <LlmGatewayPanel v-else />
+    <!-- Main Workspace (KeepAlive preserves queue, preview & debug state across tab switches) -->
+    <main class="flex-1 p-6 overflow-y-auto min-w-0">
+      <KeepAlive>
+        <component :is="currentComponent" />
+      </KeepAlive>
     </main>
+
+    <!-- Global Toast Notifications -->
+    <ToastContainer />
   </div>
 </template>

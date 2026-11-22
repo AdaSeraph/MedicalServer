@@ -105,12 +105,49 @@
   border-radius: 999rpx;
   background-color: #fef3c7;
   color: #b45309;
+  font-weight: 600;
+}
+
+.urgency-l1 {
+  background-color: #fee2e2;
+  color: #b91c1c;
+}
+
+.urgency-l2 {
+  background-color: #ffedd5;
+  color: #c2410c;
+}
+
+.urgency-l3 {
+  background-color: #fef3c7;
+  color: #b45309;
+}
+
+.urgency-l4 {
+  background-color: #ccfbf1;
+  color: #0f766e;
 }
 
 .secondary-depts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10rpx;
   font-size: 24rpx;
   color: #475569;
   margin-bottom: 12rpx;
+}
+
+.secondary-label {
+  color: #64748b;
+}
+
+.secondary-pill {
+  padding: 4rpx 14rpx;
+  border-radius: 999rpx;
+  background-color: #f1f5f9;
+  color: #334155;
+  font-size: 22rpx;
 }
 
 .card-summary {
@@ -149,7 +186,7 @@
   display: flex;
   align-items: center;
   gap: 16rpx;
-  padding: 18rpx 24rpx;
+  padding: 18rpx 24rpx calc(18rpx + env(safe-area-inset-bottom));
   background-color: #ffffff;
   border-top: 1rpx solid #e2e8f0;
 }

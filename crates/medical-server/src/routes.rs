@@ -2,7 +2,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -12,9 +12,9 @@ use chrono::Utc;
 use futures::stream;
 use medical_core::crypto::hash_patient_id;
 use medical_core::ecs::{TriageRequest, TriageStreamEvent};
-use medical_core::llm::{LlmMessage, LlmRequest, MessageRole, ModelTier};
+use medical_core::llm::{LlmMessage, LlmRequest, LlmStreamChunk, MessageRole, ModelTier};
 use medical_core::models::{
-    EpidemicContext, PatientRecord, RedFlagLevel, TargetPopulation, TriageStatus,
+    EpidemicContext, PatientRecord, RedFlagLevel, TargetPopulation,
 };
 use medical_core::privacy::{MEDICAL_DISCLAIMER, sanitize_medical_output, scrub_pii};
 use medical_core::storage::KnowledgeSearchQuery;
@@ -22,6 +22,7 @@ use medical_core::validation::Validate;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tower::limit::ConcurrencyLimitLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -54,6 +55,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/admin/reload", post(admin_reload_handler))
         .route("/v1/admin/epidemics", post(admin_upsert_epidemic_handler))
+        .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
+        .layer(ConcurrencyLimitLayer::new(512))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -221,6 +224,7 @@ async fn wechat_auth_handler(
 #[derive(Debug, Deserialize)]
 struct TriageChatRequest {
     session_id: String,
+    #[allow(dead_code)]
     #[serde(default)]
     patient_id: Option<String>,
     utterance: String,
@@ -290,33 +294,38 @@ async fn triage_chat_handler(
         let started = Instant::now();
 
         tokio::spawn(async move {
-            let outcome = state_bg.triage_engine.run_triage(triage_req).await;
-            state_bg
-                .metrics
-                .triage_duration_seconds
-                .observe(started.elapsed().as_secs_f64());
+            // Cancel in-flight LLM/RAG work immediately if the SSE client disconnects
+            tokio::select! {
+                _ = tx.closed() => {}
+                outcome = state_bg.triage_engine.run_triage(triage_req) => {
+                    state_bg
+                        .metrics
+                        .triage_duration_seconds
+                        .observe(started.elapsed().as_secs_f64());
 
-            match outcome {
-                Ok(exec) => {
-                    if exec.response.is_fallback {
-                        state_bg.metrics.llm_errors_total.inc();
+                    match outcome {
+                        Ok(exec) => {
+                            if exec.response.is_fallback {
+                                state_bg.metrics.llm_errors_total.inc();
+                            }
+                            if let Some(ref k) = api_key_rec {
+                                state_bg.rate_limiter.record_actual_tokens(
+                                    &k.key_id,
+                                    k.tpm_limit,
+                                    exec.trace.llm_calls_made.saturating_mul(128),
+                                );
+                            }
+                            let _ = tx.send(TriageStreamEvent::Result(exec.response)).await;
+                        }
+                        Err(e) => {
+                            state_bg.metrics.llm_errors_total.inc();
+                            let _ = tx
+                                .send(TriageStreamEvent::Error {
+                                    message: e.to_string(),
+                                })
+                                .await;
+                        }
                     }
-                    if let Some(ref k) = api_key_rec {
-                        state_bg.rate_limiter.record_actual_tokens(
-                            &k.key_id,
-                            k.tpm_limit,
-                            exec.trace.llm_calls_made.saturating_mul(128),
-                        );
-                    }
-                    let _ = tx.send(TriageStreamEvent::Result(exec.response)).await;
-                }
-                Err(e) => {
-                    state_bg.metrics.llm_errors_total.inc();
-                    let _ = tx
-                        .send(TriageStreamEvent::Error {
-                            message: e.to_string(),
-                        })
-                        .await;
                 }
             }
             state_bg.metrics.sse_active_connections.dec();
@@ -356,20 +365,10 @@ async fn triage_chat_handler(
 
     // Non-streaming JSON mode
     let started = Instant::now();
-    let failures_before: u64 = state
-        .model_router
-        .health_metrics()
-        .iter()
-        .map(|m| m.total_failures)
-        .sum();
+    let failures_before = state.model_router.total_failures();
     match state.triage_engine.run_triage(triage_req).await {
         Ok(exec) => {
-            let failures_after: u64 = state
-                .model_router
-                .health_metrics()
-                .iter()
-                .map(|m| m.total_failures)
-                .sum();
+            let failures_after = state.model_router.total_failures();
             let new_failures = failures_after.saturating_sub(failures_before);
             if new_failures > 0 {
                 state.metrics.llm_errors_total.inc_by(new_failures);
@@ -593,6 +592,7 @@ struct OpenAiProxyRequest {
     max_tokens: Option<u32>,
     #[serde(default)]
     stream: bool,
+    #[allow(dead_code)]
     #[serde(default)]
     patient_id: Option<String>,
 }
@@ -635,106 +635,101 @@ async fn openai_proxy_handler(
         .map(|m| m.content.as_str())
         .unwrap_or(&req.messages.last().unwrap().content);
 
-    // 1. Run ECS red-flag check first for emergency safety interception
-    let triage_res = state
-        .triage_engine
-        .run_triage(TriageRequest {
-            session_id: format!("proxy_{}", Uuid::new_v4().simple()),
-            patient_id: resolve_patient_id(&auth, req.patient_id.as_deref()),
-            tenant_id: auth.namespace.clone(),
-            region_code: None,
-            utterance: last_user_text.to_string(),
-            target_population: vec![TargetPopulation::Adult],
-            consent_long_term_memory: Some(false),
-            prior_session: None,
-            stream_tx: None,
-        })
-        .await;
-
-    let final_content = if let Ok(exec) = &triage_res
-        && exec.response.red_flag == RedFlagLevel::Emergency120
-    {
-        let alert = exec
-            .trace
-            .red_flag_alert
-            .alert_message
-            .clone()
-            .unwrap_or_else(|| "检测到高危急症指征，请立即拨打 120 急救电话！".to_string());
-        format!("[急诊红线预警 Emergency120] {alert}\n\n{MEDICAL_DISCLAIMER}")
-    } else {
-        // 2. RAG augmentation + scrubbed outbound LLM call
-        let scrubbed_msgs: Vec<LlmMessage> = req
-            .messages
-            .iter()
-            .map(|m| {
-                let role = match m.role.as_str() {
-                    "system" => MessageRole::System,
-                    "assistant" => MessageRole::Assistant,
-                    _ => MessageRole::User,
-                };
-                LlmMessage {
-                    role,
-                    content: scrub_pii(&m.content).scrubbed_text,
-                }
-            })
-            .collect();
-
-        let llm_req = LlmRequest {
-            messages: scrubbed_msgs,
-            tier: ModelTier::Reasoning,
-            temperature: req.temperature.or(Some(0.2)),
-            max_tokens: req.max_tokens.or(Some(1024)),
-            response_format_json: false,
-            json_schema: None,
-            timeout_ms: Some(10_000),
-        };
-
-        let raw_answer = match state.model_router.complete_json(&llm_req).await {
-            Ok(resp) => {
-                if let Some(ref k) = auth.api_key {
-                    state.rate_limiter.record_actual_tokens(
-                        &k.key_id,
-                        k.tpm_limit,
-                        resp.usage.completion_tokens,
-                    );
-                }
-                resp.content
-            }
-            Err(_) => {
-                state.metrics.llm_errors_total.inc();
-                // Graceful fallback to ECS triage summary
-                if let Ok(exec) = &triage_res {
-                    match exec.response.status {
-                        TriageStatus::Completed => exec
-                            .response
-                            .triage_result
-                            .as_ref()
-                            .map(|r| format!("建议就诊科室：{}。{}", r.primary_department, r.summary))
-                            .unwrap_or_else(|| "建议前往全科医学科进一步评估。".to_string()),
-                        TriageStatus::FollowUp => exec
-                            .response
-                            .question
-                            .clone()
-                            .unwrap_or_else(|| "请补充症状持续时间与伴随表现。".to_string()),
-                        TriageStatus::Emergency => exec
-                            .trace
-                            .red_flag_alert
-                            .alert_message
-                            .clone()
-                            .unwrap_or_else(|| "请立即拨打120前往急诊科。".to_string()),
-                    }
-                } else {
-                    "当前智能推理服务繁忙，建议前往医院全科医学科或对应专科现场评估。".to_string()
-                }
-            }
-        };
-
-        sanitize_medical_output(&raw_answer, true).sanitized_text
-    };
+    // 1. Run lightweight Stage-1-only CPU red-flag check (< 1ms, zero I/O / LLM overhead)
+    let red_flag_alert = state.triage_engine.check_red_flag_fast(last_user_text);
 
     let completion_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
     let created = Utc::now().timestamp();
     let model = req.model.clone();
+
+    if red_flag_alert.level == RedFlagLevel::Emergency120 {
+        let alert = red_flag_alert
+            .alert_message
+            .unwrap_or_else(|| "检测到高危急症指征，请立即拨打 120 急救电话！".to_string());
+        let final_content = format!("[急诊红线预警 Emergency120] {alert}\n\n{MEDICAL_DISCLAIMER}");
+
+        state
+            .metrics
+            .requests_total
+            .with_label_values(&["/v1/openai/chat/completions", "POST", "200"])
+            .inc();
+
+        if req.stream {
+            let chunk1 = serde_json::json!({
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": { "role": "assistant", "content": final_content },
+                    "finish_reason": serde_json::Value::Null
+                }]
+            });
+            let chunk2 = serde_json::json!({
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            });
+            let events: Vec<Result<Event, Infallible>> = vec![
+                Ok(Event::default().data(chunk1.to_string())),
+                Ok(Event::default().data(chunk2.to_string())),
+                Ok(Event::default().data("[DONE]")),
+            ];
+            return Sse::new(stream::iter(events)).into_response();
+        }
+
+        return Json(serde_json::json!({
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": final_content },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": (total_chars as u32).max(1),
+                "completion_tokens": (final_content.chars().count() as u32).max(1),
+                "total_tokens": (total_chars + final_content.chars().count()) as u32
+            }
+        }))
+        .into_response();
+    }
+
+    // 2. Scrubbed outbound LLM call
+    let scrubbed_msgs: Vec<LlmMessage> = req
+        .messages
+        .iter()
+        .map(|m| {
+            let role = match m.role.as_str() {
+                "system" => MessageRole::System,
+                "assistant" => MessageRole::Assistant,
+                _ => MessageRole::User,
+            };
+            LlmMessage {
+                role,
+                content: scrub_pii(&m.content).scrubbed_text,
+            }
+        })
+        .collect();
+
+    let llm_req = LlmRequest {
+        messages: scrubbed_msgs,
+        tier: ModelTier::Reasoning,
+        temperature: req.temperature.or(Some(0.2)),
+        max_tokens: req.max_tokens.or(Some(1024)),
+        response_format_json: false,
+        json_schema: None,
+        timeout_ms: Some(10_000),
+    };
 
     state
         .metrics
@@ -743,36 +738,152 @@ async fn openai_proxy_handler(
         .inc();
 
     if req.stream {
-        let chunk1 = serde_json::json!({
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": { "role": "assistant", "content": final_content },
-                "finish_reason": serde_json::Value::Null
-            }]
+        let (out_tx, out_rx) = mpsc::channel::<Result<Event, Infallible>>(64);
+        let state_bg = state.clone();
+        let api_key_rec = auth.api_key.clone();
+        let cid = completion_id.clone();
+        let mdl = model.clone();
+        state.metrics.sse_active_connections.inc();
+
+        tokio::spawn(async move {
+            let (llm_tx, mut llm_rx) = mpsc::channel::<LlmStreamChunk>(64);
+            let fwd_tx = out_tx.clone();
+            let cid_fwd = cid.clone();
+            let mdl_fwd = mdl.clone();
+
+            let fwd_handle = tokio::spawn(async move {
+                let mut sent_any = false;
+                while let Some(chunk) = llm_rx.recv().await {
+                    if chunk.delta.is_empty() {
+                        continue;
+                    }
+                    sent_any = true;
+                    let payload = serde_json::json!({
+                        "id": cid_fwd,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": mdl_fwd,
+                        "choices": [{
+                            "index": 0,
+                            "delta": { "role": "assistant", "content": chunk.delta },
+                            "finish_reason": serde_json::Value::Null
+                        }]
+                    });
+                    if fwd_tx
+                        .send(Ok(Event::default().data(payload.to_string())))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                sent_any
+            });
+
+            tokio::select! {
+                _ = out_tx.closed() => {}
+                res = state_bg.model_router.chat_stream(&llm_req, llm_tx) => {
+                    let sent_any = fwd_handle.await.unwrap_or(false);
+                    match res {
+                        Ok(resp) => {
+                            if let Some(ref k) = api_key_rec {
+                                state_bg.rate_limiter.record_actual_tokens(
+                                    &k.key_id,
+                                    k.tpm_limit,
+                                    resp.usage.completion_tokens,
+                                );
+                            }
+                            if !sent_any && !resp.content.is_empty() {
+                                let safe_text = sanitize_medical_output(&resp.content, true).sanitized_text;
+                                let chunk1 = serde_json::json!({
+                                    "id": cid,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": mdl,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": { "role": "assistant", "content": safe_text },
+                                        "finish_reason": serde_json::Value::Null
+                                    }]
+                                });
+                                let _ = out_tx.send(Ok(Event::default().data(chunk1.to_string()))).await;
+                            } else {
+                                let disclaimer_chunk = serde_json::json!({
+                                    "id": cid,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": mdl,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": { "content": format!("\n\n{MEDICAL_DISCLAIMER}") },
+                                        "finish_reason": serde_json::Value::Null
+                                    }]
+                                });
+                                let _ = out_tx.send(Ok(Event::default().data(disclaimer_chunk.to_string()))).await;
+                            }
+                        }
+                        Err(_) => {
+                            state_bg.metrics.llm_errors_total.inc();
+                            let fallback = sanitize_medical_output(
+                                "当前智能推理服务繁忙，建议前往医院全科医学科或对应专科现场评估。",
+                                true,
+                            )
+                            .sanitized_text;
+                            let fb_chunk = serde_json::json!({
+                                "id": cid,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": mdl,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": { "role": "assistant", "content": fallback },
+                                    "finish_reason": serde_json::Value::Null
+                                }]
+                            });
+                            let _ = out_tx.send(Ok(Event::default().data(fb_chunk.to_string()))).await;
+                        }
+                    }
+                    let stop_chunk = serde_json::json!({
+                        "id": cid,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": mdl,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": "stop"
+                        }]
+                    });
+                    let _ = out_tx.send(Ok(Event::default().data(stop_chunk.to_string()))).await;
+                    let _ = out_tx.send(Ok(Event::default().data("[DONE]"))).await;
+                }
+            }
+            state_bg.metrics.sse_active_connections.dec();
         });
-        let chunk2 = serde_json::json!({
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {},
-                "finish_reason": "stop"
-            }]
-        });
-        let events: Vec<Result<Event, Infallible>> = vec![
-            Ok(Event::default().data(chunk1.to_string())),
-            Ok(Event::default().data(chunk2.to_string())),
-            Ok(Event::default().data("[DONE]")),
-        ];
-        let s = stream::iter(events);
-        return Sse::new(s).into_response();
+
+        return Sse::new(ReceiverStream::new(out_rx))
+            .keep_alive(KeepAlive::default())
+            .into_response();
     }
+
+    let raw_answer = match state.model_router.complete_json(&llm_req).await {
+        Ok(resp) => {
+            if let Some(ref k) = auth.api_key {
+                state.rate_limiter.record_actual_tokens(
+                    &k.key_id,
+                    k.tpm_limit,
+                    resp.usage.completion_tokens,
+                );
+            }
+            resp.content
+        }
+        Err(_) => {
+            state.metrics.llm_errors_total.inc();
+            "当前智能推理服务繁忙，建议前往医院全科医学科或对应专科现场评估。".to_string()
+        }
+    };
+
+    let final_content = sanitize_medical_output(&raw_answer, true).sanitized_text;
 
     Json(serde_json::json!({
         "id": completion_id,

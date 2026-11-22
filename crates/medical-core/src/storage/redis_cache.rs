@@ -59,9 +59,22 @@ impl SessionCache for RedisSessionCache {
         let sess_key = Self::session_key(&session.session_id);
         let pat_key = Self::patient_set_key(&session.patient_id);
 
-        con.set_ex::<_, _, ()>(&sess_key, &payload, ttl).await?;
-        con.sadd::<_, _, ()>(&pat_key, &session.session_id).await?;
-        con.expire::<_, ()>(&pat_key, ttl as i64).await?;
+        // Single Redis pipeline round-trip instead of 3 sequential RTTs under high concurrency
+        let mut pipe = redis::pipe();
+        pipe.cmd("SETEX")
+            .arg(&sess_key)
+            .arg(ttl)
+            .arg(&payload)
+            .ignore()
+            .cmd("SADD")
+            .arg(&pat_key)
+            .arg(&session.session_id)
+            .ignore()
+            .cmd("EXPIRE")
+            .arg(&pat_key)
+            .arg(ttl as i64)
+            .ignore();
+        pipe.query_async::<()>(&mut con).await?;
         Ok(())
     }
 

@@ -398,8 +398,16 @@ impl DualWriteIndexer {
                 })
                 .collect();
 
-            self.vector_store.upsert_documents(&vectorized).await?;
-            self.tantivy.upsert_documents(chunk, tenant_namespace)?;
+            let tantivy = Arc::clone(&self.tantivy);
+            let chunk_owned = chunk.to_vec();
+            let ns_owned = tenant_namespace.to_string();
+            let (vec_res, bm25_res) = tokio::join!(
+                self.vector_store.upsert_documents(&vectorized),
+                tokio::task::spawn_blocking(move || tantivy.upsert_documents(&chunk_owned, &ns_owned))
+            );
+            vec_res?;
+            bm25_res
+                .map_err(|e| PipelineError::Index(format!("tantivy blocking join error: {e}")))??;
             total_written += chunk.len() as u64;
         }
 
@@ -600,16 +608,18 @@ impl KnowledgeSearchEngine for HybridKnowledgeSearchEngine {
             tenant_namespace: query.tenant_namespace.clone(),
         };
 
-        let vector_hits = self
-            .vector_store
-            .search_vectors(&query_vec, &filter, candidate_k)
-            .await?;
-
         let mut bm25_query = query.clone();
         bm25_query.top_k = candidate_k;
-        let bm25_hits = self
-            .tantivy
-            .search_bm25(&bm25_query)
+        let tantivy = Arc::clone(&self.tantivy);
+
+        // Execute vector search and blocking Tantivy BM25 search concurrently without starving Tokio workers
+        let (vector_res, bm25_join_res) = tokio::join!(
+            self.vector_store.search_vectors(&query_vec, &filter, candidate_k),
+            tokio::task::spawn_blocking(move || tantivy.search_bm25(&bm25_query))
+        );
+        let vector_hits = vector_res?;
+        let bm25_hits = bm25_join_res
+            .map_err(|e| StorageError::VectorStore(format!("tantivy blocking join error: {e}")))?
             .map_err(|e| StorageError::VectorStore(e.to_string()))?;
 
         // Reciprocal Rank Fusion (RRF)

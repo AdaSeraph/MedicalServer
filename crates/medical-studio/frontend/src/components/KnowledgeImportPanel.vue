@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue';
 import { invokeStudio } from '../api/tauri';
+import { useToast } from '../composables/useToast';
 import {
   formatBytes,
   readBrowserFilesToQueue,
   type BatchImportItem,
   type QueuedImportFile,
 } from '../utils/batchFiles';
+
+const toast = useToast();
 
 interface LlmProviderItem {
   id: string;
@@ -56,6 +59,9 @@ const statusKind = ref<'info' | 'success' | 'error'>('info');
 function setStatus(msg: string, kind: 'info' | 'success' | 'error' = 'info') {
   statusMessage.value = msg;
   statusKind.value = kind;
+  if (kind !== 'info') {
+    toast.push(msg, kind);
+  }
 }
 
 async function loadInitialConfig() {
@@ -582,11 +588,11 @@ async function handleExportErrors() {
         </div>
       </div>
       <div class="md:col-span-3 flex flex-wrap gap-2">
-        <button @click="handlePreview" class="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-sm font-medium">切片预览</button>
-        <button @click="handleStartImport" class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium">开始双写入库</button>
-        <button @click="handleResumeImport" class="px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-sm font-medium">断点续传</button>
-        <button @click="handleRefreshStatus" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm">查询检查点</button>
-        <button @click="handleExportErrors" class="px-4 py-2 rounded-lg bg-rose-700 hover:bg-rose-600 text-sm">导出错误日志</button>
+        <button :disabled="isBusy" @click="handlePreview" class="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-sm font-medium text-white">切片预览</button>
+        <button :disabled="isBusy" @click="handleStartImport" class="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-sm font-medium text-white">开始双写入库</button>
+        <button :disabled="isBusy" @click="handleResumeImport" class="px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-sm font-medium text-white">断点续传</button>
+        <button :disabled="isBusy" @click="handleRefreshStatus" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 disabled:opacity-50 text-sm">查询检查点</button>
+        <button :disabled="isBusy" @click="handleExportErrors" class="px-4 py-2 rounded-lg bg-rose-700 hover:bg-rose-600 disabled:opacity-50 text-sm text-white">导出错误日志</button>
       </div>
     </div>
 
@@ -639,14 +645,14 @@ async function handleExportErrors() {
 
     <!-- Normalized Knowledge Cards Preview -->
     <div v-if="normalizedDocs.length > 0" class="space-y-3">
-      <div class="flex items-center justify-between">
+      <div class="sticky top-0 z-10 flex items-center justify-between py-2.5 px-3 rounded-xl bg-slate-900/95 backdrop-blur border border-slate-700/80 shadow-md">
         <h3 class="text-sm font-semibold text-white">标准格式预览（共 {{ normalizedDocs.length }} 条，校验通过后可写入数据库）</h3>
         <button
           :disabled="isBusy"
           @click="handleCommitNormalizedDocs"
-          class="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-medium text-white"
+          class="px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-xs font-medium text-white"
         >
-          确认全部写入数据库
+          确认全部写入数据库 ({{ normalizedDocs.length }})
         </button>
       </div>
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4">

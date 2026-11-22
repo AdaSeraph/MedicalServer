@@ -13,7 +13,8 @@ use medical_studio::commands::{
     CommitPatientRecordsRequest, KnowledgePreviewRequest, StartKnowledgeImportRequest,
     WhiteboxTriageRequest, apply_masking_and_import_patients_impl,
     batch_preview_knowledge_items_impl, batch_preview_patient_items_impl,
-    commit_knowledge_documents_impl, commit_patient_records_impl, delete_llm_provider_impl,
+    commit_knowledge_documents_impl, commit_patient_records_impl, delete_epidemic_context_impl,
+    delete_llm_provider_impl,
     delete_red_flag_rule_impl, delete_symptom_synonym_impl, export_import_errors_impl,
     get_gateway_metrics_impl, get_import_job_status_impl, get_medical_dictionaries_impl,
     get_router_config_impl, issue_api_key_impl, list_api_keys_impl, list_debug_patients_impl,
@@ -126,6 +127,11 @@ async fn test_studio_modules_3_4_5_6_end_to_end() {
         valid_to: NaiveDate::from_ymd_opt(2027, 12, 31).unwrap(),
     };
     upsert_epidemic_context_impl(&state, new_epi).await.unwrap();
+    let epis_after_add = list_epidemic_contexts_impl(&state).await.unwrap();
+    assert!(epis_after_add.iter().any(|e| e.context_id == "epi_studio_sh_norovirus"));
+    assert!(delete_epidemic_context_impl(&state, "epi_studio_sh_norovirus".to_string()).await.unwrap());
+    let epis_after_del = list_epidemic_contexts_impl(&state).await.unwrap();
+    assert!(!epis_after_del.iter().any(|e| e.context_id == "epi_studio_sh_norovirus"));
     let reload = notify_server_hot_reload_impl(&state, None, None).await.unwrap();
     assert!(reload.local_reloaded);
 
