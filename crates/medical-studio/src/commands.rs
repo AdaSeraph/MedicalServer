@@ -2890,3 +2890,77 @@ pub async fn delete_patient_record(
 ) -> Result<medical_core::storage::WipedMemoryStats, String> {
     delete_patient_record_impl(&state, patient_id).await
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StudioRuntimeStatusResponse {
+    pub storage_mode: String,
+    pub tantivy_persistent: bool,
+    pub tantivy_dir: Option<String>,
+    pub tantivy_docs: u64,
+    pub local_snapshot_path: Option<String>,
+    pub embedded_server_running: bool,
+    pub embedding_real: bool,
+    pub rerank_real: bool,
+    pub server_url: String,
+    pub server_connected: bool,
+    pub server_health: Option<serde_json::Value>,
+    pub init_note: Option<String>,
+}
+
+pub async fn get_studio_runtime_status_impl(
+    state: &StudioState,
+    server_url_override: Option<String>,
+) -> Result<StudioRuntimeStatusResponse, String> {
+    let target_url = server_url_override
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| state.runtime_meta.server_url.clone());
+
+    let health_url = format!("{}/health", target_url.trim_end_matches('/'));
+    let mut server_connected = state.runtime_meta.embedded_server_running;
+    let mut server_health = None;
+
+    if let Ok(resp) = state
+        .http_client
+        .get(&health_url)
+        .timeout(std::time::Duration::from_millis(1500))
+        .send()
+        .await
+        && resp.status().is_success()
+    {
+        server_connected = true;
+        server_health = resp.json::<serde_json::Value>().await.ok();
+    }
+
+    Ok(StudioRuntimeStatusResponse {
+        storage_mode: state.runtime_meta.storage_mode.clone(),
+        tantivy_persistent: state.runtime_meta.tantivy_persistent,
+        tantivy_dir: state.runtime_meta.tantivy_dir.clone(),
+        tantivy_docs: state.tantivy.num_docs(),
+        local_snapshot_path: state.runtime_meta.local_snapshot_path.clone(),
+        embedded_server_running: state.runtime_meta.embedded_server_running,
+        embedding_real: state.runtime_meta.embedding_real,
+        rerank_real: state.runtime_meta.rerank_real,
+        server_url: target_url,
+        server_connected,
+        server_health,
+        init_note: state.runtime_meta.init_note.clone(),
+    })
+}
+
+#[tauri::command]
+pub async fn get_studio_runtime_status(
+    state: State<'_, StudioState>,
+    server_url: Option<String>,
+) -> Result<StudioRuntimeStatusResponse, String> {
+    get_studio_runtime_status_impl(&state, server_url).await
+}
+
+#[tauri::command]
+pub async fn save_local_snapshot_now(state: State<'_, StudioState>) -> Result<String, String> {
+    let Some(ref path) = state.runtime_meta.local_snapshot_path else {
+        return Ok("当前已直连数据库持久化，无需手动保存本地快照".to_string());
+    };
+    let count = crate::local_persist::save_local_snapshot(&state, std::path::Path::new(path)).await?;
+    Ok(format!("已安全加密保存 {count} 条业务记录至本机 {path}"))
+}

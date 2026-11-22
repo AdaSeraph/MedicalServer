@@ -252,8 +252,8 @@ def test_f2_t1_03(ctx: TestContext) -> None:
     errs = validate_patient_record(rec, load_schema_rules())
     assert not errs, f"PatientRecord fixture invalid: {errs}"
 
-    hdrs, _ = ctx.auth_headers_or_wechat("wx_f2_t1_03")
-    pid = "pat_sha256_998877665544"
+    hdrs, auth_pid = ctx.auth_headers_or_wechat("wx_f2_t1_03")
+    pid = auth_pid or "pat_sha256_998877665544"
     payload = dict(rec, patient_id=pid)
     put_resp = ctx.client.put(f"/v1/patients/{pid}/memory", json_body=payload, headers=hdrs)
     assert put_resp.status in (200, 201), f"PUT /memory failed ({put_resp.status}): {put_resp.text}"
@@ -1103,8 +1103,8 @@ def test_f10_t1_04(ctx: TestContext) -> None:
 
 @REGISTRY.register("F10-T1-05", tier=1, features=[10], title="Masked patient record round-trip via /v1/patients/{id}/memory")
 def test_f10_t1_05(ctx: TestContext) -> None:
-    hdrs, _ = ctx.auth_headers_or_wechat("wx_f10_t1_05")
-    pid = "pat_sha256_f10_masked_01"
+    hdrs, auth_pid = ctx.auth_headers_or_wechat("wx_f10_t1_05")
+    pid = auth_pid or "pat_sha256_f10_masked_01"
     rec = {
         "patient_id": pid,
         "consent_long_term_memory": True,

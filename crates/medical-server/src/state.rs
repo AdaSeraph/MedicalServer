@@ -82,6 +82,39 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Builds an `AppState` sharing already-initialized live stores & engines (used by embedded
+    /// all-in-one desktop mode in `medical-studio` so UI edits take effect immediately on HTTP APIs).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_shared(
+        config: ServerConfig,
+        stores: CoreStores,
+        cipher: Arc<FieldCipher>,
+        embedder: Arc<dyn EmbeddingProvider>,
+        reranker: Arc<dyn RerankProvider>,
+        tantivy: Arc<TantivyKnowledgeIndex>,
+        indexer: Arc<DualWriteIndexer>,
+        hybrid_search: Arc<HybridKnowledgeSearchEngine>,
+        model_router: Arc<ModelRouter>,
+        triage_engine: Arc<TriageEngine>,
+        http_client: reqwest::Client,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            config,
+            stores,
+            cipher,
+            embedder,
+            reranker,
+            tantivy,
+            indexer,
+            hybrid_search,
+            model_router,
+            triage_engine,
+            rate_limiter: Arc::new(TenantRateLimiter::new()),
+            metrics: Arc::new(ServerMetrics::new()),
+            http_client,
+        })
+    }
+
     /// Builds `AppState` from `ServerConfig`, supporting both production clients and R5 offline mode.
     pub async fn build(config: ServerConfig) -> Result<Arc<Self>, String> {
         config.validate_production_security()?;

@@ -10,14 +10,62 @@ import DataExchangePanel from './components/DataExchangePanel.vue';
 import PatientFollowUpPanel from './components/PatientFollowUpPanel.vue';
 import ToastContainer from './components/ToastContainer.vue';
 import { initTheme, useTheme } from './composables/useTheme';
+import { invokeStudio } from './api/tauri';
 
 type TabId = 'knowledge' | 'patients' | 'followup' | 'epidemic' | 'dictionary' | 'ecs' | 'gateway' | 'exchange';
 type OperatorRole = 'admin' | 'editor' | 'clinician';
+
+interface RuntimeStatus {
+  storage_mode: string;
+  tantivy_persistent: boolean;
+  tantivy_dir: string | null;
+  tantivy_docs: number;
+  local_snapshot_path: string | null;
+  embedded_server_running: boolean;
+  embedding_real: boolean;
+  rerank_real: boolean;
+  server_url: string;
+  server_connected: boolean;
+  server_health: any;
+  init_note: string | null;
+}
 
 const activeTab = ref<TabId>('knowledge');
 const operatorRole = ref<OperatorRole>('admin');
 const sidebarCollapsed = ref(false);
 const { theme, toggleTheme } = useTheme();
+const runtimeStatus = ref<RuntimeStatus | null>(null);
+const checkingRuntime = ref(false);
+const savingSnapshot = ref(false);
+const saveNotice = ref('');
+
+async function refreshRuntimeStatus() {
+  checkingRuntime.value = true;
+  try {
+    runtimeStatus.value = await invokeStudio<RuntimeStatus>('get_studio_runtime_status', {
+      serverUrl: null,
+    });
+  } catch {
+    runtimeStatus.value = null;
+  } finally {
+    checkingRuntime.value = false;
+  }
+}
+
+async function handleSaveSnapshotNow() {
+  savingSnapshot.value = true;
+  saveNotice.value = '';
+  try {
+    saveNotice.value = await invokeStudio<string>('save_local_snapshot_now');
+    setTimeout(() => {
+      saveNotice.value = '';
+    }, 3500);
+  } catch (e: any) {
+    saveNotice.value = `保存失败：${e?.message || e}`;
+  } finally {
+    savingSnapshot.value = false;
+  }
+}
 
 const roleAllowedTabs: Record<OperatorRole, TabId[]> = {
   admin: ['knowledge', 'patients', 'followup', 'epidemic', 'dictionary', 'ecs', 'gateway', 'exchange'],
@@ -135,6 +183,7 @@ function handleGlobalKeydown(e: KeyboardEvent) {
 
 onMounted(() => {
   initTheme();
+  refreshRuntimeStatus();
   window.addEventListener('keydown', handleGlobalKeydown);
 });
 
@@ -246,8 +295,55 @@ onBeforeUnmount(() => {
 
     <!-- Main Workspace (KeepAlive preserves queue, preview & debug state across tab switches) -->
     <main class="flex-1 p-6 overflow-y-auto min-w-0">
-      <div class="mb-4 px-3.5 py-2 rounded-lg border border-amber-500/40 bg-amber-950/30 text-amber-200 text-xs flex items-center justify-between gap-2">
-        <span>⚠️ 当前运行于【离线内存沙盒模式】：本地录入数据在软件重启后会清空，检索/重排组件为 Mock；请通过“数据导出”或配置远端 medical-server 同步持久化。</span>
+      <div
+        v-if="runtimeStatus"
+        :class="
+          runtimeStatus.storage_mode === 'postgres' || runtimeStatus.storage_mode === 'local_encrypted_disk'
+            ? 'border-emerald-500/40 bg-emerald-950/30 text-emerald-200'
+            : 'border-amber-500/40 bg-amber-950/30 text-amber-200'
+        "
+        class="mb-4 px-3.5 py-2 rounded-lg border text-xs flex flex-wrap items-center justify-between gap-2"
+      >
+        <div class="flex flex-wrap items-center gap-2">
+          <span v-if="runtimeStatus.storage_mode === 'postgres'">
+            🟢 已连接 PostgreSQL 数据库持久化（知识库 {{ runtimeStatus.tantivy_docs }} 条）
+          </span>
+          <span v-else-if="runtimeStatus.storage_mode === 'local_encrypted_disk'">
+            🟢 本机一体化模式已就绪 · 数据自动加密落盘（知识库 {{ runtimeStatus.tantivy_docs }} 条 · 重启不丢失）
+          </span>
+          <span v-else>
+            ⚠️ 当前运行于纯内存模式
+          </span>
+          <span class="opacity-80">·</span>
+          <span v-if="runtimeStatus.embedded_server_running" class="text-emerald-300 font-medium">
+            内置分诊服务已自动启动 ({{ runtimeStatus.server_url }})
+          </span>
+          <span v-else-if="runtimeStatus.server_connected" class="text-emerald-300 font-medium">
+            已连接本机分诊服务 ({{ runtimeStatus.server_url }})
+          </span>
+          <span v-else class="text-amber-300">
+            分诊服务未连接 ({{ runtimeStatus.server_url }})
+          </span>
+          <span v-if="saveNotice" class="text-teal-300 font-medium">· {{ saveNotice }}</span>
+          <span v-if="runtimeStatus.init_note" class="text-amber-300">· {{ runtimeStatus.init_note }}</span>
+        </div>
+        <div class="flex items-center gap-1.5 shrink-0">
+          <button
+            v-if="runtimeStatus.local_snapshot_path"
+            :disabled="savingSnapshot"
+            @click="handleSaveSnapshotNow"
+            class="px-2 py-0.5 rounded bg-emerald-700/80 hover:bg-emerald-600 text-white text-[11px]"
+          >
+            {{ savingSnapshot ? '保存中...' : '立即保存' }}
+          </button>
+          <button
+            :disabled="checkingRuntime"
+            @click="refreshRuntimeStatus"
+            class="px-2 py-0.5 rounded bg-slate-800/80 hover:bg-slate-700 text-slate-200 text-[11px]"
+          >
+            {{ checkingRuntime ? '检测中...' : '刷新状态' }}
+          </button>
+        </div>
       </div>
       <KeepAlive>
         <component :is="currentComponent" />

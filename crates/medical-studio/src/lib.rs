@@ -1,5 +1,6 @@
 pub mod ai_normalize;
 pub mod commands;
+pub mod local_persist;
 pub mod state;
 
 pub use state::StudioState;
@@ -11,9 +12,57 @@ pub fn crate_name() -> &'static str {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime for MedicalStudio");
-    let studio_state = runtime
-        .block_on(StudioState::new_offline())
-        .expect("initialize MedicalStudio offline state");
+    let mut studio_state = runtime
+        .block_on(StudioState::from_env_or_local())
+        .expect("initialize MedicalStudio state");
+
+    // 1. All-in-One Embedded medical-server: if port 8080 (or configured addr) is free,
+    //    automatically start the HTTP API server inside MedicalStudio sharing the exact same
+    //    live stores & TriageEngine — customer only needs to double-click ONE app!
+    let server_cfg = medical_server::ServerConfig::from_env();
+    let bind_addr = server_cfg.bind_addr.clone();
+    if let Ok(std_listener) = std::net::TcpListener::bind(&bind_addr) {
+        let _ = std_listener.set_nonblocking(true);
+        let shared_app = medical_server::AppState::from_shared(
+            server_cfg,
+            studio_state.stores.clone(),
+            studio_state.cipher.clone(),
+            studio_state.embedder.clone(),
+            studio_state.reranker.clone(),
+            studio_state.tantivy.clone(),
+            studio_state.indexer.clone(),
+            studio_state.hybrid_search.clone(),
+            studio_state.model_router.clone(),
+            studio_state.triage_engine.clone(),
+            studio_state.http_client.clone(),
+        );
+        let router = medical_server::build_router(shared_app);
+        studio_state.runtime_meta.embedded_server_running = true;
+        studio_state.runtime_meta.server_url = format!("http://{bind_addr}");
+        runtime.spawn(async move {
+            if let Ok(listener) = tokio::net::TcpListener::from_std(std_listener) {
+                let _ = axum::serve(listener, router).await;
+            }
+        });
+    }
+
+    // 2. Background encrypted local disk auto-save (every 5s) when running in single-PC disk mode
+    if let Some(snap_path) = studio_state.runtime_meta.local_snapshot_path.clone() {
+        let stores_bg = studio_state.stores.clone();
+        let cipher_bg = studio_state.cipher.clone();
+        runtime.spawn(async move {
+            let path = std::path::PathBuf::from(snap_path);
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let _ = local_persist::save_local_snapshot_from_parts(&stores_bg, &cipher_bg, &path)
+                    .await;
+            }
+        });
+    }
+
+    // Keep the background Tokio runtime alive for embedded HTTP server + auto-save
+    let _runtime_guard = Box::leak(Box::new(runtime));
 
     tauri::Builder::default()
         .manage(studio_state)
@@ -80,6 +129,8 @@ pub fn run() {
             commands::list_triage_audit_logs,
             commands::delete_knowledge_documents,
             commands::delete_patient_record,
+            commands::get_studio_runtime_status,
+            commands::save_local_snapshot_now,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MedicalStudio Tauri application");
