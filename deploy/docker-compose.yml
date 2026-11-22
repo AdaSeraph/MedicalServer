@@ -12,9 +12,13 @@ services:
       - .env
     environment:
       SERVER_ADDR: 0.0.0.0:8080
+      MEDICAL_DATA_DIR: /app/data
+      TANTIVY_INDEX_DIR: /app/data/tantivy
       DATABASE_URL: postgres://medical:${POSTGRES_PASSWORD:-medical_secret}@postgres:5432/medical_server
       REDIS_URL: redis://redis:6379
       QDRANT_URL: http://qdrant:6334
+    volumes:
+      - medical_data:/app/data
     depends_on:
       postgres:
         condition: service_healthy
@@ -92,6 +96,7 @@ services:
       - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
 
 volumes:
+  medical_data:
   pg_data:
   redis_data:
   qdrant_data:

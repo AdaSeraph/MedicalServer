@@ -61,10 +61,14 @@ pub fn run() {
         });
     }
 
-    // Keep the background Tokio runtime alive for embedded HTTP server + auto-save
-    let _runtime_guard = Box::leak(Box::new(runtime));
+    let exit_stores = studio_state.stores.clone();
+    let exit_cipher = studio_state.cipher.clone();
+    let exit_snap_path = studio_state.runtime_meta.local_snapshot_path.clone();
 
-    tauri::Builder::default()
+    // Keep the background Tokio runtime alive for embedded HTTP server + auto-save + exit flush
+    let runtime_static: &'static tokio::runtime::Runtime = Box::leak(Box::new(runtime));
+
+    let app = tauri::Builder::default()
         .manage(studio_state)
         .invoke_handler(tauri::generate_handler![
             // Module 1: Knowledge Import Workshop
@@ -131,7 +135,26 @@ pub fn run() {
             commands::delete_patient_record,
             commands::get_studio_runtime_status,
             commands::save_local_snapshot_now,
+            // Module 10: Clinical Examinations, Biochemistry & Multimodal Medical Images
+            commands::get_clinical_data_catalog,
+            commands::attach_patient_clinical_exams,
+            commands::attach_knowledge_clinical_assets,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running MedicalStudio Tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building MedicalStudio Tauri application");
+
+    app.run(move |_app_handle, event| {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) && let Some(ref snap_path) = exit_snap_path
+        {
+            let path = std::path::PathBuf::from(snap_path);
+            let _ = runtime_static.block_on(local_persist::save_local_snapshot_from_parts(
+                &exit_stores,
+                &exit_cipher,
+                &path,
+            ));
+        }
+    });
 }

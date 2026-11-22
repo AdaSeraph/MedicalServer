@@ -11,9 +11,11 @@ use medical_core::ecs::{
 };
 use medical_core::llm::{ProbeResult, ProviderConfig, RouterConfig};
 use medical_core::models::{
-    DataCollectionPackage, EpidemicContext, KnowledgeDocument, L2Profile, L3VisitEvent,
-    MedicalDictionaries, PatientRecord, RedFlagLevel, RedFlagRule, SymptomSynonym,
-    TargetPopulation, TriageStatus,
+    ClinicalDataCatalog, ClinicalExamBundle, ClinicalMediaAsset, DataCollectionPackage,
+    EpidemicContext, ImagingFeatureRef, KnowledgeDocument, L2Profile, L3VisitEvent,
+    LabBiochemItem, MedicalDictionaries, PatientRecord, RedFlagLevel, RedFlagRule,
+    SymptomSynonym, TargetPopulation, TriageStatus, TriggerSubstanceRecord, VitalSignsRecord,
+    WoundFeatureRef, default_clinical_data_catalog,
 };
 use medical_core::privacy::scrub_pii;
 use medical_core::storage::{
@@ -2617,6 +2619,7 @@ pub async fn submit_patient_revisit_feedback_impl(
         recommended_department: department,
         urgency_level: req.urgency_level.clamp(1, 4),
         summary: scrubbed_summary,
+        clinical_exams: Default::default(),
     };
 
     state
@@ -2963,4 +2966,264 @@ pub async fn save_local_snapshot_now(state: State<'_, StudioState>) -> Result<St
     };
     let count = crate::local_persist::save_local_snapshot(&state, std::path::Path::new(path)).await?;
     Ok(format!("已安全加密保存 {count} 条业务记录至本机 {path}"))
+}
+
+// ===========================================================================
+// Module 10: 医学检查、生化指标、影像(核磁/CT)、伤口与诱因物质多模态导入
+// ===========================================================================
+
+#[tauri::command]
+pub async fn get_clinical_data_catalog() -> Result<ClinicalDataCatalog, String> {
+    Ok(default_clinical_data_catalog())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StudioAttachPatientClinicalExamsRequest {
+    pub serial_or_id: String,
+    #[serde(default)]
+    pub salt: Option<String>,
+    #[serde(default)]
+    pub event_id: Option<String>,
+    #[serde(default)]
+    pub chief_complaint: Option<String>,
+    #[serde(default)]
+    pub recommended_department: Option<String>,
+    #[serde(default)]
+    pub urgency_level: Option<u8>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub baseline_vitals: Option<VitalSignsRecord>,
+    #[serde(default)]
+    pub l2_trigger_substances: Vec<TriggerSubstanceRecord>,
+    #[serde(default)]
+    pub clinical_exams: ClinicalExamBundle,
+}
+
+pub async fn attach_patient_clinical_exams_impl(
+    state: &StudioState,
+    req: StudioAttachPatientClinicalExamsRequest,
+) -> Result<PatientRecord, String> {
+    let raw = req.serial_or_id.trim();
+    if raw.is_empty() {
+        return Err("患者序列号或匿名 Patient ID 不能为空".to_string());
+    }
+    let patient_id = if raw.starts_with("pat_sha256_") && raw.len() == 75 {
+        raw.to_string()
+    } else {
+        let salt_str = req
+            .salt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("medical-server-hospital-salt-v1");
+        hash_patient_id(raw, salt_str.as_bytes())
+    };
+
+    req.clinical_exams
+        .validate()
+        .map_err(|e| format!("医学检查数据校验失败: {e}"))?;
+    if let Some(ref bv) = req.baseline_vitals {
+        bv.validate()
+            .map_err(|e| format!("基线生命体征校验失败: {e}"))?;
+    }
+
+    let existing_l2 = state
+        .stores
+        .patient_memory
+        .get_l2_profile(&patient_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (consent, mut profile) = match existing_l2 {
+        Some(rec) => (rec.consent_long_term_memory, rec.l2_profile),
+        None => (
+            true,
+            L2Profile {
+                age_group: "unknown".to_string(),
+                ..Default::default()
+            },
+        ),
+    };
+    if let Some(bv) = req.baseline_vitals {
+        profile.baseline_vitals = Some(bv);
+    } else if profile.baseline_vitals.is_none()
+        && let Some(first_vs) = req.clinical_exams.vital_signs.first()
+    {
+        profile.baseline_vitals = Some(first_vs.clone());
+    }
+    for t in req.l2_trigger_substances {
+        if let Some(ex) = profile
+            .trigger_substances
+            .iter_mut()
+            .find(|x| x.trigger_id == t.trigger_id)
+        {
+            *ex = t;
+        } else {
+            profile.trigger_substances.push(t);
+        }
+    }
+    for t in &req.clinical_exams.trigger_substances {
+        if !profile
+            .trigger_substances
+            .iter()
+            .any(|x| x.trigger_id == t.trigger_id)
+        {
+            profile.trigger_substances.push(t.clone());
+        }
+    }
+
+    state
+        .stores
+        .patient_memory
+        .upsert_l2_profile(&patient_id, consent, &profile)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let target_event = if let Some(ref eid) = req.event_id
+        && let Ok(events) = state
+            .stores
+            .patient_memory
+            .list_l3_events(&patient_id, 100)
+            .await
+        && let Some(mut found) = events.into_iter().find(|e| &e.event_id == eid)
+    {
+        found.clinical_exams.merge(req.clinical_exams);
+        found
+    } else {
+        let exam_text = req.clinical_exams.to_searchable_text();
+        let cc = req
+            .chief_complaint
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| scrub_pii(s).scrubbed_text)
+            .unwrap_or_else(|| "医学检查/生化/影像/伤口/诱因导入".to_string());
+        let summary = req
+            .summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| scrub_pii(s).scrubbed_text)
+            .unwrap_or_else(|| {
+                if exam_text.is_empty() {
+                    cc.clone()
+                } else {
+                    format!("{cc}：{exam_text}")
+                }
+            });
+        L3VisitEvent {
+            event_id: req
+                .event_id
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| format!("evt_exam_{}", uuid::Uuid::new_v4().simple())),
+            occurred_at: Utc::now(),
+            chief_complaint: cc,
+            extracted_symptoms: Vec::new(),
+            recommended_department: req
+                .recommended_department
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "全科医学科".to_string()),
+            urgency_level: req.urgency_level.unwrap_or(2).clamp(1, 4),
+            summary,
+            clinical_exams: req.clinical_exams,
+        }
+    };
+
+    state
+        .stores
+        .patient_memory
+        .insert_l3_event(&patient_id, &target_event)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let embed_text = format!(
+        "{} {} {}",
+        target_event.chief_complaint,
+        target_event.summary,
+        target_event.clinical_exams.to_searchable_text()
+    );
+    if let Ok(vec) = state.embedder.embed_one(&embed_text).await {
+        let _ = state
+            .stores
+            .patient_l3_vectors
+            .upsert_event_vector(&patient_id, &target_event, vec)
+            .await;
+    }
+
+    state
+        .stores
+        .patient_memory
+        .get_full_memory(&patient_id, 50)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "保存后读取患者档案失败".to_string())
+}
+
+#[tauri::command]
+pub async fn attach_patient_clinical_exams(
+    state: State<'_, StudioState>,
+    req: StudioAttachPatientClinicalExamsRequest,
+) -> Result<PatientRecord, String> {
+    attach_patient_clinical_exams_impl(&state, req).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StudioAttachKnowledgeClinicalAssetsRequest {
+    pub doc_id: String,
+    #[serde(default = "default_ns")]
+    pub tenant_namespace: String,
+    #[serde(default)]
+    pub reference_labs: Vec<LabBiochemItem>,
+    #[serde(default)]
+    pub reference_vitals: Vec<String>,
+    #[serde(default)]
+    pub imaging_features: Vec<ImagingFeatureRef>,
+    #[serde(default)]
+    pub wound_features: Vec<WoundFeatureRef>,
+    #[serde(default)]
+    pub trigger_substances: Vec<TriggerSubstanceRecord>,
+    #[serde(default)]
+    pub media_assets: Vec<ClinicalMediaAsset>,
+}
+
+pub async fn attach_knowledge_clinical_assets_impl(
+    state: &StudioState,
+    req: StudioAttachKnowledgeClinicalAssetsRequest,
+) -> Result<KnowledgeDocument, String> {
+    let docs = state
+        .tantivy
+        .list_all_documents(Some(&req.tenant_namespace))
+        .map_err(|e| e.to_string())?;
+    let mut doc = docs
+        .into_iter()
+        .find(|d| d.doc_id == req.doc_id)
+        .ok_or_else(|| format!("未找到 doc_id={} 的知识库文档", req.doc_id))?;
+
+    doc.reference_labs.extend(req.reference_labs);
+    for v in req.reference_vitals {
+        if !v.trim().is_empty() && !doc.reference_vitals.contains(&v) {
+            doc.reference_vitals.push(v);
+        }
+    }
+    doc.imaging_features.extend(req.imaging_features);
+    doc.wound_features.extend(req.wound_features);
+    doc.trigger_substances.extend(req.trigger_substances);
+    doc.media_assets.extend(req.media_assets);
+    doc.updated_at = Some(Utc::now());
+
+    doc.validate().map_err(|e| e.to_string())?;
+    state
+        .indexer
+        .upsert_documents(std::slice::from_ref(&doc), &req.tenant_namespace)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(doc)
+}
+
+#[tauri::command]
+pub async fn attach_knowledge_clinical_assets(
+    state: State<'_, StudioState>,
+    req: StudioAttachKnowledgeClinicalAssetsRequest,
+) -> Result<KnowledgeDocument, String> {
+    attach_knowledge_clinical_assets_impl(&state, req).await
 }

@@ -106,6 +106,12 @@ fn test_knowledge_doc_validation_negative_cases() {
         red_flag_signs: vec![],
         seasonal_tags: vec![],
         suggested_follow_up_slots: vec![],
+        reference_labs: vec![],
+        reference_vitals: vec![],
+        imaging_features: vec![],
+        wound_features: vec![],
+        trigger_substances: vec![],
+        media_assets: vec![],
         updated_at: None,
     };
 
@@ -162,6 +168,7 @@ fn test_patient_id_rejects_plaintext_id_card_and_phone() {
             recommended_department: "呼吸内科".into(),
             urgency_level: 5, // invalid: out of 1..=4
             summary: "summary".into(),
+            clinical_exams: Default::default(),
         }],
     };
     let errs = bad_record.validate().unwrap_err();

@@ -5,8 +5,10 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    DataCollectionPackage, EpidemicContext, KnowledgeDocument, L2Profile, L3VisitEvent,
+    ClinicalExamBundle, ClinicalMediaAsset, DataCollectionPackage, EpidemicContext,
+    ImagingExamRecord, KnowledgeDocument, L2Profile, L3VisitEvent, LabBiochemPanel,
     MedicalDictionaries, PatientRecord, RedFlagLevel, RedFlagRule, SymptomSynonym,
+    TriggerSubstanceRecord, VitalSignsRecord, WoundAssessmentRecord,
 };
 
 static RE_CANONICAL_PATIENT_ID: LazyLock<Regex> =
@@ -183,11 +185,197 @@ impl Validate for KnowledgeDocument {
     }
 }
 
+impl Validate for VitalSignsRecord {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        let mut errs = ValidationErrors::new();
+        if let Some(s) = self.systolic_bp_mmhg
+            && (!s.is_finite() || !(30.0..=320.0).contains(&s))
+        {
+            errs.push("systolic_bp_mmhg", "systolic_bp_mmhg must be within 30..=320 mmHg");
+        }
+        if let Some(d) = self.diastolic_bp_mmhg
+            && (!d.is_finite() || !(15.0..=220.0).contains(&d))
+        {
+            errs.push("diastolic_bp_mmhg", "diastolic_bp_mmhg must be within 15..=220 mmHg");
+        }
+        if let Some(hr) = self.heart_rate_bpm
+            && (!hr.is_finite() || !(20.0..=300.0).contains(&hr))
+        {
+            errs.push("heart_rate_bpm", "heart_rate_bpm must be within 20..=300 bpm");
+        }
+        if let Some(t) = self.temperature_c
+            && (!t.is_finite() || !(30.0..=45.0).contains(&t))
+        {
+            errs.push("temperature_c", "temperature_c must be within 30.0..=45.0 ℃");
+        }
+        if let Some(spo2) = self.spo2_percent
+            && (!spo2.is_finite() || !(40.0..=100.0).contains(&spo2))
+        {
+            errs.push("spo2_percent", "spo2_percent must be within 40..=100%");
+        }
+        if let Some(pain) = self.pain_score_0_10
+            && pain > 10
+        {
+            errs.push("pain_score_0_10", "pain_score_0_10 must be within 0..=10");
+        }
+        errs.into_result()
+    }
+}
+
+impl Validate for ClinicalMediaAsset {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        let mut errs = ValidationErrors::new();
+        if self.asset_id.trim().is_empty() {
+            errs.push("asset_id", "asset_id must not be empty");
+        }
+        if self.title.trim().is_empty() {
+            errs.push("title", "title must not be empty");
+        }
+        if self.mime_type.trim().is_empty() {
+            errs.push("mime_type", "mime_type must not be empty");
+        }
+        errs.into_result()
+    }
+}
+
+impl Validate for LabBiochemPanel {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        let mut errs = ValidationErrors::new();
+        if self.panel_id.trim().is_empty() {
+            errs.push("panel_id", "panel_id must not be empty");
+        }
+        if self.panel_name.trim().is_empty() {
+            errs.push("panel_name", "panel_name must not be empty");
+        }
+        for (idx, item) in self.items.iter().enumerate() {
+            if item.item_name.trim().is_empty() {
+                errs.push(
+                    format!("items[{idx}].item_name"),
+                    "item_name must not be empty",
+                );
+            }
+        }
+        for (idx, asset) in self.attachments.iter().enumerate() {
+            if let Err(sub) = asset.validate() {
+                errs.extend_with_prefix(&format!("attachments[{idx}]"), sub);
+            }
+        }
+        errs.into_result()
+    }
+}
+
+impl Validate for ImagingExamRecord {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        let mut errs = ValidationErrors::new();
+        if self.exam_id.trim().is_empty() {
+            errs.push("exam_id", "exam_id must not be empty");
+        }
+        if self.exam_name.trim().is_empty() {
+            errs.push("exam_name", "exam_name must not be empty");
+        }
+        if self.findings.trim().is_empty() && self.impression.trim().is_empty() {
+            errs.push("findings", "at least one of findings or impression must be non-empty");
+        }
+        for (idx, img) in self.images.iter().enumerate() {
+            if let Err(sub) = img.validate() {
+                errs.extend_with_prefix(&format!("images[{idx}]"), sub);
+            }
+        }
+        errs.into_result()
+    }
+}
+
+impl Validate for WoundAssessmentRecord {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        let mut errs = ValidationErrors::new();
+        if self.wound_id.trim().is_empty() {
+            errs.push("wound_id", "wound_id must not be empty");
+        }
+        if self.body_site.trim().is_empty() {
+            errs.push("body_site", "body_site must not be empty");
+        }
+        if self.wound_type.trim().is_empty() {
+            errs.push("wound_type", "wound_type must not be empty");
+        }
+        for (idx, img) in self.images.iter().enumerate() {
+            if let Err(sub) = img.validate() {
+                errs.extend_with_prefix(&format!("images[{idx}]"), sub);
+            }
+        }
+        errs.into_result()
+    }
+}
+
+impl Validate for TriggerSubstanceRecord {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        let mut errs = ValidationErrors::new();
+        if self.trigger_id.trim().is_empty() {
+            errs.push("trigger_id", "trigger_id must not be empty");
+        }
+        if self.substance_name.trim().is_empty() {
+            errs.push("substance_name", "substance_name must not be empty");
+        }
+        for (idx, img) in self.images.iter().enumerate() {
+            if let Err(sub) = img.validate() {
+                errs.extend_with_prefix(&format!("images[{idx}]"), sub);
+            }
+        }
+        errs.into_result()
+    }
+}
+
+impl Validate for ClinicalExamBundle {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        let mut errs = ValidationErrors::new();
+        for (idx, v) in self.vital_signs.iter().enumerate() {
+            if let Err(sub) = v.validate() {
+                errs.extend_with_prefix(&format!("vital_signs[{idx}]"), sub);
+            }
+        }
+        for (idx, p) in self.lab_panels.iter().enumerate() {
+            if let Err(sub) = p.validate() {
+                errs.extend_with_prefix(&format!("lab_panels[{idx}]"), sub);
+            }
+        }
+        for (idx, img) in self.imaging_exams.iter().enumerate() {
+            if let Err(sub) = img.validate() {
+                errs.extend_with_prefix(&format!("imaging_exams[{idx}]"), sub);
+            }
+        }
+        for (idx, w) in self.wound_assessments.iter().enumerate() {
+            if let Err(sub) = w.validate() {
+                errs.extend_with_prefix(&format!("wound_assessments[{idx}]"), sub);
+            }
+        }
+        for (idx, t) in self.trigger_substances.iter().enumerate() {
+            if let Err(sub) = t.validate() {
+                errs.extend_with_prefix(&format!("trigger_substances[{idx}]"), sub);
+            }
+        }
+        for (idx, m) in self.media_assets.iter().enumerate() {
+            if let Err(sub) = m.validate() {
+                errs.extend_with_prefix(&format!("media_assets[{idx}]"), sub);
+            }
+        }
+        errs.into_result()
+    }
+}
+
 impl Validate for L2Profile {
     fn validate(&self) -> Result<(), ValidationErrors> {
         let mut errs = ValidationErrors::new();
         if self.age_group.trim().is_empty() {
             errs.push("age_group", "age_group must not be empty");
+        }
+        if let Some(ref vitals) = self.baseline_vitals
+            && let Err(sub) = vitals.validate()
+        {
+            errs.extend_with_prefix("baseline_vitals", sub);
+        }
+        for (idx, t) in self.trigger_substances.iter().enumerate() {
+            if let Err(sub) = t.validate() {
+                errs.extend_with_prefix(&format!("trigger_substances[{idx}]"), sub);
+            }
         }
         errs.into_result()
     }
@@ -213,6 +401,9 @@ impl Validate for L3VisitEvent {
         }
         if self.summary.trim().is_empty() {
             errs.push("summary", "summary must not be empty");
+        }
+        if let Err(sub) = self.clinical_exams.validate() {
+            errs.extend_with_prefix("clinical_exams", sub);
         }
         errs.into_result()
     }

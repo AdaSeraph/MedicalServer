@@ -827,6 +827,27 @@ pub fn parse_ai_knowledge_response(
             red_flag_signs,
             seasonal_tags,
             suggested_follow_up_slots,
+            reference_labs: obj
+                .get("reference_labs")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default(),
+            reference_vitals: get_str_list(obj, &["reference_vitals", "生命体征参考"]),
+            imaging_features: obj
+                .get("imaging_features")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default(),
+            wound_features: obj
+                .get("wound_features")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default(),
+            trigger_substances: obj
+                .get("trigger_substances")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default(),
+            media_assets: obj
+                .get("media_assets")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default(),
             updated_at: Some(Utc::now()),
         };
 
@@ -944,6 +965,13 @@ pub fn parse_ai_patient_response(
                 .map(|s| scrub_and_track(&s, &mut detected_pii_types))
                 .filter(|s| !s.is_empty())
                 .collect(),
+            baseline_vitals: obj
+                .get("baseline_vitals")
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
+            trigger_substances: obj
+                .get("trigger_substances")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default(),
         };
 
         // Collect L3 visit events (supports `visit_events` array, `l3_visit_events`, single `visit_event`, or flat top-level fields)
@@ -1013,6 +1041,10 @@ pub fn parse_ai_patient_response(
                 recommended_department,
                 urgency_level,
                 summary,
+                clinical_exams: ev_obj
+                    .get("clinical_exams")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default(),
             });
         }
 

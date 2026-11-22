@@ -233,6 +233,12 @@ async fn test_idempotent_upsert_by_doc_id() {
         red_flag_signs: vec![],
         seasonal_tags: vec![],
         suggested_follow_up_slots: vec![],
+        reference_labs: vec![],
+        reference_vitals: vec![],
+        imaging_features: vec![],
+        wound_features: vec![],
+        trigger_substances: vec![],
+        media_assets: vec![],
         updated_at: None,
     };
 
@@ -331,6 +337,12 @@ async fn test_hybrid_search_hard_filters_and_seasonal_epidemic_boost() {
         red_flag_signs: vec![],
         seasonal_tags: vec!["influenza".to_string(), "winter".to_string()],
         suggested_follow_up_slots: vec![],
+        reference_labs: vec![],
+        reference_vitals: vec![],
+        imaging_features: vec![],
+        wound_features: vec![],
+        trigger_substances: vec![],
+        media_assets: vec![],
         updated_at: None,
     };
 
@@ -351,6 +363,12 @@ async fn test_hybrid_search_hard_filters_and_seasonal_epidemic_boost() {
         red_flag_signs: vec![],
         seasonal_tags: vec![],
         suggested_follow_up_slots: vec![],
+        reference_labs: vec![],
+        reference_vitals: vec![],
+        imaging_features: vec![],
+        wound_features: vec![],
+        trigger_substances: vec![],
+        media_assets: vec![],
         updated_at: None,
     };
 

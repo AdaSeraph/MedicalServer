@@ -1,0 +1,38 @@
+{
+  "mcpServers": {
+    "medical-server-http": {
+      "command": "cargo",
+      "args": [
+        "run",
+        "--quiet",
+        "--manifest-path",
+        "E:/RustP/MedicalServer/Cargo.toml",
+        "--package",
+        "medical-mcp",
+        "--bin",
+        "medical-mcp",
+        "--",
+        "--url",
+        "http://127.0.0.1:8080"
+      ],
+      "env": {
+        "MEDICAL_ADMIN_TOKEN": "e2e-admin-secret"
+      }
+    },
+    "medical-server-standalone": {
+      "command": "cargo",
+      "args": [
+        "run",
+        "--quiet",
+        "--manifest-path",
+        "E:/RustP/MedicalServer/Cargo.toml",
+        "--package",
+        "medical-mcp",
+        "--bin",
+        "medical-mcp",
+        "--",
+        "--standalone"
+      ]
+    }
+  }
+}

@@ -40,6 +40,7 @@ async fn test_in_memory_patient_encryption_and_physical_wipe() {
         allergies: vec!["阿司匹林".into()],
         surgical_history: vec!["胆囊切除".into()],
         long_term_medications: vec!["氯吡格雷".into()],
+        ..Default::default()
     };
     store
         .upsert_l2_profile("pat_sha256_test01", true, &profile)
@@ -60,6 +61,7 @@ async fn test_in_memory_patient_encryption_and_physical_wipe() {
         recommended_department: "心血管内科".into(),
         urgency_level: 2,
         summary: "建议心血管内科进一步评估".into(),
+        clinical_exams: Default::default(),
     };
     store
         .insert_l3_event("pat_sha256_test01", &event)
@@ -322,6 +324,7 @@ async fn test_list_l3_events_limit_zero_and_api_key_seed_key() {
             recommended_department: "呼吸内科".into(),
             urgency_level: 3,
             summary: "建议呼吸内科就诊".into(),
+            clinical_exams: Default::default(),
         },
     )
     .await
@@ -412,6 +415,12 @@ async fn test_knowledge_tenant_namespace_visibility_and_hit_field() {
         red_flag_signs: vec![],
         seasonal_tags: vec![],
         suggested_follow_up_slots: vec![],
+        reference_labs: vec![],
+        reference_vitals: vec![],
+        imaging_features: vec![],
+        wound_features: vec![],
+        trigger_substances: vec![],
+        media_assets: vec![],
         updated_at: None,
     };
 

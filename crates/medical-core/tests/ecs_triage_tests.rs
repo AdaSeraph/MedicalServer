@@ -293,6 +293,7 @@ async fn test_l2_aes256_gcm_roundtrip_and_outbound_pii_scrubbing() {
         allergies: vec!["青霉素".into()],
         surgical_history: vec![],
         long_term_medications: vec![],
+        ..Default::default()
     };
     h.patient_mem
         .upsert_l2_profile("pat_sha256_l2", true, &l2)
@@ -377,6 +378,12 @@ async fn test_seasonal_epidemic_boost_changes_ranking() {
             red_flag_signs: vec![],
             seasonal_tags: vec![],
             suggested_follow_up_slots: vec![],
+            reference_labs: vec![],
+            reference_vitals: vec![],
+            imaging_features: vec![],
+            wound_features: vec![],
+            trigger_substances: vec![],
+            media_assets: vec![],
             updated_at: None,
         },
         KnowledgeDocument {
@@ -400,6 +407,12 @@ async fn test_seasonal_epidemic_boost_changes_ranking() {
                 short_question: "近期接触过发热病人吗？".into(),
                 quick_options: vec!["有接触".into(), "没有接触".into()],
             }],
+            reference_labs: vec![],
+            reference_vitals: vec![],
+            imaging_features: vec![],
+            wound_features: vec![],
+            trigger_substances: vec![],
+            media_assets: vec![],
             updated_at: None,
         },
     ]);
@@ -564,6 +577,12 @@ async fn test_sse_streaming_triage_and_inactive_epidemic_control() {
         red_flag_signs: vec![],
         seasonal_tags: vec!["influenza_season".into()],
         suggested_follow_up_slots: vec![],
+        reference_labs: vec![],
+        reference_vitals: vec![],
+        imaging_features: vec![],
+        wound_features: vec![],
+        trigger_substances: vec![],
+        media_assets: vec![],
         updated_at: None,
     }]);
 
@@ -776,6 +795,12 @@ async fn test_zero_intensity_epidemic_and_reasoning_prompt_label_preservation() 
         red_flag_signs: vec![],
         seasonal_tags: vec!["influenza_season".into()],
         suggested_follow_up_slots: vec![],
+        reference_labs: vec![],
+        reference_vitals: vec![],
+        imaging_features: vec![],
+        wound_features: vec![],
+        trigger_substances: vec![],
+        media_assets: vec![],
         updated_at: None,
     }]);
     h.reasoning_llm.push_step(MockStep::Json(

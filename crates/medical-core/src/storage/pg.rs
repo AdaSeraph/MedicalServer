@@ -98,6 +98,8 @@ impl PgPatientMemoryStore {
                 allergies: sensitive.allergies,
                 surgical_history: sensitive.surgical_history,
                 long_term_medications: sensitive.long_term_medications,
+                baseline_vitals: sensitive.baseline_vitals,
+                trigger_substances: sensitive.trigger_substances,
             },
             updated_at: row.updated_at,
         })
@@ -118,6 +120,7 @@ impl PgPatientMemoryStore {
             recommended_department: row.recommended_department,
             urgency_level: row.urgency_level.clamp(1, 4) as u8,
             summary: sensitive.summary,
+            clinical_exams: sensitive.clinical_exams,
         })
     }
 }

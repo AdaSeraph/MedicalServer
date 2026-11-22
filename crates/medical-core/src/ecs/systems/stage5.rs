@@ -124,6 +124,7 @@ pub async fn execute_memory_consolidation(
         recommended_department: input.recommended_department,
         urgency_level: input.urgency_level.clamp(1, 4),
         summary: summary.clone(),
+        clinical_exams: Default::default(),
     };
 
     let l2_ok = res

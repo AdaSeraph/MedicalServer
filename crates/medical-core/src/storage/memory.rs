@@ -94,6 +94,8 @@ impl PatientMemoryStore for InMemoryPatientMemoryStore {
                 allergies: sensitive.allergies,
                 surgical_history: sensitive.surgical_history,
                 long_term_medications: sensitive.long_term_medications,
+                baseline_vitals: sensitive.baseline_vitals,
+                trigger_substances: sensitive.trigger_substances,
             },
             updated_at: row.updated_at,
         }))
@@ -161,6 +163,7 @@ impl PatientMemoryStore for InMemoryPatientMemoryStore {
                     recommended_department: r.recommended_department,
                     urgency_level: r.urgency_level,
                     summary: sensitive.summary,
+                    clinical_exams: sensitive.clinical_exams,
                 })
             })
             .collect()

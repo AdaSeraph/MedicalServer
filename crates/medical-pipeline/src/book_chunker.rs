@@ -693,6 +693,12 @@ fn build_chunks_from_trees(
                 },
                 seasonal_tags: seasonal_tags.clone(),
                 suggested_follow_up_slots: Vec::new(),
+                reference_labs: Vec::new(),
+                reference_vitals: Vec::new(),
+                imaging_features: Vec::new(),
+                wound_features: Vec::new(),
+                trigger_substances: Vec::new(),
+                media_assets: Vec::new(),
                 updated_at: Some(Utc::now()),
             };
             doc.validate()

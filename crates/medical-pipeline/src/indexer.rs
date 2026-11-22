@@ -111,11 +111,60 @@ impl TantivyKnowledgeIndex {
             } else {
                 format!("{} {}", d.disease_name, d.aliases.join(" "))
             };
-            let content_with_diff = if d.differential_points.is_empty() {
-                d.content.clone()
-            } else {
-                format!("{} {}", d.content, d.differential_points.join(" "))
-            };
+            let mut content_parts = vec![d.content.clone()];
+            if !d.differential_points.is_empty() {
+                content_parts.push(d.differential_points.join(" "));
+            }
+            for lab in &d.reference_labs {
+                content_parts.push(format!(
+                    "{} {} {} {}",
+                    lab.item_name,
+                    lab.item_code.as_deref().unwrap_or(""),
+                    lab.value_text.as_deref().unwrap_or(""),
+                    lab.reference_range.as_deref().unwrap_or("")
+                ));
+            }
+            if !d.reference_vitals.is_empty() {
+                content_parts.push(d.reference_vitals.join(" "));
+            }
+            for img in &d.imaging_features {
+                content_parts.push(format!(
+                    "{} {} {} {} {}",
+                    img.modality.label_zh(),
+                    img.exam_name,
+                    img.body_part,
+                    img.typical_findings,
+                    img.diagnostic_significance.as_deref().unwrap_or("")
+                ));
+            }
+            for w in &d.wound_features {
+                content_parts.push(format!(
+                    "{} {} {} {}",
+                    w.wound_type,
+                    w.common_sites.join(" "),
+                    w.visual_characteristics,
+                    w.warning_signs.join(" ")
+                ));
+            }
+            for t in &d.trigger_substances {
+                content_parts.push(format!(
+                    "{} {} {} {}",
+                    t.category.label_zh(),
+                    t.substance_name,
+                    t.reaction_symptoms.join(" "),
+                    t.notes.as_deref().unwrap_or("")
+                ));
+            }
+            for m in &d.media_assets {
+                content_parts.push(format!(
+                    "{} {} {} {}",
+                    m.category.label_zh(),
+                    m.title,
+                    m.caption.as_deref().unwrap_or(""),
+                    m.tags.join(" ")
+                ));
+            }
+            let content_with_diff = content_parts.join(" ");
 
             let mut tdoc = doc!(
                 self.fields.doc_id => scoped_key.as_str(),

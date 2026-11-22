@@ -5,7 +5,12 @@ use std::path::Path;
 use calamine::{Data, Reader, open_workbook_auto, open_workbook_auto_from_rs};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use medical_core::crypto::{hash_api_key, hash_patient_id};
-use medical_core::models::{Gender, L2Profile, L3VisitEvent, PatientRecord};
+use medical_core::models::{
+    ClinicalExamBundle, ClinicalMediaAsset, ClinicalMediaCategory, Gender, ImagingExamRecord,
+    ImagingModality, L2Profile, L3VisitEvent, LabBiochemItem, LabBiochemPanel, LabPanelCategory,
+    PatientRecord, TriggerCategory, TriggerSubstanceRecord, VitalSignsRecord,
+    WoundAssessmentRecord,
+};
 use medical_core::privacy::scrub_pii;
 use medical_core::validation::Validate;
 use rayon::prelude::*;
@@ -70,6 +75,9 @@ struct RawPatientRow {
     recommended_department: Option<String>,
     urgency_level: Option<u8>,
     summary: Option<String>,
+    baseline_vitals: Option<VitalSignsRecord>,
+    l2_trigger_substances: Vec<TriggerSubstanceRecord>,
+    clinical_exams: ClinicalExamBundle,
 }
 
 /// JSON export format for raw hospital patient files (e.g. `patients_raw.json`).
@@ -100,6 +108,10 @@ struct RawPatientJsonItem {
     #[serde(default)]
     long_term_medications: Vec<String>,
     #[serde(default)]
+    baseline_vitals: Option<VitalSignsRecord>,
+    #[serde(default)]
+    trigger_substances: Vec<TriggerSubstanceRecord>,
+    #[serde(default)]
     visit_event: Option<RawVisitEventJson>,
 }
 
@@ -119,6 +131,8 @@ struct RawVisitEventJson {
     urgency_level: Option<u8>,
     #[serde(default)]
     summary: Option<String>,
+    #[serde(default)]
+    clinical_exams: ClinicalExamBundle,
 }
 
 /// Auto-detects columns that contain sensitive PII (name, ID card, phone, address).
@@ -350,19 +364,37 @@ pub fn import_patients_json_str(
                 serde_json::Value::String(s) => s,
                 other => other.to_string(),
             });
-            let (event_id, occurred_at, chief_complaint, extracted_symptoms, recommended_department, urgency_level, summary) =
-                match item.visit_event {
-                    Some(ev) => (
-                        ev.event_id,
-                        ev.occurred_at,
-                        ev.chief_complaint,
-                        ev.extracted_symptoms,
-                        ev.recommended_department,
-                        ev.urgency_level,
-                        ev.summary,
-                    ),
-                    None => (None, None, None, Vec::new(), None, None, None),
-                };
+            let (
+                event_id,
+                occurred_at,
+                chief_complaint,
+                extracted_symptoms,
+                recommended_department,
+                urgency_level,
+                summary,
+                clinical_exams,
+            ) = match item.visit_event {
+                Some(ev) => (
+                    ev.event_id,
+                    ev.occurred_at,
+                    ev.chief_complaint,
+                    ev.extracted_symptoms,
+                    ev.recommended_department,
+                    ev.urgency_level,
+                    ev.summary,
+                    ev.clinical_exams,
+                ),
+                None => (
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    None,
+                    None,
+                    None,
+                    ClinicalExamBundle::default(),
+                ),
+            };
             RawPatientRow {
                 row_index: idx + 1,
                 name: item.name,
@@ -384,6 +416,9 @@ pub fn import_patients_json_str(
                 recommended_department,
                 urgency_level,
                 summary,
+                baseline_vitals: item.baseline_vitals,
+                l2_trigger_substances: item.trigger_substances,
+                clinical_exams,
             }
         })
         .collect();
@@ -530,10 +565,26 @@ fn mask_single_row(row: &RawPatientRow, config: &PatientMaskingConfig) -> Result
             .map(|s| scrub_row_text(s, row))
             .filter(|s| !s.is_empty())
             .collect(),
+        baseline_vitals: row.baseline_vitals.clone(),
+        trigger_substances: row.l2_trigger_substances.clone(),
     };
 
     let mut l3_visit_events = Vec::new();
-    if let Some(raw_cc) = row.chief_complaint.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let has_clinical_exams = !row.clinical_exams.is_empty();
+    let effective_cc = row
+        .chief_complaint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            if has_clinical_exams {
+                Some("医学检查/生化/影像/创面记录导入".to_string())
+            } else {
+                None
+            }
+        });
+    if let Some(raw_cc) = effective_cc {
         let occurred_at = match row.occurred_at.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             Some(raw_dt) => parse_clinical_datetime(raw_dt).ok_or_else(|| {
                 format!(
@@ -544,13 +595,20 @@ fn mask_single_row(row: &RawPatientRow, config: &PatientMaskingConfig) -> Result
             None => Utc::now(),
         };
 
-        let chief_complaint = scrub_row_text(raw_cc, row);
+        let chief_complaint = scrub_row_text(&raw_cc, row);
         let summary = row
             .summary
             .as_deref()
             .map(|s| scrub_row_text(s, row))
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| chief_complaint.clone());
+            .unwrap_or_else(|| {
+                let exam_text = row.clinical_exams.to_searchable_text();
+                if exam_text.is_empty() {
+                    chief_complaint.clone()
+                } else {
+                    format!("{chief_complaint}（{exam_text}）")
+                }
+            });
         let recommended_department = row
             .recommended_department
             .as_deref()
@@ -589,6 +647,7 @@ fn mask_single_row(row: &RawPatientRow, config: &PatientMaskingConfig) -> Result
             recommended_department,
             urgency_level,
             summary,
+            clinical_exams: row.clinical_exams.clone(),
         });
     }
 
@@ -703,6 +762,224 @@ fn raw_row_from_map(row_index: usize, map: &HashMap<&str, String>) -> RawPatient
     let urgency_level = get_any(&["紧急等级", "urgency_level", "urgency"])
         .and_then(|s| s.parse::<u8>().ok());
 
+    let parse_f32 = |keys: &[&str]| -> Option<f32> {
+        get_any(keys).and_then(|s| s.parse::<f32>().ok())
+    };
+
+    let mut clinical_exams = ClinicalExamBundle::default();
+
+    // 1. Vital signs / blood pressure columns (血压、收缩压、舒张压、心率、体温、血氧、血糖)
+    let mut bp_sys = parse_f32(&["收缩压", "高压", "systolic_bp", "systolic_bp_mmhg"]);
+    let mut bp_dia = parse_f32(&["舒张压", "低压", "diastolic_bp", "diastolic_bp_mmhg"]);
+    if bp_sys.is_none()
+        && let Some(bp_str) = get_any(&["血压", "blood_pressure", "bp"])
+        && let Some((s_str, d_str)) = bp_str.split_once('/')
+    {
+        bp_sys = s_str.trim().parse::<f32>().ok();
+        bp_dia = d_str.trim().parse::<f32>().ok();
+    }
+    let vitals = VitalSignsRecord {
+        record_id: format!("vs_row_{row_index}"),
+        measured_at: None,
+        systolic_bp_mmhg: bp_sys,
+        diastolic_bp_mmhg: bp_dia,
+        heart_rate_bpm: parse_f32(&["心率", "heart_rate", "heart_rate_bpm"]),
+        respiratory_rate_rpm: parse_f32(&["呼吸频率", "respiratory_rate", "respiratory_rate_rpm"]),
+        temperature_c: parse_f32(&["体温", "temperature", "temperature_c"]),
+        spo2_percent: parse_f32(&["血氧", "血氧饱和度", "spo2", "spo2_percent"]),
+        blood_glucose_mmol_l: parse_f32(&["血糖", "blood_glucose", "blood_glucose_mmol_l"]),
+        height_cm: parse_f32(&["身高", "height_cm"]),
+        weight_kg: parse_f32(&["体重", "weight_kg"]),
+        bmi: parse_f32(&["BMI", "bmi"]),
+        pain_score_0_10: get_any(&["疼痛评分", "pain_score"]).and_then(|s| s.parse::<u8>().ok()),
+        notes: None,
+    };
+    let baseline_vitals = if vitals.has_any_measurement() {
+        clinical_exams.vital_signs.push(vitals.clone());
+        Some(vitals)
+    } else {
+        None
+    };
+
+    // 2. Blood / Biochemical lab column (抽血生化、生化指标、lab_biochem)
+    if let Some(lab_raw) = get_any(&["抽血生化", "生化指标", "化验结果", "lab_biochem", "lab_panels"]) {
+        if let Ok(parsed_panels) = serde_json::from_str::<Vec<LabBiochemPanel>>(&lab_raw) {
+            clinical_exams.lab_panels.extend(parsed_panels);
+        } else {
+            let items: Vec<LabBiochemItem> = lab_raw
+                .split([';', '；', '|'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|entry| {
+                    if let Some((k, v)) = entry.split_once(':').or_else(|| entry.split_once('：')) {
+                        let v_trim = v.trim();
+                        let num_prefix: String = v_trim
+                            .chars()
+                            .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                            .collect();
+                        let value_numeric = num_prefix.parse::<f64>().ok();
+                        let unit_part = v_trim.strip_prefix(&num_prefix).map(str::trim).filter(|u| !u.is_empty()).map(ToString::to_string);
+                        LabBiochemItem {
+                            loinc_code: None,
+                            item_code: None,
+                            item_name: k.trim().to_string(),
+                            value_numeric,
+                            value_text: if value_numeric.is_none() { Some(v_trim.to_string()) } else { None },
+                            unit: unit_part,
+                            reference_range: None,
+                            abnormal_flag: None,
+                        }
+                    } else {
+                        LabBiochemItem {
+                            loinc_code: None,
+                            item_code: None,
+                            item_name: entry.to_string(),
+                            value_numeric: None,
+                            value_text: Some(entry.to_string()),
+                            unit: None,
+                            reference_range: None,
+                            abnormal_flag: None,
+                        }
+                    }
+                })
+                .collect();
+            if !items.is_empty() {
+                clinical_exams.lab_panels.push(LabBiochemPanel {
+                    panel_id: format!("lab_row_{row_index}"),
+                    category: LabPanelCategory::Other,
+                    panel_name: "导入抽血/生化检验".to_string(),
+                    specimen: Some("静脉血".to_string()),
+                    collected_at: None,
+                    reported_at: None,
+                    items,
+                    summary: None,
+                    attachments: Vec::new(),
+                });
+            }
+        }
+    }
+
+    // 3. Imaging exam column (核磁影像、核磁MRI、CT影像、影像检查)
+    if let Some(img_raw) = get_any(&["核磁影像", "影像检查", "核磁", "mri_findings", "imaging_exam"]) {
+        let modality = if img_raw.to_ascii_lowercase().contains("mri") || img_raw.contains("核磁") || img_raw.contains("磁共振") {
+            ImagingModality::Mri
+        } else if img_raw.to_ascii_lowercase().contains("ct") {
+            ImagingModality::Ct
+        } else if img_raw.contains("超声") || img_raw.contains("B超") {
+            ImagingModality::Ultrasound
+        } else if img_raw.contains("心电") || img_raw.to_ascii_lowercase().contains("ecg") {
+            ImagingModality::Ecg
+        } else if img_raw.contains("X线") || img_raw.contains("胸片") {
+            ImagingModality::Xray
+        } else {
+            ImagingModality::Other
+        };
+        let mut images = Vec::new();
+        if let Some(img_uri) = get_any(&["影像图片", "核磁图片", "mri_image", "imaging_image"]) {
+            images.push(ClinicalMediaAsset {
+                asset_id: format!("img_exam_row_{row_index}"),
+                category: if modality == ImagingModality::Mri {
+                    ClinicalMediaCategory::MriImage
+                } else {
+                    ClinicalMediaCategory::CtImage
+                },
+                title: format!("{}影像图片", modality.label_zh()),
+                mime_type: "image/jpeg".to_string(),
+                uri_or_path: Some(img_uri),
+                data_base64: None,
+                sha256: None,
+                body_site: None,
+                captured_at: None,
+                caption: None,
+                tags: vec!["影像".to_string()],
+            });
+        }
+        clinical_exams.imaging_exams.push(ImagingExamRecord {
+            exam_id: format!("exam_row_{row_index}"),
+            modality,
+            exam_name: modality.label_zh().to_string(),
+            body_part: get_any(&["检查部位", "body_part"]).unwrap_or_default(),
+            examined_at: None,
+            findings: img_raw,
+            impression: String::new(),
+            contrast_used: None,
+            images,
+        });
+    }
+
+    // 4. Wound assessment & wound image columns (伤口评估、伤口图片)
+    let wound_desc = get_any(&["伤口评估", "创面描述", "wound_assessment"]);
+    let wound_img = get_any(&["伤口图片", "创面图片", "wound_image"]);
+    if wound_desc.is_some() || wound_img.is_some() {
+        let mut images = Vec::new();
+        if let Some(uri) = wound_img {
+            images.push(ClinicalMediaAsset {
+                asset_id: format!("wound_img_row_{row_index}"),
+                category: ClinicalMediaCategory::WoundImage,
+                title: "伤口实拍图片".to_string(),
+                mime_type: "image/jpeg".to_string(),
+                uri_or_path: Some(uri),
+                data_base64: None,
+                sha256: None,
+                body_site: get_any(&["伤口部位", "wound_site"]),
+                captured_at: None,
+                caption: wound_desc.clone(),
+                tags: vec!["伤口".to_string()],
+            });
+        }
+        clinical_exams.wound_assessments.push(WoundAssessmentRecord {
+            wound_id: format!("wound_row_{row_index}"),
+            body_site: get_any(&["伤口部位", "wound_site"]).unwrap_or_else(|| "未标注部位".to_string()),
+            wound_type: get_any(&["伤口类型", "wound_type"]).unwrap_or_else(|| "临床创面".to_string()),
+            length_cm: None,
+            width_cm: None,
+            depth_cm: None,
+            tissue_type: None,
+            infection_signs: Vec::new(),
+            exudate_level: None,
+            edge_status: None,
+            assessed_at: None,
+            notes: wound_desc,
+            images,
+        });
+    }
+
+    // 5. Trigger substance & image columns (诱因物质、诱因图片)
+    let trigger_name = get_any(&["诱因物质", "疑似诱因", "trigger_substance"]);
+    let trigger_img = get_any(&["诱因图片", "诱因物质图片", "trigger_image"]);
+    let mut l2_trigger_substances = Vec::new();
+    if trigger_name.is_some() || trigger_img.is_some() {
+        let mut images = Vec::new();
+        if let Some(uri) = trigger_img {
+            images.push(ClinicalMediaAsset {
+                asset_id: format!("trigger_img_row_{row_index}"),
+                category: ClinicalMediaCategory::TriggerSubstanceImage,
+                title: "诱因物质图片".to_string(),
+                mime_type: "image/jpeg".to_string(),
+                uri_or_path: Some(uri),
+                data_base64: None,
+                sha256: None,
+                body_site: None,
+                captured_at: None,
+                caption: trigger_name.clone(),
+                tags: vec!["诱因物质".to_string()],
+            });
+        }
+        let trig = TriggerSubstanceRecord {
+            trigger_id: format!("trig_row_{row_index}"),
+            category: TriggerCategory::Other,
+            substance_name: trigger_name.unwrap_or_else(|| "待确认诱因物质".to_string()),
+            exposure_route: get_any(&["暴露途径", "exposure_route"]),
+            reaction_symptoms: split_list(get_any(&["诱发反应", "reaction_symptoms"])),
+            severity: None,
+            exposure_time: None,
+            notes: None,
+            images,
+        };
+        l2_trigger_substances.push(trig.clone());
+        clinical_exams.trigger_substances.push(trig);
+    }
+
     RawPatientRow {
         row_index,
         name: get_any(&["姓名", "患者姓名", "name"]),
@@ -724,6 +1001,9 @@ fn raw_row_from_map(row_index: usize, map: &HashMap<&str, String>) -> RawPatient
         recommended_department: get_any(&["推荐科室", "recommended_department"]),
         urgency_level,
         summary: get_any(&["摘要", "summary"]),
+        baseline_vitals,
+        l2_trigger_substances,
+        clinical_exams,
     }
 }
 

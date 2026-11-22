@@ -11,24 +11,30 @@ COPY crates ./crates
 COPY migrations ./migrations
 COPY config ./config
 
-RUN cargo build --release --bin medical-server
+RUN cargo build --release --bin medical-server --bin medical-mcp
 
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd -r -u 10001 -m medical
+    && useradd -r -u 10001 -m medical \
+    && mkdir -p /app/data/tantivy \
+    && chown -R medical:medical /app
 
 WORKDIR /app
 COPY --from=builder /app/target/release/medical-server /usr/local/bin/medical-server
+COPY --from=builder /app/target/release/medical-mcp /usr/local/bin/medical-mcp
 COPY --from=builder /app/migrations /app/migrations
 COPY --from=builder /app/config /app/config
 
 USER medical
 ENV SERVER_ADDR=0.0.0.0:8080
+ENV MEDICAL_DATA_DIR=/app/data
+ENV TANTIVY_INDEX_DIR=/app/data/tantivy
 ENV RUST_LOG=info
 
+VOLUME ["/app/data"]
 EXPOSE 8080
 
 HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \

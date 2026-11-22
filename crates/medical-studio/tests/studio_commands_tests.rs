@@ -824,6 +824,7 @@ async fn test_patient_revisit_feedback_and_new_patient_consultation() {
                 allergies: vec!["头孢".to_string()],
                 surgical_history: vec![],
                 long_term_medications: vec![],
+                ..Default::default()
             },
         },
     )

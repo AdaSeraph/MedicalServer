@@ -1,6 +1,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::clinical::{
+    ClinicalMediaAsset, ImagingFeatureRef, LabBiochemItem, TriggerSubstanceRecord, WoundFeatureRef,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceType {
@@ -41,6 +45,12 @@ pub enum SectionType {
     DifferentialDiagnosis,
     RedFlag,
     TriageRule,
+    /// 医学检查与生化检验参考（血常规、生化、血压、心电等）
+    DiagnosticWorkup,
+    /// 影像学与伤口/皮损图谱（MRI/CT/X线/超声/伤口照片）
+    ImagingAtlas,
+    /// 诱因物质与过敏原防治指南（附诱因识别图）
+    TriggerPrevention,
 }
 
 impl SectionType {
@@ -50,6 +60,9 @@ impl SectionType {
             Self::DifferentialDiagnosis => "differential_diagnosis",
             Self::RedFlag => "red_flag",
             Self::TriageRule => "triage_rule",
+            Self::DiagnosticWorkup => "diagnostic_workup",
+            Self::ImagingAtlas => "imaging_atlas",
+            Self::TriggerPrevention => "trigger_prevention",
         }
     }
 }
@@ -85,6 +98,24 @@ pub struct KnowledgeDocument {
     pub seasonal_tags: Vec<String>,
     #[serde(default)]
     pub suggested_follow_up_slots: Vec<SuggestedFollowUpSlot>,
+    /// 该疾病典型/参考化验与医学生化指标（如 WBC、ALT、cTnI、CRP、HbA1c 等）
+    #[serde(default)]
+    pub reference_labs: Vec<LabBiochemItem>,
+    /// 典型生命体征/血压/血氧参考阈值（如 "收缩压 ≥140 mmHg"、"SpO2 <93%"）
+    #[serde(default)]
+    pub reference_vitals: Vec<String>,
+    /// 典型影像学检查表现（MRI、CT、X线、超声、心电图等）及示例图
+    #[serde(default)]
+    pub imaging_features: Vec<ImagingFeatureRef>,
+    /// 典型伤口/创面/皮损形态特征及图谱
+    #[serde(default)]
+    pub wound_features: Vec<WoundFeatureRef>,
+    /// 常见诱因物质/过敏原及识别图片
+    #[serde(default)]
+    pub trigger_substances: Vec<TriggerSubstanceRecord>,
+    /// 知识库关联多模态医学图片（伤口图、MRI/CT图、化验单示例、诱因物质图等）
+    #[serde(default)]
+    pub media_assets: Vec<ClinicalMediaAsset>,
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
 }

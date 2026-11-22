@@ -15,11 +15,16 @@ use medical_core::crypto::hash_patient_id;
 use medical_core::ecs::{TriageRequest, TriageStreamEvent};
 use medical_core::llm::{LlmMessage, LlmRequest, LlmStreamChunk, MessageRole, ModelTier};
 use medical_core::models::{
-    EpidemicContext, PatientRecord, RedFlagLevel, TargetPopulation,
+    ClinicalExamBundle, EpidemicContext, KnowledgeDocument, L2Profile, L3VisitEvent,
+    PatientRecord, RedFlagLevel, RedFlagRule, SymptomSynonym, TargetPopulation,
+    TriggerSubstanceRecord, VitalSignsRecord, default_clinical_data_catalog,
 };
 use medical_core::privacy::{MEDICAL_DISCLAIMER, sanitize_medical_output, scrub_pii};
 use medical_core::storage::KnowledgeSearchQuery;
 use medical_core::validation::{Validate, validate_patient_id};
+use medical_pipeline::{
+    PatientMaskingConfig, import_patients_csv_str, import_patients_json_str,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -53,23 +58,39 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
+        .route("/v1/clinical/types", get(clinical_types_catalog_handler))
         .route("/v1/auth/wechat", post(wechat_auth_handler))
         .route("/v1/triage/chat", post(triage_chat_handler))
         .route("/v1/knowledge/search", post(knowledge_search_handler))
+        .route("/v1/knowledge/import", post(knowledge_import_handler))
+        .route(
+            "/v1/knowledge/documents",
+            get(knowledge_list_handler).delete(knowledge_delete_handler),
+        )
         .route(
             "/v1/openai/chat/completions",
             post(openai_proxy_handler),
         )
         .route("/v1/epidemic/current", get(epidemic_current_handler))
+        .route("/v1/patients", get(list_patients_handler))
+        .route("/v1/patients/import", post(import_patients_batch_handler))
         .route(
             "/v1/patients/{patient_id}/memory",
             get(get_patient_memory_handler)
                 .put(put_patient_memory_handler)
                 .delete(delete_patient_memory_handler),
         )
+        .route(
+            "/v1/patients/{patient_id}/clinical-exams",
+            post(attach_patient_clinical_exams_handler),
+        )
+        .route("/v1/dictionaries", get(get_dictionaries_handler))
+        .route("/v1/dictionaries/synonyms", post(upsert_synonym_handler))
+        .route("/v1/dictionaries/red-flags", post(upsert_red_flag_handler))
         .route("/v1/admin/reload", post(admin_reload_handler))
+        .route("/v1/admin/save", post(admin_save_snapshot_handler))
         .route("/v1/admin/epidemics", post(admin_upsert_epidemic_handler))
-        .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .layer(ConcurrencyLimitLayer::new(512))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -1336,4 +1357,567 @@ async fn admin_upsert_epidemic_handler(
     }
     let _ = state.reload_hot_resources(true, false, false).await;
     Json(serde_json::json!({ "saved": true, "context_id": ctx.context_id })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/clinical/types (Standardized Clinical Data Type Catalog)
+// ---------------------------------------------------------------------------
+
+async fn clinical_types_catalog_handler() -> impl IntoResponse {
+    Json(default_clinical_data_catalog())
+}
+
+// ---------------------------------------------------------------------------
+// POST /v1/knowledge/import, GET & DELETE /v1/knowledge/documents
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct KnowledgeImportRequest {
+    documents: Vec<KnowledgeDocument>,
+    #[serde(default)]
+    tenant_namespace: Option<String>,
+}
+
+async fn knowledge_import_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<KnowledgeImportRequest>,
+) -> Response {
+    let auth = match authenticate_request(&state, &headers, 20).await {
+        Ok(a) => a,
+        Err(e) => return auth_err_response(e),
+    };
+    if !auth.is_admin && auth.api_key.is_none() {
+        return auth_err_response(AuthError::forbidden(
+            "admin or tenant API key required for knowledge import",
+        ));
+    }
+    if req.documents.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "documents must not be empty");
+    }
+    for (idx, doc) in req.documents.iter().enumerate() {
+        if let Err(verr) = doc.validate() {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                format!("documents[{idx}] validation failed: {verr}"),
+            );
+        }
+    }
+    let ns = req
+        .tenant_namespace
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&auth.namespace)
+        .to_string();
+
+    match state.indexer.upsert_documents(&req.documents, &ns).await {
+        Ok(written) => Json(serde_json::json!({
+            "imported": written,
+            "tenant_namespace": ns,
+            "total_docs_in_index": state.tantivy.num_docs(),
+        }))
+        .into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct KnowledgeListQuery {
+    #[serde(default)]
+    department: Option<String>,
+    #[serde(default)]
+    keyword: Option<String>,
+    #[serde(default = "default_list_limit")]
+    limit: usize,
+}
+
+fn default_list_limit() -> usize {
+    50
+}
+
+async fn knowledge_list_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<KnowledgeListQuery>,
+) -> Response {
+    let auth = match authenticate_request(&state, &headers, 5).await {
+        Ok(a) => a,
+        Err(e) => return auth_err_response(e),
+    };
+    let ns = if auth.is_admin {
+        None
+    } else {
+        Some(auth.namespace.as_str())
+    };
+    match state.tantivy.list_all_documents(ns) {
+        Ok(mut docs) => {
+            if let Some(dept) = q.department.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                docs.retain(|d| d.department == dept || d.secondary_departments.iter().any(|s| s == dept));
+            }
+            if let Some(kw) = q.keyword.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                let kw_lower = kw.to_ascii_lowercase();
+                docs.retain(|d| {
+                    d.disease_name.to_ascii_lowercase().contains(&kw_lower)
+                        || d.content.to_ascii_lowercase().contains(&kw_lower)
+                        || d.doc_id.to_ascii_lowercase().contains(&kw_lower)
+                });
+            }
+            let total = docs.len();
+            docs.truncate(q.limit.clamp(1, 500));
+            Json(serde_json::json!({
+                "total": total,
+                "documents": docs,
+            }))
+            .into_response()
+        }
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct KnowledgeDeleteRequest {
+    doc_ids: Vec<String>,
+    #[serde(default)]
+    tenant_namespace: Option<String>,
+}
+
+async fn knowledge_delete_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<KnowledgeDeleteRequest>,
+) -> Response {
+    let auth = match authenticate_request(&state, &headers, 5).await {
+        Ok(a) => a,
+        Err(e) => return auth_err_response(e),
+    };
+    if !auth.is_admin {
+        return auth_err_response(AuthError::forbidden("admin authorization required"));
+    }
+    if req.doc_ids.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "doc_ids must not be empty");
+    }
+    let ns = req
+        .tenant_namespace
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default");
+    if let Err(e) = state
+        .tantivy
+        .delete_by_doc_ids_in_namespace(&req.doc_ids, ns)
+    {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+    let _ = state
+        .stores
+        .knowledge_vectors
+        .delete_by_doc_ids(&req.doc_ids)
+        .await;
+    Json(serde_json::json!({
+        "deleted": req.doc_ids.len(),
+        "doc_ids": req.doc_ids,
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/patients, POST /v1/patients/import, POST /v1/patients/{id}/clinical-exams
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ListPatientsQuery {
+    #[serde(default = "default_list_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+}
+
+async fn list_patients_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<ListPatientsQuery>,
+) -> Response {
+    let auth = match authenticate_request(&state, &headers, 5).await {
+        Ok(a) => a,
+        Err(e) => return auth_err_response(e),
+    };
+    if !auth.is_admin && auth.api_key.is_none() {
+        return auth_err_response(AuthError::forbidden(
+            "admin or tenant API key required to list patients",
+        ));
+    }
+    match state
+        .stores
+        .patient_memory
+        .list_patient_ids(q.limit.clamp(1, 500), q.offset)
+        .await
+    {
+        Ok(ids) => Json(serde_json::json!({
+            "total": ids.len(),
+            "patient_ids": ids,
+        }))
+        .into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AttachClinicalExamsRequest {
+    #[serde(default)]
+    event_id: Option<String>,
+    #[serde(default)]
+    chief_complaint: Option<String>,
+    #[serde(default)]
+    recommended_department: Option<String>,
+    #[serde(default)]
+    urgency_level: Option<u8>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    baseline_vitals: Option<VitalSignsRecord>,
+    #[serde(default)]
+    l2_trigger_substances: Vec<TriggerSubstanceRecord>,
+    #[serde(default)]
+    clinical_exams: ClinicalExamBundle,
+}
+
+async fn attach_patient_clinical_exams_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(patient_id): AxumPath<String>,
+    Json(req): Json<AttachClinicalExamsRequest>,
+) -> Response {
+    let auth = match authenticate_request(&state, &headers, 10).await {
+        Ok(a) => a,
+        Err(e) => return auth_err_response(e),
+    };
+    if let Err(e) = check_patient_access(&state, &auth, &patient_id) {
+        return auth_err_response(e);
+    }
+    if let Err(verr) = validate_patient_id(&patient_id) {
+        return json_error(StatusCode::BAD_REQUEST, verr.message);
+    }
+    if let Err(verr) = req.clinical_exams.validate() {
+        return json_error(StatusCode::BAD_REQUEST, verr.to_string());
+    }
+    if let Some(ref bv) = req.baseline_vitals
+        && let Err(verr) = bv.validate()
+    {
+        return json_error(StatusCode::BAD_REQUEST, verr.to_string());
+    }
+    for (idx, t) in req.l2_trigger_substances.iter().enumerate() {
+        if let Err(verr) = t.validate() {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                format!("l2_trigger_substances[{idx}]: {verr}"),
+            );
+        }
+    }
+
+    // Ensure L2 profile exists and update baseline vitals / trigger substances if provided
+    let existing_l2 = state
+        .stores
+        .patient_memory
+        .get_l2_profile(&patient_id)
+        .await
+        .ok()
+        .flatten();
+    let (consent, mut profile) = match existing_l2 {
+        Some(rec) => (rec.consent_long_term_memory, rec.l2_profile),
+        None => (
+            true,
+            L2Profile {
+                age_group: "unknown".to_string(),
+                ..Default::default()
+            },
+        ),
+    };
+    if let Some(bv) = req.baseline_vitals {
+        profile.baseline_vitals = Some(bv);
+    } else if profile.baseline_vitals.is_none()
+        && let Some(first_vs) = req.clinical_exams.vital_signs.first()
+    {
+        profile.baseline_vitals = Some(first_vs.clone());
+    }
+    for t in req.l2_trigger_substances {
+        if let Some(existing) = profile
+            .trigger_substances
+            .iter_mut()
+            .find(|x| x.trigger_id == t.trigger_id)
+        {
+            *existing = t;
+        } else {
+            profile.trigger_substances.push(t);
+        }
+    }
+    for t in &req.clinical_exams.trigger_substances {
+        if !profile
+            .trigger_substances
+            .iter()
+            .any(|x| x.trigger_id == t.trigger_id)
+        {
+            profile.trigger_substances.push(t.clone());
+        }
+    }
+    if let Err(e) = state
+        .stores
+        .patient_memory
+        .upsert_l2_profile(&patient_id, consent, &profile)
+        .await
+    {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+
+    // Attach to existing event_id or create a new L3 visit event
+    let target_event = if let Some(ref eid) = req.event_id
+        && let Ok(events) = state
+            .stores
+            .patient_memory
+            .list_l3_events(&patient_id, 100)
+            .await
+        && let Some(mut found) = events.into_iter().find(|e| &e.event_id == eid)
+    {
+        found.clinical_exams.merge(req.clinical_exams);
+        found
+    } else {
+        let exam_summary = req.clinical_exams.to_searchable_text();
+        let cc = req
+            .chief_complaint
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| scrub_pii(s).scrubbed_text)
+            .unwrap_or_else(|| "医学检查与生化/影像/创面记录".to_string());
+        let summary = req
+            .summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| scrub_pii(s).scrubbed_text)
+            .unwrap_or_else(|| {
+                if exam_summary.is_empty() {
+                    cc.clone()
+                } else {
+                    format!("{cc}：{exam_summary}")
+                }
+            });
+        L3VisitEvent {
+            event_id: req
+                .event_id
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| format!("evt_exam_{}", Uuid::new_v4().simple())),
+            occurred_at: Utc::now(),
+            chief_complaint: cc,
+            extracted_symptoms: Vec::new(),
+            recommended_department: req
+                .recommended_department
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "全科医学科".to_string()),
+            urgency_level: req.urgency_level.unwrap_or(2).clamp(1, 4),
+            summary,
+            clinical_exams: req.clinical_exams,
+        }
+    };
+
+    if let Err(e) = state
+        .stores
+        .patient_memory
+        .insert_l3_event(&patient_id, &target_event)
+        .await
+    {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+    let embed_text = format!(
+        "{} {} {}",
+        target_event.chief_complaint,
+        target_event.summary,
+        target_event.clinical_exams.to_searchable_text()
+    );
+    if let Ok(vec) = state.embedder.embed_one(&embed_text).await {
+        let _ = state
+            .stores
+            .patient_l3_vectors
+            .upsert_event_vector(&patient_id, &target_event, vec)
+            .await;
+    }
+
+    Json(serde_json::json!({
+        "saved": true,
+        "patient_id": patient_id,
+        "event": target_event,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchPatientImportRequest {
+    /// "json" or "csv"
+    format: String,
+    content: String,
+    #[serde(default)]
+    default_consent: bool,
+}
+
+async fn import_patients_batch_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<BatchPatientImportRequest>,
+) -> Response {
+    let auth = match authenticate_request(&state, &headers, 20).await {
+        Ok(a) => a,
+        Err(e) => return auth_err_response(e),
+    };
+    if !auth.is_admin && auth.api_key.is_none() {
+        return auth_err_response(AuthError::forbidden(
+            "admin or tenant API key required for batch patient import",
+        ));
+    }
+    let cfg = PatientMaskingConfig {
+        salt: state.config.patient_id_salt.clone(),
+        default_consent: req.default_consent,
+    };
+    let report = match req.format.trim().to_ascii_lowercase().as_str() {
+        "json" => import_patients_json_str(&req.content, &cfg),
+        "csv" => import_patients_csv_str(&req.content, &cfg),
+        other => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                format!("unsupported format '{other}', expected 'json' or 'csv'"),
+            );
+        }
+    };
+    let report = match report {
+        Ok(r) => r,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, e.to_string()),
+    };
+
+    let mut persisted_patients = 0usize;
+    let mut persisted_events = 0usize;
+    for rec in &report.records {
+        if state
+            .stores
+            .patient_memory
+            .upsert_l2_profile(
+                &rec.patient_id,
+                rec.consent_long_term_memory,
+                &rec.l2_profile,
+            )
+            .await
+            .is_ok()
+        {
+            persisted_patients += 1;
+        }
+        for ev in &rec.l3_visit_events {
+            if state
+                .stores
+                .patient_memory
+                .insert_l3_event(&rec.patient_id, ev)
+                .await
+                .is_ok()
+            {
+                persisted_events += 1;
+            }
+        }
+    }
+
+    Json(serde_json::json!({
+        "persisted_patients": persisted_patients,
+        "persisted_events": persisted_events,
+        "total_input_rows": report.total_input_rows,
+        "detected_pii_columns": report.detected_pii_columns,
+        "failed_rows": report.failed_rows,
+        "patient_ids": report.records.iter().map(|r| &r.patient_id).collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/dictionaries, POST /v1/dictionaries/synonyms & /red-flags
+// ---------------------------------------------------------------------------
+
+async fn get_dictionaries_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = authenticate_request(&state, &headers, 5).await {
+        return auth_err_response(e);
+    }
+    match state.stores.dictionaries.load_dictionaries().await {
+        Ok(dict) => Json(dict).into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn upsert_synonym_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(syn): Json<SymptomSynonym>,
+) -> Response {
+    let auth = match authenticate_request(&state, &headers, 5).await {
+        Ok(a) => a,
+        Err(e) => return auth_err_response(e),
+    };
+    if !auth.is_admin {
+        return auth_err_response(AuthError::forbidden("admin authorization required"));
+    }
+    if let Err(verr) = syn.validate() {
+        return json_error(StatusCode::BAD_REQUEST, verr.to_string());
+    }
+    if let Err(e) = state.stores.dictionaries.save_symptom_synonym(&syn).await {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+    let _ = state.reload_hot_resources(false, true, false).await;
+    Json(serde_json::json!({ "saved": true, "standard_term": syn.standard_term })).into_response()
+}
+
+async fn upsert_red_flag_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(rule): Json<RedFlagRule>,
+) -> Response {
+    let auth = match authenticate_request(&state, &headers, 5).await {
+        Ok(a) => a,
+        Err(e) => return auth_err_response(e),
+    };
+    if !auth.is_admin {
+        return auth_err_response(AuthError::forbidden("admin authorization required"));
+    }
+    if let Err(verr) = rule.validate() {
+        return json_error(StatusCode::BAD_REQUEST, verr.to_string());
+    }
+    if let Err(e) = state.stores.dictionaries.save_red_flag_rule(&rule).await {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+    let _ = state.reload_hot_resources(false, true, false).await;
+    Json(serde_json::json!({ "saved": true, "rule_id": rule.rule_id })).into_response()
+}
+
+async fn admin_save_snapshot_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    let auth = match authenticate_request(&state, &headers, 1).await {
+        Ok(a) => a,
+        Err(e) => return auth_err_response(e),
+    };
+    if !auth.is_admin {
+        return auth_err_response(AuthError::forbidden("admin authorization required"));
+    }
+    match state.save_snapshot_now().await {
+        Ok(Some(count)) => Json(serde_json::json!({
+            "saved": true,
+            "mode": "local_encrypted_snapshot",
+            "records_saved": count,
+            "path": state.config.local_snapshot_path.as_ref().map(|p| p.display().to_string()),
+        }))
+        .into_response(),
+        Ok(None) => Json(serde_json::json!({
+            "saved": true,
+            "mode": "external_database_or_ephemeral",
+            "records_saved": 0,
+        }))
+        .into_response(),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
 }

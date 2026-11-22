@@ -8,11 +8,12 @@ import EcsDebuggerPanel from './components/EcsDebuggerPanel.vue';
 import LlmGatewayPanel from './components/LlmGatewayPanel.vue';
 import DataExchangePanel from './components/DataExchangePanel.vue';
 import PatientFollowUpPanel from './components/PatientFollowUpPanel.vue';
+import ClinicalExamImportPanel from './components/ClinicalExamImportPanel.vue';
 import ToastContainer from './components/ToastContainer.vue';
 import { initTheme, useTheme } from './composables/useTheme';
 import { invokeStudio } from './api/tauri';
 
-type TabId = 'knowledge' | 'patients' | 'followup' | 'epidemic' | 'dictionary' | 'ecs' | 'gateway' | 'exchange';
+type TabId = 'knowledge' | 'patients' | 'clinical' | 'followup' | 'epidemic' | 'dictionary' | 'ecs' | 'gateway' | 'exchange';
 type OperatorRole = 'admin' | 'editor' | 'clinician';
 
 interface RuntimeStatus {
@@ -68,9 +69,9 @@ async function handleSaveSnapshotNow() {
 }
 
 const roleAllowedTabs: Record<OperatorRole, TabId[]> = {
-  admin: ['knowledge', 'patients', 'followup', 'epidemic', 'dictionary', 'ecs', 'gateway', 'exchange'],
-  editor: ['knowledge', 'epidemic', 'dictionary', 'ecs', 'exchange'],
-  clinician: ['followup', 'patients', 'ecs'],
+  admin: ['knowledge', 'patients', 'clinical', 'followup', 'epidemic', 'dictionary', 'ecs', 'gateway', 'exchange'],
+  editor: ['knowledge', 'clinical', 'epidemic', 'dictionary', 'ecs', 'exchange'],
+  clinician: ['followup', 'patients', 'clinical', 'ecs'],
 };
 
 const visibleNavItems = computed(() =>
@@ -156,11 +157,20 @@ const navItems: Array<{
     shortcut: '8',
     icon: 'M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4',
   },
+  {
+    id: 'clinical',
+    short: '检查影像',
+    label: '医学检查、生化与图像中心',
+    desc: '血压、抽血生化、核磁/CT、伤口与诱因图片导入',
+    shortcut: '9',
+    icon: 'M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z',
+  },
 ];
 
 const componentMap = {
   knowledge: KnowledgeImportPanel,
   patients: PatientMaskingPanel,
+  clinical: ClinicalExamImportPanel,
   followup: PatientFollowUpPanel,
   epidemic: EpidemicConsolePanel,
   dictionary: DictionaryManagerPanel,

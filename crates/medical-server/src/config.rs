@@ -25,6 +25,8 @@ pub struct ServerConfig {
     pub rerank_base_url: Option<String>,
     pub rerank_model: String,
     pub tantivy_index_dir: Option<PathBuf>,
+    pub data_dir: Option<PathBuf>,
+    pub local_snapshot_path: Option<PathBuf>,
     pub cors_allowed_origins: Vec<String>,
     pub protect_metrics: bool,
     pub tenant_keys_file: Option<PathBuf>,
@@ -56,6 +58,8 @@ impl Default for ServerConfig {
             rerank_base_url: None,
             rerank_model: "BAAI/bge-reranker-v2-m3".to_string(),
             tantivy_index_dir: None,
+            data_dir: None,
+            local_snapshot_path: None,
             cors_allowed_origins: Vec::new(),
             protect_metrics: false,
             tenant_keys_file: None,
@@ -165,6 +169,22 @@ impl ServerConfig {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .map(PathBuf::from);
+        cfg.data_dir = env::var("MEDICAL_DATA_DIR")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from);
+        cfg.local_snapshot_path = env::var("MEDICAL_LOCAL_SNAPSHOT_PATH")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from);
+        if let Some(ref dir) = cfg.data_dir {
+            if cfg.tantivy_index_dir.is_none() {
+                cfg.tantivy_index_dir = Some(dir.join("tantivy"));
+            }
+            if cfg.offline_mode && cfg.local_snapshot_path.is_none() {
+                cfg.local_snapshot_path = Some(dir.join("medical_local.enc"));
+            }
+        }
         cfg.cors_allowed_origins = env::var("CORS_ALLOWED_ORIGINS")
             .ok()
             .map(|raw| {
@@ -189,6 +209,19 @@ impl ServerConfig {
             .map(PathBuf::from);
 
         cfg
+    }
+
+    /// Configures persistent disk storage (Tantivy index + AES-256-GCM encrypted local snapshot)
+    /// under `dir` so data survives process shutdown and restarts in headless / single-node mode.
+    pub fn with_persistent_data_dir(mut self, dir: PathBuf) -> Self {
+        self.data_dir = Some(dir.clone());
+        if self.tantivy_index_dir.is_none() {
+            self.tantivy_index_dir = Some(dir.join("tantivy"));
+        }
+        if self.offline_mode && self.local_snapshot_path.is_none() {
+            self.local_snapshot_path = Some(dir.join("medical_local.enc"));
+        }
+        self
     }
 
     /// Rejects insecure public default secrets when running in non-offline production mode.

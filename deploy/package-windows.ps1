@@ -30,8 +30,8 @@ try {
 
 # 静态链接 MSVC C 运行库，避免新电脑报缺少 VCRUNTIME140.dll
 $env:RUSTFLAGS = "-C target-feature=+crt-static"
-Write-Host "=== [2/4] 编译静态 CRT 服务端 (medical-server.exe) ===" -ForegroundColor Cyan
-cargo build --release --bin medical-server
+Write-Host "=== [2/4] 编译静态 CRT 无头服务端 (medical-server.exe) 与 MCP 工具套件 (medical-mcp.exe) ===" -ForegroundColor Cyan
+cargo build --release --bin medical-server --bin medical-mcp
 
 if (-not $SkipInstaller) {
     Write-Host "=== [3/4] 使用 Tauri CLI 构建 Windows 安装包 (NSIS / MSI) ===" -ForegroundColor Cyan
@@ -58,6 +58,7 @@ if (Test-Path $distDir) { Remove-Item $distDir -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $distDir | Out-Null
 
 Copy-Item (Join-Path $RepoRoot "target\release\medical-server.exe") $distDir
+Copy-Item (Join-Path $RepoRoot "target\release\medical-mcp.exe") $distDir
 Copy-Item (Join-Path $RepoRoot "target\release\medical-studio.exe") $distDir
 Copy-Item (Join-Path $RepoRoot "deploy\windows\start-medical-studio.bat") $distDir
 Copy-Item -Recurse (Join-Path $RepoRoot "migrations") $distDir

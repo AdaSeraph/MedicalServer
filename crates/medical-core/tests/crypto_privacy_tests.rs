@@ -15,6 +15,7 @@ fn test_aes256_gcm_roundtrip_random_nonce_and_tamper_detection() {
         allergies: vec!["青霉素".into()],
         surgical_history: vec!["阑尾切除术".into()],
         long_term_medications: vec!["二甲双胍".into()],
+        ..Default::default()
     };
 
     let env1 = cipher.encrypt_json(&payload).expect("encrypt 1");

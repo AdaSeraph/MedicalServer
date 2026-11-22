@@ -443,6 +443,7 @@ impl PatientL3VectorStore for QdrantPatientL3Store {
                         recommended_department: payload_str(p, "recommended_department"),
                         urgency_level: payload_i64(p, "urgency_level").unwrap_or(2).clamp(1, 4) as u8,
                         summary: payload_str(p, "summary_preview"),
+                        clinical_exams: Default::default(),
                     },
                     similarity_score: pt.score,
                 }

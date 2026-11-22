@@ -1,9 +1,17 @@
+pub mod clinical;
 pub mod dictionary;
 pub mod epidemic;
 pub mod knowledge;
 pub mod patient;
 pub mod triage;
 
+pub use clinical::{
+    AbnormalFlag, ClinicalDataCatalog, ClinicalExamBundle, ClinicalMediaAsset,
+    ClinicalMediaCategory, ClinicalTypeDescriptor, ImagingExamRecord, ImagingFeatureRef,
+    ImagingModality, LabBiochemItem, LabBiochemPanel, LabPanelCategory,
+    StandardLabAnalyteTemplate, TriggerCategory, TriggerSeverity, TriggerSubstanceRecord,
+    VitalSignsRecord, WoundAssessmentRecord, WoundFeatureRef, default_clinical_data_catalog,
+};
 pub use dictionary::{MedicalDictionaries, RedFlagLevel, RedFlagRule, SymptomSynonym};
 pub use epidemic::{EpidemicContext, Season};
 pub use knowledge::{

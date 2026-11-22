@@ -54,15 +54,16 @@ jobs:
         with:
           key: cloud-musl
 
-      - name: Build static medical-server (release, musl)
-        run: cargo build --release --target x86_64-unknown-linux-musl --bin medical-server
+      - name: Build static medical-server & medical-mcp (release, musl)
+        run: cargo build --release --target x86_64-unknown-linux-musl --bin medical-server --bin medical-mcp
 
       - name: Package Cloud Server Deployment Bundle
         run: |
           mkdir -p cloud_pkg
           cp target/x86_64-unknown-linux-musl/release/medical-server cloud_pkg/
-          chmod +x cloud_pkg/medical-server
-          file cloud_pkg/medical-server
+          cp target/x86_64-unknown-linux-musl/release/medical-mcp cloud_pkg/
+          chmod +x cloud_pkg/medical-server cloud_pkg/medical-mcp
+          file cloud_pkg/medical-server cloud_pkg/medical-mcp
           cp -r migrations config deploy k6 cloud_pkg/
           chmod +x cloud_pkg/deploy/install-linux.sh
           tar -czf medical-server-cloud-linux-x86_64.tar.gz -C cloud_pkg .
@@ -262,19 +263,20 @@ jobs:
 
       - name: Build Release Binaries (Linux)
         if: runner.os == 'Linux'
-        run: cargo build --release --bin medical-server --bin medical-studio
+        run: cargo build --release --bin medical-server --bin medical-mcp --bin medical-studio
 
       - name: Build Release Binaries (Windows, static CRT — no VCRUNTIME140.dll needed)
         if: runner.os == 'Windows'
         env:
           RUSTFLAGS: "-C target-feature=+crt-static"
-        run: cargo build --release --bin medical-server --bin medical-studio
+        run: cargo build --release --bin medical-server --bin medical-mcp --bin medical-studio
 
       - name: Package Release Archive (Linux)
         if: runner.os == 'Linux'
         run: |
           mkdir -p dist_pkg
           cp target/release/medical-server dist_pkg/
+          cp target/release/medical-mcp dist_pkg/
           cp target/release/medical-studio dist_pkg/
           cp -r migrations config deploy k6 dist_pkg/
           chmod +x dist_pkg/deploy/install-linux.sh dist_pkg/deploy/linux/install-studio-deps.sh
@@ -286,6 +288,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist_pkg | Out-Null
           Copy-Item "target/release/medical-server.exe" dist_pkg/
+          Copy-Item "target/release/medical-mcp.exe" dist_pkg/
           Copy-Item "target/release/medical-studio.exe" dist_pkg/
           Copy-Item "deploy/windows/start-medical-studio.bat" dist_pkg/
           Copy-Item -Recurse migrations, config, deploy, k6 dist_pkg/

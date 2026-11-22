@@ -232,20 +232,58 @@ impl AppState {
         // Build LLM ModelRouter
         let model_router = Arc::new(build_model_router(&config, &stores).await?);
 
-        // Seed default epidemic context + default medical knowledge in offline mode
-        // (in production mode, only seed explicitly configured seed_corpus_file / tenant_keys_file).
-        if config.offline_mode {
-            seed_default_epidemics(&stores).await;
-            seed_default_knowledge(&indexer).await;
+        // Restore persisted AES-256-GCM local snapshot if present (preserves patients, clinical exams,
+        // epidemics, dictionaries, and LLM providers across restarts).
+        let mut restored_from_snapshot = false;
+        if let Some(ref snap_path) = config.local_snapshot_path
+            && snap_path.is_file()
+        {
+            match crate::persist::load_local_snapshot(
+                &stores,
+                &cipher,
+                embedder.as_ref(),
+                snap_path,
+            )
+            .await
+            {
+                Ok(true) => {
+                    restored_from_snapshot = true;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(path = %snap_path.display(), error = %e, "failed to load local snapshot");
+                }
+            }
+        }
 
-            let candidate_bundles = [
-                config.seed_corpus_file.clone(),
-                Some(Path::new("doc/schemas/data-collection-schema.json").to_path_buf()),
-                Some(Path::new("e2e/fixtures/knowledge/rag_corpus.json").to_path_buf()),
-            ];
-            for path in candidate_bundles.into_iter().flatten() {
-                if path.is_file() {
-                    seed_from_json_file(&path, &indexer, &stores).await;
+        // Re-hydrate in-memory vector store from persisted Tantivy index if docs already exist on disk.
+        let existing_docs_on_disk = tantivy.num_docs();
+        if existing_docs_on_disk > 0 && config.offline_mode {
+            if let Ok(docs) = tantivy.list_all_documents(None)
+                && !docs.is_empty()
+            {
+                let _ = indexer.upsert_documents(&docs, "default").await;
+            }
+        }
+
+        // Seed default epidemic context + default medical knowledge in offline mode
+        // (only when starting fresh with no persisted snapshot / empty index).
+        if config.offline_mode {
+            if !restored_from_snapshot {
+                seed_default_epidemics(&stores).await;
+            }
+            if existing_docs_on_disk == 0 {
+                seed_default_knowledge(&indexer).await;
+
+                let candidate_bundles = [
+                    config.seed_corpus_file.clone(),
+                    Some(Path::new("doc/schemas/data-collection-schema.json").to_path_buf()),
+                    Some(Path::new("e2e/fixtures/knowledge/rag_corpus.json").to_path_buf()),
+                ];
+                for path in candidate_bundles.into_iter().flatten() {
+                    if path.is_file() {
+                        seed_from_json_file(&path, &indexer, &stores).await;
+                    }
                 }
             }
 
@@ -323,6 +361,15 @@ impl AppState {
             metrics: Arc::new(ServerMetrics::new()),
             http_client,
         }))
+    }
+
+    /// Flushes the AES-256-GCM encrypted local snapshot to disk if `local_snapshot_path` is configured.
+    pub async fn save_snapshot_now(&self) -> Result<Option<usize>, String> {
+        let Some(ref path) = self.config.local_snapshot_path else {
+            return Ok(None);
+        };
+        let count = crate::persist::save_local_snapshot(&self.stores, &self.cipher, path).await?;
+        Ok(Some(count))
     }
 
     /// Atomically hot-reloads epidemics, medical dictionaries, and/or LLM router into `TriageEngine`.
@@ -516,6 +563,12 @@ async fn seed_default_knowledge(indexer: &DualWriteIndexer) {
             red_flag_signs: vec!["呼吸困难".to_string(), "持续高热超3天".to_string()],
             seasonal_tags: vec!["influenza".to_string(), "winter".to_string()],
             suggested_follow_up_slots: vec![],
+            reference_labs: vec![],
+            reference_vitals: vec!["体温常 ≥38.5℃".to_string(), "SpO2 <93% 提示重症".to_string()],
+            imaging_features: vec![],
+            wound_features: vec![],
+            trigger_substances: vec![],
+            media_assets: vec![],
             updated_at: None,
         },
         KnowledgeDocument {
@@ -541,6 +594,12 @@ async fn seed_default_knowledge(indexer: &DualWriteIndexer) {
             red_flag_signs: vec!["血便".to_string(), "严重脱水".to_string()],
             seasonal_tags: vec!["gastroenteritis".to_string()],
             suggested_follow_up_slots: vec![],
+            reference_labs: vec![],
+            reference_vitals: vec![],
+            imaging_features: vec![],
+            wound_features: vec![],
+            trigger_substances: vec![],
+            media_assets: vec![],
             updated_at: None,
         },
         KnowledgeDocument {
@@ -560,6 +619,12 @@ async fn seed_default_knowledge(indexer: &DualWriteIndexer) {
             red_flag_signs: vec!["呼吸急促".to_string(), "口唇发绀".to_string()],
             seasonal_tags: vec!["mycoplasma".to_string(), "winter".to_string()],
             suggested_follow_up_slots: vec![],
+            reference_labs: vec![],
+            reference_vitals: vec![],
+            imaging_features: vec![],
+            wound_features: vec![],
+            trigger_substances: vec![],
+            media_assets: vec![],
             updated_at: None,
         },
         KnowledgeDocument {
@@ -579,6 +644,12 @@ async fn seed_default_knowledge(indexer: &DualWriteIndexer) {
             red_flag_signs: vec!["大小便失禁".to_string()],
             seasonal_tags: vec![],
             suggested_follow_up_slots: vec![],
+            reference_labs: vec![],
+            reference_vitals: vec![],
+            imaging_features: vec![],
+            wound_features: vec![],
+            trigger_substances: vec![],
+            media_assets: vec![],
             updated_at: None,
         },
     ];

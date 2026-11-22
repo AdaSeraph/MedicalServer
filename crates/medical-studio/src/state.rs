@@ -117,6 +117,8 @@ impl StudioState {
                     allergies: vec!["青霉素".to_string()],
                     surgical_history: vec![],
                     long_term_medications: vec!["布地奈德吸入剂".to_string()],
+                    baseline_vitals: None,
+                    trigger_substances: vec![],
                 },
             )
             .await;
@@ -128,6 +130,7 @@ impl StudioState {
             recommended_department: "呼吸内科".to_string(),
             urgency_level: 2,
             summary: "换季轻度哮喘发作风险，建议呼吸内科评估".to_string(),
+            clinical_exams: Default::default(),
         };
         let _ = stores
             .patient_memory

@@ -33,12 +33,13 @@
 
 ```text
 MedicalServer/
-├── Cargo.toml                        # 4-Crate Rust Workspace 配置
+├── Cargo.toml                        # 5-Crate Rust Workspace 配置
 ├── crates/
-│   ├── medical-core/                 # 领域模型、Schema 校验、AES-256-GCM、PII 脱敏、bevy_ecs 引擎、LLM 路由
-│   ├── medical-pipeline/             # sonic-rs 流式解析、书籍切块、病历脱敏、Tantivy + Qdrant 双写与断点续传
-│   ├── medical-server/               # Axum HTTP/SSE 线上服务、JWT/API Key 鉴权、QPM/TPM 限流、Prometheus 指标
-│   └── medical-studio/               # Tauri 2.0 桌面工具箱（28 个 Rust Commands + Vue 3 / Tailwind 六大模块）
+│   ├── medical-core/                 # 领域模型（含医学检查/生化/影像/伤口/诱因多模态模型）、AES-256-GCM、bevy_ecs 引擎
+│   ├── medical-pipeline/             # sonic-rs 流式解析、书籍切块、病历脱敏与检查导入、Tantivy + Qdrant 双写
+│   ├── medical-server/               # Axum HTTP/SSE 线上服务、临床检查/知识库管理接口、JWT/API Key 鉴权、Prometheus 指标
+│   ├── medical-studio/               # Tauri 2.0 桌面工具箱（含多模态医学检查、生化与图像导入中心）
+│   └── medical-mcp/                  # 标准 MCP (JSON-RPC 2.0 stdio) 工具套件（19 Tools + 4 Resources + 3 Prompts）
 ├── miniapp/                          # 患者端原生微信小程序（隐私弹窗、SSE 分诊、120 警示、长期记忆清空）
 ├── migrations/001_init.sql           # PostgreSQL 初始化 DDL
 ├── config/qdrant/collections.json    # Qdrant 1024 维余弦相似度 Collection Schema

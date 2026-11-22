@@ -1,0 +1,26 @@
+[package]
+name = "medical-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Model Context Protocol (MCP) server & tool suite for MedicalServer"
+
+[[bin]]
+name = "medical-mcp"
+path = "src/main.rs"
+
+[dependencies]
+medical-core = { workspace = true }
+medical-pipeline = { workspace = true }
+medical-server = { path = "../medical-server" }
+
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }

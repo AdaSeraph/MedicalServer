@@ -5,6 +5,7 @@ members = [
     "crates/medical-pipeline",
     "crates/medical-server",
     "crates/medical-studio",
+    "crates/medical-mcp",
 ]
 
 [workspace.package]
