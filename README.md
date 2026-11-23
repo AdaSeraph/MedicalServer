@@ -2,8 +2,9 @@
 
 [![CI](https://github.com/AdaSeraph/MedicalServer/actions/workflows/ci.yml/badge.svg)](https://github.com/AdaSeraph/MedicalServer/actions/workflows/ci.yml)
 [![Release](https://github.com/AdaSeraph/MedicalServer/actions/workflows/release.yml/badge.svg)](https://github.com/AdaSeraph/MedicalServer/actions/workflows/release.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](./LICENSE-MIT)
 
-**MedicalServer** 是一套面向医院高并发场景构建的纯 Rust 智能医疗分诊、医学知识库检索与开放 API 平台。系统以 **“AI 大模型分级路由 + 混合 RAG 医学知识库 + 病人三层长期记忆 + 急危重症本地红线拦截”** 为核心，同时配套提供 **Tauri 2.0 桌面运营工具箱（`MedicalStudio`）** 与 **患者端原生微信小程序（`miniapp/`）**。
+**MedicalServer** 是一套面向医院高并发场景构建的纯 Rust 智能医疗分诊、多模态医学知识库检索与院内系统（HIS/LIS/PACS/FHIR）集成开放平台。系统以 **“AI 大模型分级路由 + 混合 RAG 医学知识库 + 病人三层长期记忆 + 急危重症本地红线拦截 + 多模态临床检验影像分析”** 为核心，同时配套提供 **Tauri 2.0 桌面运营工具箱（`MedicalStudio`）**、**标准 MCP 工具套件（`medical-mcp`）** 与 **患者端原生微信小程序（`miniapp/`）**。
 
 ---
 
@@ -21,9 +22,9 @@
   - `csv` / `calamine` + `rayon` 并行病历脱敏（跨文件确定性加盐 SHA-256 匿名 `patient_id`、年龄分段、自由文本 PII 清洗）；
   - `tantivy`（`tantivy-jieba` 中文医学分词）+ 向量库（Qdrant / 离线内存）按 `doc_id` 幂等双写与断点续传。
 - **高并发 Axum 开放 API 网关（`medical-server`）**
-  - 微信小程序 `code2Session` + JWT 鉴权、多租户 `mk_live_*` API Key 鉴权与独立 **QPM/TPM 双令牌桶限流**、语义缓存、SSE 流式分诊、OpenAI 兼容增强代理与 Prometheus 监控指标。
+  - 微信小程序 `code2Session` + JWT 鉴权、多租户 `mk_live_*` API Key 鉴权与独立 **QPM/TPM 双令牌桶限流**、语义缓存、SSE 流式分诊、OpenAI 兼容增强代理、院内 HIS/LIS/PACS/HL7 FHIR R4 对接与 Prometheus 监控指标。
 - **Tauri 2.0 桌面工作台（`medical-studio`）**
-  - Vue 3 + Tailwind CSS 六大运营管理模块：医学知识库导入工坊、病人数据脱敏中心、季节流行病控制台、同义词与 120 红线词典沙盒、ECS 白盒调试台、AI 大模型与 API 网关配置中心。
+  - Vue 3 + Tailwind CSS 六大运营管理模块：医学知识库导入工坊、病人数据脱敏中心、季节流行病控制台、同义词与 120 红线词典沙盒、ECS 白盒调试台、AI 大模型与 API 网关配置中心（支持直接拖拽/粘贴导入临床图像、音频、视频与报告文件）。
 - **零外部依赖离线开发与测试**
   - 完整保留 PostgreSQL / Redis / Qdrant / OpenAI 兼容生产客户端接口，同时内置内存适配器，无外部数据库或 API 密钥即可直接编译、运行并通过全部自动化测试。
 
@@ -34,6 +35,8 @@
 ```text
 MedicalServer/
 ├── Cargo.toml                        # 5-Crate Rust Workspace 配置
+├── LICENSE-MIT                       # MIT 开源许可证
+├── LICENSE-APACHE                    # Apache-2.0 开源许可证
 ├── crates/
 │   ├── medical-core/                 # 领域模型（含医学检查/生化/影像/伤口/诱因多模态模型）、AES-256-GCM、bevy_ecs 引擎
 │   ├── medical-pipeline/             # sonic-rs 流式解析、书籍切块、病历脱敏与检查导入、Tantivy + Qdrant 双写
@@ -204,3 +207,15 @@ curl http://127.0.0.1:8080/health
 ## 医疗安全与免责声明
 
 > 本系统所有 AI 分诊建议均结合医学知识库生成，仅供参考，不替代执业医师诊断。遇到胸痛、呼吸困难、意识障碍、大出血等急危重症情况，请立即拨打 **120** 急救电话或前往最近医院急诊科救治。
+
+---
+
+## 开源协议 (License)
+
+本项目采用 Rust 社区标准的双重开源许可协议，您可以根据需要任选其一：
+
+- **MIT License**（详见 [LICENSE-MIT](./LICENSE-MIT) 或 <https://opensource.org/licenses/MIT>）
+- **Apache License, Version 2.0**（详见 [LICENSE-APACHE](./LICENSE-APACHE) 或 <https://www.apache.org/licenses/LICENSE-2.0>）
+
+除非您明确声明，否则您向本项目提交以供包含在内的任何贡献（如 Apache-2.0 许可证中所定义），均应按上述双重许可进行授权，不附加任何其他条款或条件。
+

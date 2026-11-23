@@ -3,6 +3,10 @@ name = "medical-pipeline"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "High-performance medical data ingestion, PII anonymization, document chunking, and Tantivy + Qdrant dual-write pipeline"
 
 [features]
 default = []

@@ -3,6 +3,9 @@ name = "medical-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 description = "Model Context Protocol (MCP) server & tool suite for MedicalServer"
 
 [[bin]]

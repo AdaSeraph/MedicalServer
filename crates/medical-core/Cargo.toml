@@ -3,6 +3,10 @@ name = "medical-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Core domain models, AES-256-GCM privacy encryption, and 5-stage bevy_ecs medical triage engine"
 
 [dependencies]
 tokio = { workspace = true }

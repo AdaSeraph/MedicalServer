@@ -3,6 +3,10 @@ name = "medical-studio"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Tauri 2.0 desktop workbench for medical knowledge ingestion, patient record anonymization, ECS white-box debugging, and LLM routing management"
 
 [build-dependencies]
 tauri-build = { workspace = true }
